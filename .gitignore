@@ -1,0 +1,11 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+*.log
+*.pem
+*.key
+*.p12
+*.secret
+config.toml
+.env

@@ -14,7 +14,21 @@ Bluetooth turntable -> BlueZ/BlueALSA -> auto-airplay -> AirPlay 2 speaker
 
 Application code is Rust. Linux still provides BlueZ, BlueALSA, ALSA, networking, and systemd.
 
-## Quick start
+## Install a release
+
+Download the installer, inspect it, then run it for your Linux user:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/0xtlt/auto-airplay/main/install.sh
+less install.sh
+sudo sh install.sh --user "$USER"
+```
+
+The installer detects ARM64 or ARMv7, downloads the matching GitHub release, verifies its SHA-256 checksum, and installs the binary and systemd template. It does not enable, start, or restart the service.
+
+To install a specific release, add `--version v0.1.0`.
+
+## Build from source
 
 Install the Linux build requirements and Rust:
 
@@ -121,6 +135,16 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Hardware-dependent tests are performed with `input probe`, `output test`, and `doctor` on the target Pi.
+
+Installer tests are isolated in Docker:
+
+```bash
+docker build --file tests/install/Dockerfile --tag auto-airplay-installer-test .
+```
+
+## Releases
+
+Pushing a version tag such as `v0.1.0` builds checksum-protected ARM64 and ARMv7 archives and publishes them to GitHub Releases. The tag must match the version in `Cargo.toml`. The release workflow can also be run manually to validate both builds without publishing a release.
 
 ## License and acknowledgements
 

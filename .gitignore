@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.idea/
 /.vscode/
 .DS_Store
@@ -7,5 +8,5 @@
 *.key
 *.p12
 *.secret
-config.toml
+/config.toml
 .env

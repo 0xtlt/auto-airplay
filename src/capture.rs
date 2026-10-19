@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use airplay_client::{LiveFrameSender, LivePcmFrame};
 use anyhow::{Context, Result};
@@ -11,12 +12,24 @@ use crate::platform::linux::{OpenedInput, SampleEncoding};
 /// level, and forwards frames only while an AirPlay stream is attached.
 #[derive(Default)]
 pub struct AudioSink {
-    sender: Mutex<Option<LiveFrameSender>>,
+    stream: Mutex<Stream>,
     /// Peak linear RMS since the last read, as `f32` bits. Levels are never
     /// negative, so the bit patterns order the same way as the values.
     level_bits: AtomicU32,
     failed: AtomicBool,
 }
+
+/// The attached stream, if any, and how long it has been refusing frames.
+#[derive(Default)]
+struct Stream {
+    sender: Option<LiveFrameSender>,
+    refusing_since: Option<Instant>,
+}
+
+/// How long a stream may refuse every frame before it counts as dead.
+/// `try_send` cannot tell a briefly full queue from a closed one, so a single
+/// refusal only drops that frame.
+const STALL_LIMIT: Duration = Duration::from_secs(5);
 
 impl AudioSink {
     pub fn new() -> Arc<Self> {
@@ -25,13 +38,16 @@ impl AudioSink {
 
     /// Starts forwarding frames to a new stream and clears any earlier failure.
     pub fn attach(&self, sender: LiveFrameSender) {
-        *self.sender() = Some(sender);
+        *self.stream() = Stream {
+            sender: Some(sender),
+            refusing_since: None,
+        };
         self.failed.store(false, Ordering::Release);
     }
 
     /// Stops forwarding frames. The capture thread keeps measuring the level.
     pub fn detach(&self) {
-        *self.sender() = None;
+        *self.stream() = Stream::default();
     }
 
     /// Returns the loudest linear RMS (`0.0..=1.0`) seen since the last call.
@@ -48,8 +64,8 @@ impl AudioSink {
         let level = crate::silence::rms_linear(samples);
         self.level_bits.fetch_max(level.to_bits(), Ordering::AcqRel);
 
-        let mut guard = self.sender();
-        let Some(sender) = guard.as_ref() else {
+        let mut stream = self.stream();
+        let Some(sender) = stream.sender.as_ref() else {
             return;
         };
         let frame = LivePcmFrame {
@@ -58,19 +74,23 @@ impl AudioSink {
             sample_rate,
         };
         if sender.try_send(frame) {
+            stream.refusing_since = None;
             return;
         }
-        if sender.is_full() {
+
+        let now = Instant::now();
+        let since = *stream.refusing_since.get_or_insert(now);
+        if now.duration_since(since) < STALL_LIMIT {
             tracing::debug!("AirPlay stream is behind; dropping an audio frame");
         } else {
-            tracing::debug!("AirPlay stream is gone; detaching the audio sink");
-            *guard = None;
+            tracing::debug!("AirPlay stream stopped accepting audio; detaching the sink");
+            *stream = Stream::default();
             self.failed.store(true, Ordering::Release);
         }
     }
 
-    fn sender(&self) -> MutexGuard<'_, Option<LiveFrameSender>> {
-        self.sender
+    fn stream(&self) -> MutexGuard<'_, Stream> {
+        self.stream
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

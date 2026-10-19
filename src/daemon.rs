@@ -36,13 +36,18 @@ pub async fn run(_store: ConfigStore) -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn run_linux(store: ConfigStore) -> Result<()> {
     let config = validate_config(store.load()?)?;
-    tracing::info!(path = %store.path().display(), "starting auto-airplay");
+    let recycled = std::env::var_os(RECYCLED_ENV).is_some();
+    tracing::info!(path = %store.path().display(), recycled, "starting auto-airplay");
 
-    match run_session(&store, config).await? {
+    match run_session(&store, config, recycled).await? {
         SessionExit::ConfigurationChanged => {
             tracing::info!("configuration changed; exiting for a clean supervisor restart");
         }
         SessionExit::Shutdown => tracing::info!("shutdown requested"),
+        SessionExit::Recycle => {
+            tracing::info!("restarting in a fresh process for the next AirPlay session");
+            return Err(recycle_process());
+        }
     }
     Ok(())
 }
@@ -51,7 +56,14 @@ async fn run_linux(store: ConfigStore) -> Result<()> {
 enum SessionExit {
     ConfigurationChanged,
     Shutdown,
+    /// The AirPlay session is over (released, lost, or could not start); run
+    /// the next one in a fresh process image.
+    Recycle,
 }
+
+/// Set on processes started by [`recycle_process`].
+#[cfg(target_os = "linux")]
+const RECYCLED_ENV: &str = "AUTO_AIRPLAY_RECYCLED";
 
 /// Cadence of the input level check that drives acquiring and releasing.
 #[cfg(target_os = "linux")]
@@ -68,7 +80,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Everything needed to (re)connect to the configured AirPlay speaker.
+/// Everything needed to connect to the configured AirPlay speaker.
 #[cfg(target_os = "linux")]
 struct OutputTarget {
     selector: String,
@@ -77,12 +89,21 @@ struct OutputTarget {
     volume: f32,
     sample_rate: u32,
     channels: u8,
-    /// Last device that connected successfully; avoids a discovery per resume.
-    device: Option<Device>,
 }
 
+/// Runs at most one AirPlay session: wait for sound, acquire the speaker,
+/// stream until the input goes silent, then release it.
+///
+/// The pinned AirPlay library leaks a polling thread, sockets and an mDNS
+/// daemon per connection, and none of them stop on disconnect. Instead of
+/// reconnecting in-process, the session ends with [`SessionExit::Recycle`] and
+/// the next one runs in a fresh process image, which bounds those leaks.
 #[cfg(target_os = "linux")]
-async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionExit> {
+async fn run_session(
+    store: &ConfigStore,
+    config: AppConfig,
+    recycled: bool,
+) -> Result<SessionExit> {
     if config.output.protocol != OutputProtocol::AirPlay2 {
         bail!("live streaming currently requires `output.protocol = \"air_play2\"`");
     }
@@ -92,7 +113,11 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
         .clone()
         .context("no AirPlay output configured")?;
 
-    crate::platform::ensure_bluetooth_input(&config.input).await?;
+    // AVRCP Play is only sent on a real start: after a silence release the
+    // source was stopped on purpose (e.g. a paused phone) and must stay so.
+    let mut input_config = config.input.clone();
+    input_config.send_avrcp_play &= !recycled;
+    crate::platform::ensure_bluetooth_input(&input_config).await?;
     let input = crate::platform::open_input(&config.input, &config.audio).await?;
     tracing::info!(
         sample_rate = input.format.sample_rate,
@@ -101,14 +126,13 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
         "input format negotiated"
     );
 
-    let mut target = OutputTarget {
+    let target = OutputTarget {
         selector,
         discovery_seconds: config.output.discovery_timeout_seconds,
         render_delay_ms: config.output.render_delay_ms,
         volume: config.audio.volume.clamp(0.0, 1.0),
         sample_rate: input.format.sample_rate,
         channels: input.format.channels,
-        device: None,
     };
 
     // Capture runs for the whole session; the AirPlay output is only held
@@ -124,22 +148,24 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
     );
     let reconnect_delay = Duration::from_secs(config.runtime.reconnect_delay_seconds.max(1));
     if idle.is_zero() {
-        tracing::info!("silence release disabled; holding the AirPlay output");
+        tracing::info!("silence release disabled; acquiring the AirPlay output");
     } else {
         tracing::info!("waiting for sound before acquiring the AirPlay output");
     }
 
     let changed = wait_for_config_change(store, &config);
     tokio::pin!(changed);
+    let mut signals = ShutdownSignals::new()?;
     let mut level_tick = tokio::time::interval(LEVEL_INTERVAL);
     level_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut feedback = tokio::time::interval(FEEDBACK_INTERVAL);
     feedback.set_missed_tick_behavior(MissedTickBehavior::Skip);
     feedback.tick().await;
 
-    let mut signals = ShutdownSignals::new()?;
     let mut client: Option<AirPlayClient> = None;
-    let mut retry_at: Option<Instant> = None;
+    // Pause before recycling after a failure, so a missing speaker is not
+    // hammered with attempts.
+    let mut retry_delay: Option<Duration> = None;
 
     let result = loop {
         let mut failure: Option<anyhow::Error> = None;
@@ -152,7 +178,7 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
                 let now = Instant::now();
                 let level = linear_to_dbfs(sink.take_peak_level());
                 if client.is_some() && sink.take_failed() {
-                    failure = Some(anyhow!("AirPlay stream ended unexpectedly"));
+                    failure = Some(anyhow!("AirPlay stream stopped accepting audio"));
                 } else {
                     match monitor.observe(level, now) {
                         Some(Action::Release) => {
@@ -164,29 +190,29 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
                                 release_output(active, &sink).await;
                             }
                             monitor.mark_released(now);
-                            retry_at = None;
+                            break Ok(SessionExit::Recycle);
                         }
-                        Some(Action::Acquire) if retry_at.is_none_or(|at| now >= at) => {
+                        Some(Action::Acquire) => {
                             tracing::info!("sound detected; acquiring AirPlay output");
-                            match acquire_with_interrupts(&mut target, &sink, &mut changed, &mut signals).await {
+                            match acquire_with_interrupts(&target, &sink, &mut changed, &mut signals).await {
                                 Acquisition::Ready(acquired) => {
                                     client = Some(*acquired);
                                     monitor.mark_active(Instant::now());
-                                    retry_at = None;
                                     tracing::info!("streaming started");
                                 }
                                 Acquisition::Failed(error) => {
                                     tracing::warn!(
-                                        %error,
+                                        error = format!("{error:#}"),
                                         retry_seconds = reconnect_delay.as_secs(),
                                         "cannot acquire AirPlay output"
                                     );
-                                    retry_at = Some(Instant::now() + reconnect_delay);
+                                    retry_delay = Some(reconnect_delay);
+                                    break Ok(SessionExit::Recycle);
                                 }
                                 Acquisition::Interrupted(exit) => break exit,
                             }
                         }
-                        Some(Action::Acquire) | None => {}
+                        None => {}
                     }
                 }
             }
@@ -209,17 +235,16 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
             if let Some(active) = client.take() {
                 release_output(active, &sink).await;
             }
-            let now = Instant::now();
-            monitor.mark_released(now);
             if !config.output.auto_reconnect {
                 break Err(error);
             }
             tracing::warn!(
-                %error,
+                error = format!("{error:#}"),
                 retry_seconds = reconnect_delay.as_secs(),
                 "AirPlay output lost; reconnecting once sound is present"
             );
-            retry_at = Some(now + reconnect_delay);
+            retry_delay = Some(reconnect_delay);
+            break Ok(SessionExit::Recycle);
         }
     };
 
@@ -228,7 +253,30 @@ async fn run_session(store: &ConfigStore, config: AppConfig) -> Result<SessionEx
         release_output(active, &sink).await;
     }
     drop(capture);
+
+    if let (Ok(SessionExit::Recycle), Some(delay)) = (&result, retry_delay) {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            next = &mut changed => return next.map(|_| SessionExit::ConfigurationChanged),
+            _ = signals.recv() => return Ok(SessionExit::Shutdown),
+        }
+    }
     result
+}
+
+/// Replaces this process with a fresh copy of itself (same arguments), so the
+/// next AirPlay session starts without the previous session's leftovers.
+/// Only returns on failure; the caller then exits and systemd restarts us.
+#[cfg(target_os = "linux")]
+fn recycle_process() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+
+    let program = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
+    let error = std::process::Command::new(program)
+        .args(std::env::args_os().skip(1))
+        .env(RECYCLED_ENV, "1")
+        .exec();
+    anyhow::Error::new(error).context("cannot restart auto-airplay for the next session")
 }
 
 /// SIGINT (ctrl-c) and SIGTERM (systemd stop/restart). The listeners live for
@@ -268,7 +316,7 @@ enum Acquisition {
 /// Acquires the output but stays responsive to shutdown and config changes.
 #[cfg(target_os = "linux")]
 async fn acquire_with_interrupts(
-    target: &mut OutputTarget,
+    target: &OutputTarget,
     sink: &AudioSink,
     changed: &mut (impl Future<Output = Result<AppConfig>> + Unpin),
     signals: &mut ShutdownSignals,
@@ -302,15 +350,16 @@ async fn acquire_with_interrupts(
     }
 }
 
-/// Connects to the speaker and starts streaming. On success the connected
-/// client is left in `slot`; on failure everything is torn down.
+/// Discovers and connects to the speaker, then starts streaming. On success
+/// the connected client is left in `slot`; on failure it is torn down.
 #[cfg(target_os = "linux")]
 async fn acquire_output(
-    target: &mut OutputTarget,
+    target: &OutputTarget,
     sink: &AudioSink,
     slot: &mut Option<AirPlayClient>,
 ) -> Result<()> {
-    let client = slot.insert(connect_output(target).await?);
+    let device = resolve_target(target).await?;
+    let client = slot.insert(connect_device(&device, target.render_delay_ms).await?);
     if let Err(error) = start_stream(client, target, sink).await {
         sink.detach();
         if let Some(client) = slot.take() {
@@ -322,38 +371,22 @@ async fn acquire_output(
 }
 
 #[cfg(target_os = "linux")]
-async fn connect_output(target: &mut OutputTarget) -> Result<AirPlayClient> {
-    let Some(cached) = target.device.clone() else {
-        let device = resolve_target(target).await?;
-        let client = connect_device(&device, target.render_delay_ms).await?;
-        target.device = Some(device);
-        return Ok(client);
-    };
-
-    match connect_device(&cached, target.render_delay_ms).await {
-        Ok(client) => Ok(client),
-        Err(error) => {
-            // The speaker may have a new address; look it up again once.
-            tracing::debug!(%error, "cached AirPlay device unreachable; rediscovering");
-            target.device = None;
-            let device = resolve_target(target).await?;
-            let client = connect_device(&device, target.render_delay_ms).await?;
-            target.device = Some(device);
-            Ok(client)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 async fn resolve_target(target: &OutputTarget) -> Result<Device> {
+    // The library's mDNS scan blocks its thread without yielding, so it runs
+    // on the blocking pool: shutdown and config changes can still interrupt
+    // the acquisition (the abandoned scan ends on its own).
+    let selector = target.selector.clone();
+    let seconds = target.discovery_seconds;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = tokio::task::spawn_blocking(move || {
+        runtime.block_on(crate::output::resolve_device(&selector, seconds))
+    });
     // Discovery itself clamps to 1..=30 seconds; leave some slack on top.
-    let limit = Duration::from_secs(target.discovery_seconds.clamp(1, 30) + 5);
-    tokio::time::timeout(
-        limit,
-        crate::output::resolve_device(&target.selector, target.discovery_seconds),
-    )
-    .await
-    .context("AirPlay discovery timed out")?
+    let limit = Duration::from_secs(seconds.clamp(1, 30) + 5);
+    tokio::time::timeout(limit, scan)
+        .await
+        .context("AirPlay discovery timed out")?
+        .context("AirPlay discovery task failed")?
 }
 
 #[cfg(target_os = "linux")]

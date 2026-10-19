@@ -117,6 +117,8 @@ An AirPlay speaker can only play one source at a time, so `auto-airplay` does no
 
 If the connection to the speaker fails or is lost, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
 
+Each AirPlay session runs in its own process: after the speaker is released, or after a failed or lost connection, `auto-airplay` replaces itself with a fresh copy of the same command (the PID stays the same). This keeps per-connection resources of the AirPlay library from accumulating over days of use. On these internal restarts the Bluetooth AVRCP Play command is not sent again, so a source that was stopped on purpose stays stopped.
+
 ## CLI
 
 ```text

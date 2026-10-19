@@ -127,7 +127,7 @@ impl Default for AudioConfig {
             preferred_sample_rate: None,
             channels: 2,
             latency_ms: 500,
-            silence_threshold_dbfs: -50.0,
+            silence_threshold_dbfs: -40.0,
         }
     }
 }

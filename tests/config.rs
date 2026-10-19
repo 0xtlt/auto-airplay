@@ -44,7 +44,7 @@ fn silence_threshold_defaults_when_missing_from_an_existing_file() {
     let config = ConfigStore::new(path).load().unwrap();
 
     assert_eq!(config.audio.volume, 0.5);
-    assert_eq!(config.audio.silence_threshold_dbfs, -50.0);
+    assert_eq!(config.audio.silence_threshold_dbfs, -40.0);
     assert_eq!(
         config.audio.silence_threshold_dbfs,
         AppConfig::default().audio.silence_threshold_dbfs

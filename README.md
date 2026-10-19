@@ -87,7 +87,7 @@ The configuration lives in `/etc/auto-airplay/config.toml` and is normally writt
 ```toml
 [audio]
 # RMS level (dBFS) below which the input counts as silent.
-silence_threshold_dbfs = -50.0
+silence_threshold_dbfs = -40.0
 
 [runtime]
 # Release the speaker after this many seconds of continuous silence (0 disables).
@@ -110,10 +110,10 @@ An AirPlay speaker can only play one source at a time, so `auto-airplay` does no
 - Stopping or restarting the service (SIGTERM or ctrl-c) and configuration changes also close the AirPlay session cleanly.
 - `runtime.idle_silence_seconds = 0` disables this behavior: the bridge connects at startup and holds the speaker for as long as it runs.
 
-`audio.silence_threshold_dbfs` (default `-50.0`) sets the RMS level, in dBFS, that separates sound from silence. Check the logs to see when the speaker is acquired and released, then tune it:
+`audio.silence_threshold_dbfs` (default `-40.0`) sets the RMS level, in dBFS, that separates sound from silence. The default sits above the idle noise floor of a Bluetooth turntable such as the AT-LP60-BT, which stays above `-50` while powered on with no record playing. Check the logs to see when the speaker is acquired and released, then tune it:
 
-- If the speaker is never released because turntable hum or noise stays above the threshold, raise the value toward `-40`.
-- If quiet passages are cut or the speaker is released during soft music, lower the value toward `-60`.
+- If the speaker is never released because turntable hum or noise stays above the threshold, raise the value toward `-35`.
+- If quiet passages are cut or the speaker is released during soft music, lower the value toward `-50` or `-60`.
 
 If the connection to the speaker fails or is lost, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
 

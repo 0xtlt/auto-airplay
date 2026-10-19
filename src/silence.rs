@@ -139,7 +139,7 @@ impl SilenceMonitor {
 mod tests {
     use super::*;
 
-    const THRESHOLD: f32 = -50.0;
+    const THRESHOLD: f32 = -40.0;
     const SOUND: f32 = -20.0;
     const SILENT: f32 = -70.0;
     const IDLE: Duration = Duration::from_secs(30);

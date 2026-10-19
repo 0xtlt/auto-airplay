@@ -262,11 +262,15 @@ async fn run_session(
     }
     drop(capture);
 
-    if let (Ok(SessionExit::Recycle), Some(delay)) = (&result, retry_delay) {
+    if let Ok(SessionExit::Recycle) = result {
+        // Signals and config changes that arrived during teardown are still
+        // pending here and must win over the restart; `exec` would drop them.
+        let delay = retry_delay.unwrap_or(Duration::ZERO);
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            next = &mut changed => return next.map(|_| SessionExit::ConfigurationChanged),
+            biased;
             _ = signals.recv() => return Ok(SessionExit::Shutdown),
+            next = &mut changed => return next.map(|_| SessionExit::ConfigurationChanged),
+            _ = tokio::time::sleep(delay) => {}
         }
     }
     result

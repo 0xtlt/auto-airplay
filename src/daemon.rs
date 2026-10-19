@@ -78,7 +78,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
-const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Shared budget for stop + disconnect. Worst-case shutdown is a pending
+/// feedback (2 s) + teardown (4 s) + runtime shutdown (2 s), which fits in
+/// the service's `TimeoutStopSec=10`.
+#[cfg(target_os = "linux")]
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Everything needed to connect to the configured AirPlay speaker.
 #[cfg(target_os = "linux")]
@@ -197,6 +202,7 @@ async fn run_session(
                             match acquire_with_interrupts(&target, &sink, &mut changed, &mut signals).await {
                                 Acquisition::Ready(acquired) => {
                                     client = Some(*acquired);
+                                    sink.arm();
                                     monitor.mark_active(Instant::now());
                                     tracing::info!("streaming started");
                                 }
@@ -217,10 +223,12 @@ async fn run_session(
                 }
             }
             _ = feedback.tick(), if client.is_some() => {
-                if let Some(active) = client.as_mut()
-                    && let Err(error) = active.send_feedback().await
-                {
-                    failure = Some(error.into());
+                if let Some(active) = client.as_mut() {
+                    match tokio::time::timeout(FEEDBACK_TIMEOUT, active.send_feedback()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => failure = Some(error.into()),
+                        Err(_) => failure = Some(anyhow!("AirPlay feedback timed out")),
+                    }
                 }
             }
             next = &mut changed => {
@@ -426,24 +434,28 @@ async fn start_stream(
 #[cfg(target_os = "linux")]
 async fn release_output(mut client: AirPlayClient, sink: &AudioSink) {
     sink.detach();
-    best_effort("stopping the AirPlay stream", client.stop()).await;
-    best_effort("disconnecting from the AirPlay output", client.disconnect()).await;
+    let teardown = async {
+        if let Err(error) = client.stop().await {
+            tracing::warn!(%error, "stopping the AirPlay stream failed");
+        }
+        if let Err(error) = client.disconnect().await {
+            tracing::warn!(%error, "disconnecting from the AirPlay output failed");
+        }
+    };
+    if tokio::time::timeout(TEARDOWN_TIMEOUT, teardown)
+        .await
+        .is_err()
+    {
+        tracing::warn!("AirPlay teardown timed out");
+    }
 }
 
 #[cfg(target_os = "linux")]
 async fn disconnect_quietly(mut client: AirPlayClient) {
-    best_effort("disconnecting from the AirPlay output", client.disconnect()).await;
-}
-
-#[cfg(target_os = "linux")]
-async fn best_effort<E: std::fmt::Display>(
-    what: &str,
-    operation: impl Future<Output = std::result::Result<(), E>>,
-) {
-    match tokio::time::timeout(TEARDOWN_TIMEOUT, operation).await {
+    match tokio::time::timeout(TEARDOWN_TIMEOUT, client.disconnect()).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "{what} failed"),
-        Err(_) => tracing::warn!("{what} timed out"),
+        Ok(Err(error)) => tracing::warn!(%error, "disconnecting from the AirPlay output failed"),
+        Err(_) => tracing::warn!("disconnecting from the AirPlay output timed out"),
     }
 }
 

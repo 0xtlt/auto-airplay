@@ -23,6 +23,9 @@ pub struct AudioSink {
 #[derive(Default)]
 struct Stream {
     sender: Option<LiveFrameSender>,
+    /// Stall detection only runs once the stream is playing: while it starts
+    /// up, the queue legitimately stays full and refused frames are dropped.
+    armed: bool,
     refusing_since: Option<Instant>,
 }
 
@@ -40,9 +43,17 @@ impl AudioSink {
     pub fn attach(&self, sender: LiveFrameSender) {
         *self.stream() = Stream {
             sender: Some(sender),
-            refusing_since: None,
+            ..Stream::default()
         };
         self.failed.store(false, Ordering::Release);
+    }
+
+    /// The stream is now playing: from here on, a stream that keeps refusing
+    /// frames counts as dead.
+    pub fn arm(&self) {
+        let mut stream = self.stream();
+        stream.armed = true;
+        stream.refusing_since = None;
     }
 
     /// Stops forwarding frames. The capture thread keeps measuring the level.
@@ -75,6 +86,9 @@ impl AudioSink {
         };
         if sender.try_send(frame) {
             stream.refusing_since = None;
+            return;
+        }
+        if !stream.armed {
             return;
         }
 

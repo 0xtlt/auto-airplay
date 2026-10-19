@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
 use airplay_client::{LiveFrameSender, LivePcmFrame};
@@ -7,18 +7,87 @@ use anyhow::{Context, Result};
 
 use crate::platform::linux::{OpenedInput, SampleEncoding};
 
+/// Where captured audio goes. The capture thread always measures the input
+/// level, and forwards frames only while an AirPlay stream is attached.
+#[derive(Default)]
+pub struct AudioSink {
+    sender: Mutex<Option<LiveFrameSender>>,
+    /// Peak linear RMS since the last read, as `f32` bits. Levels are never
+    /// negative, so the bit patterns order the same way as the values.
+    level_bits: AtomicU32,
+    failed: AtomicBool,
+}
+
+impl AudioSink {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Starts forwarding frames to a new stream and clears any earlier failure.
+    pub fn attach(&self, sender: LiveFrameSender) {
+        *self.sender() = Some(sender);
+        self.failed.store(false, Ordering::Release);
+    }
+
+    /// Stops forwarding frames. The capture thread keeps measuring the level.
+    pub fn detach(&self) {
+        *self.sender() = None;
+    }
+
+    /// Returns the loudest linear RMS (`0.0..=1.0`) seen since the last call.
+    pub fn take_peak_level(&self) -> f32 {
+        f32::from_bits(self.level_bits.swap(0, Ordering::AcqRel))
+    }
+
+    /// Returns whether the attached stream went away since the last call.
+    pub fn take_failed(&self) -> bool {
+        self.failed.swap(false, Ordering::AcqRel)
+    }
+
+    fn push(&self, samples: &[i16], channels: u8, sample_rate: u32) {
+        let level = crate::silence::rms_linear(samples);
+        self.level_bits.fetch_max(level.to_bits(), Ordering::AcqRel);
+
+        let mut guard = self.sender();
+        let Some(sender) = guard.as_ref() else {
+            return;
+        };
+        let frame = LivePcmFrame {
+            samples: samples.to_vec(),
+            channels,
+            sample_rate,
+        };
+        if sender.try_send(frame) {
+            return;
+        }
+        if sender.is_full() {
+            tracing::debug!("AirPlay stream is behind; dropping an audio frame");
+        } else {
+            tracing::debug!("AirPlay stream is gone; detaching the audio sink");
+            *guard = None;
+            self.failed.store(true, Ordering::Release);
+        }
+    }
+
+    fn sender(&self) -> MutexGuard<'_, Option<LiveFrameSender>> {
+        self.sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 pub struct CaptureHandle {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<()>>>,
 }
 
 impl CaptureHandle {
-    pub fn start(input: OpenedInput, sender: LiveFrameSender) -> Result<Self> {
+    pub fn start(input: OpenedInput, sink: Arc<AudioSink>) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = Arc::clone(&running);
         let thread = thread::Builder::new()
             .name("audio-capture".into())
-            .spawn(move || capture_loop(input, sender, thread_running))
+            .spawn(move || capture_loop(input, sink, thread_running))
             .context("cannot start the audio capture thread")?;
 
         Ok(Self {
@@ -53,11 +122,7 @@ impl Drop for CaptureHandle {
     }
 }
 
-fn capture_loop(
-    input: OpenedInput,
-    sender: LiveFrameSender,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
+fn capture_loop(input: OpenedInput, sink: Arc<AudioSink>, running: Arc<AtomicBool>) -> Result<()> {
     let channels = input.format.channels as usize;
     let samples_per_period = input.period_frames * channels;
 
@@ -69,13 +134,11 @@ fn capture_loop(
                 match io.readi(&mut samples) {
                     Ok(frames) if frames > 0 => {
                         let length = frames * channels;
-                        if !sender.try_send(LivePcmFrame {
-                            samples: samples[..length].to_vec(),
-                            channels: input.format.channels,
-                            sample_rate: input.format.sample_rate,
-                        }) {
-                            break;
-                        }
+                        sink.push(
+                            &samples[..length],
+                            input.format.channels,
+                            input.format.sample_rate,
+                        );
                     }
                     Ok(_) => continue,
                     Err(error) if error.errno() == libc::EAGAIN => {
@@ -95,13 +158,7 @@ fn capture_loop(
                         let length = frames * channels;
                         converted.clear();
                         converted.extend(raw[..length].iter().map(|sample| (sample >> 16) as i16));
-                        if !sender.try_send(LivePcmFrame {
-                            samples: converted.clone(),
-                            channels: input.format.channels,
-                            sample_rate: input.format.sample_rate,
-                        }) {
-                            break;
-                        }
+                        sink.push(&converted, input.format.channels, input.format.sample_rate);
                     }
                     Ok(_) => continue,
                     Err(error) if error.errno() == libc::EAGAIN => {

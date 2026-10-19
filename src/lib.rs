@@ -6,3 +6,4 @@ pub mod daemon;
 pub mod discovery;
 pub mod output;
 pub mod platform;
+pub mod silence;

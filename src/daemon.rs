@@ -21,6 +21,8 @@ use crate::config::ConfigStore;
 #[cfg(target_os = "linux")]
 use crate::config::{AppConfig, OutputProtocol};
 #[cfg(target_os = "linux")]
+use crate::shutdown::ShutdownFlag;
+#[cfg(target_os = "linux")]
 use crate::silence::{Action, DEFAULT_RESUME_DURATION, SilenceMonitor, linear_to_dbfs};
 
 #[cfg(target_os = "linux")]
@@ -44,9 +46,9 @@ async fn run_linux(store: ConfigStore) -> Result<()> {
             tracing::info!("configuration changed; exiting for a clean supervisor restart");
         }
         SessionExit::Shutdown => tracing::info!("shutdown requested"),
-        SessionExit::Recycle => {
+        SessionExit::Recycle(shutdown) => {
             tracing::info!("restarting in a fresh process for the next AirPlay session");
-            return Err(recycle_process());
+            return recycle_process(&shutdown);
         }
     }
     Ok(())
@@ -57,8 +59,8 @@ enum SessionExit {
     ConfigurationChanged,
     Shutdown,
     /// The AirPlay session is over (released, lost, or could not start); run
-    /// the next one in a fresh process image.
-    Recycle,
+    /// the next one in a fresh process image, unless a shutdown arrives first.
+    Recycle(ShutdownFlag),
 }
 
 /// Set on processes started by [`recycle_process`].
@@ -195,7 +197,7 @@ async fn run_session(
                                 release_output(active, &sink).await;
                             }
                             monitor.mark_released(now);
-                            break Ok(SessionExit::Recycle);
+                            break Ok(signals.recycle());
                         }
                         Some(Action::Acquire) => {
                             tracing::info!("sound detected; acquiring AirPlay output");
@@ -213,7 +215,7 @@ async fn run_session(
                                         "cannot acquire AirPlay output"
                                     );
                                     retry_delay = Some(reconnect_delay);
-                                    break Ok(SessionExit::Recycle);
+                                    break Ok(signals.recycle());
                                 }
                                 Acquisition::Interrupted(exit) => break exit,
                             }
@@ -252,7 +254,7 @@ async fn run_session(
                 "AirPlay output lost; reconnecting once sound is present"
             );
             retry_delay = Some(reconnect_delay);
-            break Ok(SessionExit::Recycle);
+            break Ok(signals.recycle());
         }
     };
 
@@ -262,9 +264,12 @@ async fn run_session(
     }
     drop(capture);
 
-    if let Ok(SessionExit::Recycle) = result {
-        // Signals and config changes that arrived during teardown are still
-        // pending here and must win over the restart; `exec` would drop them.
+    if let Ok(SessionExit::Recycle(_)) = result {
+        // Signals and config changes that arrived during teardown must win
+        // over the restart; `exec` would drop them.
+        if signals.requested() {
+            return Ok(SessionExit::Shutdown);
+        }
         let delay = retry_delay.unwrap_or(Duration::ZERO);
         tokio::select! {
             biased;
@@ -278,17 +283,24 @@ async fn run_session(
 
 /// Replaces this process with a fresh copy of itself (same arguments), so the
 /// next AirPlay session starts without the previous session's leftovers.
-/// Only returns on failure; the caller then exits and systemd restarts us.
+/// Returns `Ok` without restarting if a shutdown was requested; otherwise
+/// only returns on failure, and the caller exits so systemd restarts us.
 #[cfg(target_os = "linux")]
-fn recycle_process() -> anyhow::Error {
+fn recycle_process(shutdown: &ShutdownFlag) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let program = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-    let error = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(std::env::args_os().skip(1))
-        .env(RECYCLED_ENV, "1")
-        .exec();
-    anyhow::Error::new(error).context("cannot restart auto-airplay for the next session")
+        .env(RECYCLED_ENV, "1");
+    // Last check, as close to exec as possible.
+    if shutdown.is_requested() {
+        tracing::info!("shutdown requested");
+        return Ok(());
+    }
+    let error = command.exec();
+    Err(anyhow::Error::new(error).context("cannot restart auto-airplay for the next session"))
 }
 
 /// SIGINT (ctrl-c) and SIGTERM (systemd stop/restart). The listeners live for
@@ -298,6 +310,8 @@ fn recycle_process() -> anyhow::Error {
 struct ShutdownSignals {
     interrupt: Signal,
     terminate: Signal,
+    /// Set synchronously by the signal handler, unlike the Tokio listeners.
+    flag: ShutdownFlag,
 }
 
 #[cfg(target_os = "linux")]
@@ -306,7 +320,16 @@ impl ShutdownSignals {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?,
             terminate: signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?,
+            flag: ShutdownFlag::register().context("cannot record shutdown signals")?,
         })
+    }
+
+    fn requested(&self) -> bool {
+        self.flag.is_requested()
+    }
+
+    fn recycle(&self) -> SessionExit {
+        SessionExit::Recycle(self.flag.clone())
     }
 
     async fn recv(&mut self) {

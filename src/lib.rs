@@ -6,4 +6,6 @@ pub mod daemon;
 pub mod discovery;
 pub mod output;
 pub mod platform;
+#[cfg(unix)]
+pub mod shutdown;
 pub mod silence;

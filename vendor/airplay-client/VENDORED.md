@@ -23,4 +23,11 @@ never change the speaker volume, so the crate is vendored and patched.
 
 ## Local patches
 
-None yet.
+1. **No implicit volume at stream start.** Removed the
+   `self.set_volume(self.volume)` call (and its "Sending SET_PARAMETER volume"
+   log) from `Connection::start_streaming`, `Connection::start_streaming_live`
+   (`src/connection.rs`) and from the RAOP streaming start
+   (`RaopConnection::start_streaming`, `src/raop_connection.rs`, formerly
+   "Send initial volume"). Upstream always sent its default volume of `1.0`
+   (0 dB, 100 %) there. The public `set_volume()` API is unchanged and still
+   sends the volume when called explicitly.

@@ -1089,11 +1089,8 @@ impl Connection {
         // RECORD was sent at the end of setup(), just update state
         self.session.start_playing()?;
 
-        // Send SET_PARAMETER volume to ensure HomePod is not muted
-        tracing::info!("Sending SET_PARAMETER volume");
-        if let Err(e) = self.set_volume(self.volume).await {
-            tracing::warn!("Failed to set volume: {}", e);
-        }
+        // Local patch: do not send an implicit volume here. The receiver keeps its
+        // own volume; it is only changed by an explicit `set_volume()` call.
 
         // Spawn control channel on a dedicated blocking thread for low-latency
         // retransmit handling. Uses 5ms recv timeout (well under HomePod's 70ms buffer)
@@ -1254,11 +1251,8 @@ impl Connection {
 
         self.session.start_playing()?;
 
-        // Set volume
-        tracing::info!("Sending SET_PARAMETER volume");
-        if let Err(e) = self.set_volume(self.volume).await {
-            tracing::warn!("Failed to set volume: {}", e);
-        }
+        // Local patch: do not send an implicit volume here. The receiver keeps its
+        // own volume; it is only changed by an explicit `set_volume()` call.
 
         // Spawn control channel for retransmit handling
         let control_task = if let Some(ref control_rx) = self.control_receiver {

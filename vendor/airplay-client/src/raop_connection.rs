@@ -419,10 +419,8 @@ impl RaopConnection {
 
         self.session.start_playing()?;
 
-        // Send initial volume
-        if let Err(e) = self.set_volume(self.volume).await {
-            warn!("Failed to set volume: {}", e);
-        }
+        // Local patch: do not send an implicit volume here. The receiver keeps its
+        // own volume; it is only changed by an explicit `set_volume()` call.
 
         self.streamer = Some(streamer);
         self.playback_state = PlaybackState::Playing;

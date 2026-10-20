@@ -38,10 +38,18 @@ libc = "0.2"
 zbus = { version = "5.11", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+airplay-resampler = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-crypto = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 assert_cmd = "2.0"
 predicates = "3.1"
 tokio = { version = "1.47", features = ["io-util"] }
+
+# The tests run the real AirPlay resampler over minutes of audio.
+[profile.dev.package.rubato]
+opt-level = 3
+
+[profile.dev.package.airplay-resampler]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

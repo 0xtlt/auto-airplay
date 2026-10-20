@@ -8,7 +8,7 @@ use alsa::pcm::PCM;
 use anyhow::{Context, Result};
 
 use crate::platform::linux::{OpenedInput, SampleEncoding};
-use crate::plc::{Due, JitterBuffer, Pacer, STATS_INTERVAL};
+use crate::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES, Pacer, STATS_INTERVAL};
 
 /// The jitter buffer shared by the capture and playout threads. Critical
 /// sections are one capture period of copying at most.
@@ -140,22 +140,23 @@ impl AudioSink {
             return false;
         }
         stream.refusing_since = None;
-        let allow_conceal = match pacer.due(now) {
-            Due::Wait => return false,
-            Due::Optional => false,
-            Due::Required => true,
-        };
-        if !lock(buffer).pull(chunk, allow_conceal) {
+        if !lock(buffer).pull_chunk(pacer, now, chunk) {
             return false;
         }
 
+        // The AirPlay resampler takes nothing but whole playout chunks.
+        let expected = PLAYOUT_CHUNK_FRAMES * usize::from(format.0);
+        debug_assert_eq!(chunk.len(), expected);
+        if chunk.len() != expected {
+            return false;
+        }
         let frame = LivePcmFrame {
             samples: chunk.to_vec(),
             channels: format.0,
             sample_rate: format.1,
         };
         if sender.try_send(frame) {
-            pacer.sent(chunk.len() / usize::from(format.0));
+            pacer.sent(PLAYOUT_CHUNK_FRAMES);
             true
         } else {
             self.note_refusal(stream, buffer);

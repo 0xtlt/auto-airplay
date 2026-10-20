@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use auto_airplay::plc::{Due, GapDetector, GapVerdict, JitterBuffer, Pacer};
+use auto_airplay::plc::{Due, GapDetector, GapVerdict, JitterBuffer, PLAYOUT_CHUNK_FRAMES, Pacer};
 
 const RATE: u32 = 48_000;
 const CH: usize = 2;
@@ -334,15 +334,10 @@ impl Pipeline {
                 self.pushed_frames += PERIOD;
                 next += 1;
             }
-            loop {
-                let allow = match self.pacer.due(at(self.now_ms)) {
-                    Due::Wait => break,
-                    Due::Optional => false,
-                    Due::Required => true,
-                };
-                if !self.buffer.pull(&mut chunk, allow) {
-                    break;
-                }
+            while self
+                .buffer
+                .pull_chunk(&mut self.pacer, at(self.now_ms), &mut chunk)
+            {
                 self.pacer.sent(chunk_len);
                 self.out.extend_from_slice(&chunk);
             }
@@ -814,7 +809,7 @@ fn a_two_second_buffer_holds_the_most_recent_two_seconds() {
     buffer.start_playout();
     let out = drain(&mut buffer);
 
-    assert!(out.len() / CH >= frames(2_000));
+    assert!(out.len() / CH + PLAYOUT_CHUNK_FRAMES >= frames(2_000));
     assert_continuous(&out);
     // The first second is the most recent audio, unchanged past the 10 ms
     // fade-in. (Draining the buffer dry later stretches it near the end.)
@@ -1070,4 +1065,195 @@ fn a_blocked_sender_does_not_make_the_pacer_burst_later() {
         burst += 1;
     }
     assert_eq!(burst, 10, "no more than the lead");
+}
+
+// ----- chunks for the AirPlay resampler -----
+
+/// What the AirPlay live decoder does with every frame it receives
+/// (`LiveAudioDecoder::decode_resampled`): resample it on its own with a
+/// fixed-input resampler, which fails on anything but exactly 1024 frames.
+#[track_caller]
+fn assert_every_chunk_resamples(out: &[i16], channels: usize) {
+    use airplay_resampler::{DEFAULT_CHUNK_SIZE, Resampler};
+
+    assert!(!out.is_empty());
+    assert_eq!(PLAYOUT_CHUNK_FRAMES, DEFAULT_CHUNK_SIZE);
+    let chunk_samples = PLAYOUT_CHUNK_FRAMES * channels;
+    assert_eq!(out.len() % chunk_samples, 0, "only whole chunks go out");
+    let mut resampler = Resampler::new(RATE, 44_100, channels as u8).unwrap();
+    for (index, chunk) in out.chunks(chunk_samples).enumerate() {
+        assert_eq!(chunk.len(), chunk_samples);
+        let resampled = resampler
+            .process(chunk)
+            .unwrap_or_else(|error| panic!("chunk {index}: {error}"));
+        assert!(!resampled.is_empty(), "chunk {index}");
+    }
+}
+
+#[test]
+fn playout_chunks_are_what_the_airplay_resampler_expects() {
+    let buffer = new_buffer(400);
+
+    assert_eq!(buffer.chunk_frames(), 1024);
+    assert_eq!(PLAYOUT_CHUNK_FRAMES, 1024);
+}
+
+#[test]
+fn the_resampler_takes_every_chunk_in_normal_flow_and_at_start_up() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    pipeline.run(20, first, |block| Some(block as f64 * block_ms()));
+
+    assert_eq!(pipeline.buffer.take_stats().losses, 0);
+    assert_every_chunk_resamples(&pipeline.out, CH);
+}
+
+#[test]
+fn the_resampler_takes_every_chunk_when_starting_from_nothing() {
+    // The speaker is acquired before any audio is queued: silence, then fade-in.
+    let mut pipeline = Pipeline::attached(400, 0);
+    pipeline.run(10, 0, |block| Some(block as f64 * block_ms() + 50.0));
+
+    assert_continuous(&pipeline.out);
+    assert_every_chunk_resamples(&pipeline.out, CH);
+}
+
+#[test]
+fn the_resampler_takes_every_chunk_through_a_170_ms_hole() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    let lost = first + 40..first + 48;
+    pipeline.run(10, first, |block| {
+        (!lost.contains(&block)).then(|| block as f64 * block_ms())
+    });
+
+    assert_eq!(pipeline.buffer.take_stats().gaps, 1);
+    assert_every_chunk_resamples(&pipeline.out, CH);
+}
+
+#[test]
+fn the_resampler_takes_every_chunk_through_underruns() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    let lost = first + 100..first + 194;
+    pipeline.run(15, first, |block| {
+        (!lost.contains(&block)).then(|| block as f64 * block_ms())
+    });
+
+    assert_eq!(pipeline.buffer.take_stats().underruns, 1);
+    assert_every_chunk_resamples(&pipeline.out, CH);
+}
+
+#[test]
+fn the_resampler_takes_every_chunk_through_drift_trims_and_inserts() {
+    // A source clock 0.5 % fast (the cushion grows, then is trimmed), and
+    // 0.07 % slow (it shrinks, then is stretched).
+    for (scale, seconds, label) in [(0.995, 40, "fast"), (1.0007, 100, "slow")] {
+        let mut pipeline = Pipeline::attached(100, 100);
+        let first = pipeline.pushed_frames / PERIOD;
+        let start = first as f64 * block_ms();
+        pipeline.run(seconds, first, |block| {
+            Some(start + (block - first) as f64 * block_ms() * scale)
+        });
+
+        let stats = pipeline.buffer.take_stats();
+        assert!(stats.drift_corrections >= 1, "{label}: {stats}");
+        assert_eq!(stats.underruns, 0, "{label}: {stats}");
+        assert_every_chunk_resamples(&pipeline.out, CH);
+    }
+}
+
+#[test]
+fn chunks_keep_their_size_whatever_the_capture_pushes() {
+    // Capture periods, partial reads and the 32-bit path all end up as pushes
+    // of any size; the output does not care.
+    let mut buffer = new_buffer(400);
+    let mut pacer = buffer.pacer();
+    let mut position = 0;
+    let mut out = Vec::new();
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
+    let sizes = [1024, 333, 512, 1, 2048, 97, 1024, 750];
+    for step in 0..6_000 {
+        let size = sizes[step % sizes.len()];
+        let now = at(position as f64 * 1000.0 / f64::from(RATE));
+        buffer.push_at(now, &source(position, size), 0);
+        position += size;
+        while buffer.pull_chunk(&mut pacer, now, &mut chunk) {
+            pacer.sent(PLAYOUT_CHUNK_FRAMES);
+            out.extend_from_slice(&chunk);
+        }
+    }
+
+    assert_every_chunk_resamples(&out, CH);
+}
+
+#[test]
+fn mono_chunks_are_also_1024_frames() {
+    let mut buffer = JitterBuffer::new(RATE, 1, 400);
+    let mut pacer = buffer.pacer();
+    let mono: Vec<i16> = (0..frames(2_000))
+        .map(|frame| ((frame as f32 * 0.13).sin() * 20_000.0) as i16)
+        .collect();
+    buffer.push(&mono[..frames(500)]);
+    buffer.start_playout();
+    let mut out = Vec::new();
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES];
+    let mut clock = 0.0;
+    let mut next = frames(500);
+    while clock < 1_500.0 {
+        clock += 1.0;
+        let due = (frames(500) as f64 + clock * f64::from(RATE) / 1000.0) as usize;
+        if due > next {
+            buffer.push(&mono[next..due]);
+            next = due;
+        }
+        while buffer.pull_chunk(&mut pacer, at(clock), &mut chunk) {
+            pacer.sent(PLAYOUT_CHUNK_FRAMES);
+            out.extend_from_slice(&chunk);
+        }
+    }
+
+    assert_every_chunk_resamples(&out, 1);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "fixed size")]
+fn a_chunk_of_another_size_trips_the_debug_assertion() {
+    let mut buffer = new_buffer(400);
+    let mut pacer = buffer.pacer();
+    let mut chunk = vec![0_i16; 480 * CH];
+
+    buffer.pull_chunk(&mut pacer, at(0.0), &mut chunk);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_chunk_of_another_size_is_refused() {
+    let mut buffer = new_buffer(400);
+    buffer.push(&source(0, frames(400)));
+    let mut pacer = buffer.pacer();
+    let mut chunk = vec![0_i16; 480 * CH];
+
+    assert!(!buffer.pull_chunk(&mut pacer, at(0.0), &mut chunk));
+    assert_eq!(buffer.fill_frames(), frames(400));
+}
+
+#[test]
+fn small_cushions_work_with_whole_chunks() {
+    // The chunk (21.3 ms) is coarse next to the cushion: even the lowest
+    // accepted value (50 ms) streams without losses.
+    for jitter in [50, 60, 75, 100, 150, 400, 2_000] {
+        let mut pipeline = Pipeline::attached(jitter, jitter);
+        let first = pipeline.pushed_frames / PERIOD;
+        pipeline.run(30, first, |block| Some(block as f64 * block_ms()));
+
+        let stats = pipeline.buffer.take_stats();
+        assert_eq!(
+            (stats.losses, stats.drift_corrections),
+            (0, 0),
+            "{jitter} ms: {stats}"
+        );
+        assert_continuous(&pipeline.out);
+    }
 }

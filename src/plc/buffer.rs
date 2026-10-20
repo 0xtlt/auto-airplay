@@ -3,11 +3,20 @@ use std::time::Duration;
 
 use super::conceal::{Concealment, ramp, to_i16};
 use super::gap::{GapDetector, GapVerdict};
-use super::pace::Pacer;
+use super::pace::{Due, Pacer};
 use super::stats::{Counters, StatsSnapshot};
 
-/// Length of the chunks the output stage works in.
-pub const CHUNK_MS: u32 = 10;
+/// Frames in every chunk handed to the AirPlay sender, whatever the channel
+/// count or the sample rate.
+///
+/// The sender resamples each chunk on its own (48 kHz to 44.1 kHz) with a
+/// fixed-input sinc resampler built for `airplay_resampler::DEFAULT_CHUNK_SIZE`
+/// frames: a shorter chunk fails the whole stream ("Insufficient buffer size"),
+/// and frames beyond that size are silently dropped. Pacing, the lead and the
+/// chunk granularity of the output stage all follow from this size (about
+/// 21.3 ms at 48 kHz); the lengths of fades and crossfades do not, and work
+/// across chunk boundaries.
+pub const PLAYOUT_CHUNK_FRAMES: usize = 1024;
 /// Concealment fades to silence over this long (raised cosine).
 const FADE_OUT_MS: u32 = 30;
 /// Concealment is crossfaded into the real audio over this long.
@@ -40,7 +49,8 @@ const LEAD_MS: u32 = 100;
 /// Bluetooth jitter buffer with packet loss concealment.
 ///
 /// Interleaved 16-bit audio goes in at the capture side ([`push_at`](Self::push_at))
-/// and comes out in fixed chunks at the playout side ([`pull`](Self::pull)).
+/// and comes out in chunks of [`PLAYOUT_CHUNK_FRAMES`] at the playout side
+/// ([`pull_chunk`](Self::pull_chunk)).
 /// Which audio comes out is decided by these rules, all of which keep the
 /// signal continuous (no step bigger than the signal's own slope):
 ///
@@ -84,7 +94,6 @@ pub struct JitterBuffer {
     low: usize,
     high: usize,
     capacity: usize,
-    chunk: usize,
     fade_out: usize,
     crossfade: usize,
     history_len: usize,
@@ -153,7 +162,6 @@ impl JitterBuffer {
             low: target / 4,
             high,
             capacity: (target * 2).max(high + frames(HIGH_MARGIN_MS)),
-            chunk: frames(CHUNK_MS).max(1),
             fade_out: frames(FADE_OUT_MS).max(2),
             crossfade,
             history_len,
@@ -188,9 +196,9 @@ impl JitterBuffer {
         self.channels
     }
 
-    /// Frames per chunk of the output stage (10 ms).
+    /// Frames per playout chunk: [`PLAYOUT_CHUNK_FRAMES`].
     pub fn chunk_frames(&self) -> usize {
-        self.chunk
+        PLAYOUT_CHUNK_FRAMES
     }
 
     /// The fill the buffer aims for, in frames.
@@ -450,6 +458,26 @@ impl JitterBuffer {
     }
 
     // ----- output -----
+
+    /// Pulls the next playout chunk if `pacer` says one is due: real audio
+    /// inside the lead, concealment where the output fell behind real time.
+    /// `chunk` must hold exactly [`PLAYOUT_CHUNK_FRAMES`] frames; any other
+    /// size is refused (and trips a debug assertion), so that no frame of the
+    /// wrong size can reach the AirPlay resampler. The caller reports the chunk
+    /// with [`Pacer::sent`] once it is handed over.
+    pub fn pull_chunk(&mut self, pacer: &mut Pacer, now: Duration, chunk: &mut [i16]) -> bool {
+        let expected = PLAYOUT_CHUNK_FRAMES * self.channels;
+        debug_assert_eq!(chunk.len(), expected, "playout chunks have a fixed size");
+        if chunk.len() != expected {
+            return false;
+        }
+        let allow_conceal = match pacer.due(now) {
+            Due::Wait => return false,
+            Due::Optional => false,
+            Due::Required => true,
+        };
+        self.pull(chunk, allow_conceal)
+    }
 
     /// Fills `out` (a whole number of frames) with the next audio.
     ///

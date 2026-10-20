@@ -32,8 +32,9 @@ const GAP_WINDOW_MS: u64 = 80;
 /// Longer stalls are a restarted stream, not packet loss.
 const GAP_LIMIT_MS: u64 = 2_000;
 /// A capture overrun, or an underrun, and the hole behind it are one loss when
-/// they are this close (frames received).
-const HOLE_TOLERANCE: u64 = 4096;
+/// they sit at the same place in the audio received (give or take rounding).
+/// Anything received after that place is a loss of its own.
+const HOLE_TOLERANCE: u64 = 64;
 /// Digital zeros shorter than this are ordinary signal.
 const ZERO_RUN_MS: u32 = 2;
 /// Zeros only count as lost audio when the signal right before them reached
@@ -52,6 +53,28 @@ const STRETCH_MS: u32 = 20;
 const LOW_HOLD_MS: u32 = 500;
 /// Least audio played between two clock-drift corrections.
 const CORRECTION_SPACING_MS: u32 = 1_000;
+/// The shortest cushion `audio.jitter_buffer_ms` accepts.
+///
+/// A lost packet is confirmed `GAP_WINDOW_MS` after it, on the arrival that
+/// completes the window (up to one capture period later), and only then can
+/// the concealment be inserted, at a position that must not have played yet.
+/// The audio queued ahead of the position is the cushion less what the sender
+/// already holds (the lead plus up to one chunk of overshoot), and the capture
+/// period between pushes dips it once more. At 44.1 kHz a chunk and a capture
+/// period are 24 ms each, which is what the sum below uses (the slowest rate
+/// that is not exotic); the rest is margin.
+pub const MIN_JITTER_BUFFER_MS: u32 = 200;
+
+const _: () = {
+    const CHUNK_MS_AT_44K1: u32 = (PLAYOUT_CHUNK_FRAMES as u32 * 1000).div_ceil(44_100);
+    const MARGIN_MS: u32 = 20;
+    assert!(
+        MIN_JITTER_BUFFER_MS
+            >= GAP_WINDOW_MS as u32 + CHUNK_MS_AT_44K1 + LEAD_MS + CHUNK_MS_AT_44K1 + MARGIN_MS,
+        "the shortest cushion must outlast the hole confirmation"
+    );
+};
+
 /// The output may run this far ahead of real time (see [`Pacer`]), capped to a
 /// tenth of the target: that audio leaves the queue for the sender's.
 const LEAD_MS: u32 = 50;
@@ -77,9 +100,9 @@ const LEAD_MS: u32 = 50;
 ///   played yet), with the mirrored continuation of the audio before it,
 ///   faded to silence over 30 ms and crossfaded into the audio after it over
 ///   10 ms. The cushion keeps its level and the timeline stays whole. Audio
-///   that was merely late is not touched. With a cushion shorter than about
-///   150 ms the position may have played by the time the hole is confirmed:
-///   it is then counted but not concealed.
+///   that was merely late is not touched. With a cushion shorter than
+///   [`MIN_JITTER_BUFFER_MS`] the position may have played by the time the
+///   hole is confirmed: it is then counted but not concealed.
 /// * **Zero runs.** A run of at least 2 ms of exact digital zeros right after
 ///   audible signal (a loss filled with zeros) is treated the same way.
 ///   Vinyl surface noise is never exactly zero, and silence that follows
@@ -177,7 +200,9 @@ enum ZeroRun {
 }
 
 impl JitterBuffer {
-    /// `jitter_buffer_ms` is clamped to `20..=10_000`.
+    /// `jitter_buffer_ms` is clamped to `20..=10_000`. (The configuration only
+    /// accepts [`MIN_JITTER_BUFFER_MS`] and up; below that, holes may already
+    /// have played when they are confirmed.)
     pub fn new(sample_rate: u32, channels: u8, jitter_buffer_ms: u32) -> Self {
         let frames = |ms: u32| (u64::from(sample_rate) * u64::from(ms) / 1000) as usize;
         let jitter = jitter_buffer_ms.clamp(20, 10_000);
@@ -281,6 +306,11 @@ impl JitterBuffer {
         self.tail.clear();
     }
 
+    /// The query for the frames waiting in the capture device failed.
+    pub fn note_avail_error(&mut self) {
+        self.counters.avail_errors += 1;
+    }
+
     /// The capture device overran and was recovered.
     pub fn note_xrun(&mut self) {
         self.counters.xruns += 1;
@@ -375,9 +405,10 @@ impl JitterBuffer {
             .underrun_at
             .is_some_and(|at| at.abs_diff(position) <= HOLE_TOLERANCE)
         {
-            // The output ran dry where the audio stopped: the output stage
-            // bridged this hole, and counted it. (A hole elsewhere, in audio
-            // that is queued while the cushion rebuilds, is concealed as usual.)
+            // The output ran dry exactly where the audio stopped: the output
+            // stage bridged this hole, and counted it. (A hole anywhere else,
+            // even right after, is in audio that is queued while the cushion
+            // rebuilds, and is concealed as usual.)
             return;
         }
         if !self

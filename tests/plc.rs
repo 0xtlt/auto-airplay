@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use auto_airplay::plc::{Due, GapDetector, GapVerdict, JitterBuffer, PLAYOUT_CHUNK_FRAMES, Pacer};
+use auto_airplay::plc::{
+    Due, GapDetector, GapVerdict, JitterBuffer, MIN_JITTER_BUFFER_MS, PLAYOUT_CHUNK_FRAMES, Pacer,
+};
 
 const RATE: u32 = 48_000;
 const CH: usize = 2;
@@ -1232,7 +1234,7 @@ fn the_stats_line_has_the_greppable_shape() {
     assert_eq!(
         line,
         "bt_input stats: losses_per_min=0 concealed_per_min=0 concealed_ms=0 buffer_fill_ms=250 \
-         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0 reads=0"
+         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0 reads=0 avail_errors=0"
     );
 }
 
@@ -1714,4 +1716,126 @@ fn after_an_outage_the_cushion_is_back_at_the_target() {
     assert_eq!(pipeline.buffer.take_stats().underruns, 1);
     assert_continuous(&pipeline.out);
     assert_cushion_held(&pipeline, 400, 15_000.0);
+}
+
+// ----- round 3 -----
+
+/// Source blocks reach the buffer in real time (`lost` ones never do) and the
+/// output is attached at `attach_ms` and paced like the playout thread. A
+/// 173 Hz tone, so a splice is a step far above the natural slope. Returns the
+/// audio that went out, and the buffer.
+fn paced_tone(
+    jitter_ms: u32,
+    attach_ms: u32,
+    seconds: u32,
+    lost: impl Fn(usize) -> bool,
+) -> (Vec<i16>, JitterBuffer) {
+    let hz = 173.0;
+    let mut buffer = new_buffer(jitter_ms);
+    let mut pacer = None;
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
+    let mut out = Vec::new();
+    let mut next = 0;
+    for tick in 0..seconds * 1_000 {
+        let now = f64::from(tick);
+        while next as f64 * block_ms() <= now {
+            if !lost(next) {
+                buffer.push_at(
+                    at(next as f64 * block_ms()),
+                    &tone(next * PERIOD, PERIOD, hz),
+                    0,
+                );
+            }
+            next += 1;
+        }
+        if tick == attach_ms {
+            buffer.start_playout();
+            pacer = Some(buffer.pacer());
+        }
+        if let Some(pacer) = pacer.as_mut() {
+            while buffer.pull_chunk(pacer, at(now), &mut chunk) {
+                pacer.sent(PLAYOUT_CHUNK_FRAMES);
+                out.extend_from_slice(&chunk);
+            }
+        }
+    }
+    (out, buffer)
+}
+
+#[track_caller]
+fn assert_tone_continuous(out: &[i16]) {
+    let natural = natural_step(173.0);
+    for channel in 0..CH {
+        let step = max_step(out, channel);
+        assert!(step <= STEP_MARGIN * natural, "step {step} vs {natural}");
+    }
+}
+
+#[test]
+fn a_loss_right_after_an_outage_recovery_is_its_own_loss() {
+    // 400 ms cushion, attached at 1 s. Blocks 70-99 never arrive (an outage
+    // that dries the output up), 100 and 101 do, block 102 is lost again, and
+    // the stream carries on. The second hole is only two blocks past the place
+    // where the output ran dry, and sits in the audio queued for the refill.
+    let (out, mut buffer) = paced_tone(400, 1_000, 9, |block| {
+        (70..100).contains(&block) || block == 102
+    });
+
+    assert_tone_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!((stats.underruns, stats.gaps), (1, 1), "{stats}");
+    assert_eq!(stats.losses, 2, "{stats}");
+    assert!(stats.concealed >= 2, "{stats}");
+}
+
+#[test]
+fn the_outage_itself_is_still_counted_once() {
+    let (out, mut buffer) = paced_tone(400, 1_000, 9, |block| (70..100).contains(&block));
+
+    assert_tone_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!(
+        (stats.underruns, stats.gaps, stats.losses),
+        (1, 0, 1),
+        "{stats}"
+    );
+}
+
+#[test]
+fn a_single_lost_packet_is_concealed_at_every_accepted_cushion() {
+    // Paced output, attached and settled, one packet lost: no step above the
+    // tone's own slope, at the minimum cushion and above.
+    for jitter in [MIN_JITTER_BUFFER_MS, 400, 2_000] {
+        let attach = jitter + 500;
+        let loss_block = (attach as f64 / block_ms()) as usize + 150;
+        let (out, mut buffer) = paced_tone(jitter, attach, attach / 1_000 + 10, |block| {
+            block == loss_block
+        });
+
+        assert_tone_continuous(&out);
+        let stats = buffer.take_stats();
+        assert_eq!(
+            (stats.gaps, stats.underruns),
+            (1, 0),
+            "{jitter} ms: {stats}"
+        );
+        assert!(
+            (19..=22).contains(&stats.concealed_ms),
+            "{jitter} ms: {stats}"
+        );
+    }
+}
+
+#[test]
+fn the_minimum_cushion_outlasts_the_hole_confirmation() {
+    // The numbers the constant in the buffer is derived from, spelled out
+    // here for a 44.1 kHz stream (24 ms chunks), the slowest ordinary rate.
+    let chunk_ms = (PLAYOUT_CHUNK_FRAMES as u32 * 1000).div_ceil(44_100);
+    let window_and_lead = 80 + 50;
+    assert!(MIN_JITTER_BUFFER_MS >= window_and_lead + 2 * chunk_ms + 20);
+    assert_eq!(
+        *auto_airplay::config::JITTER_BUFFER_MS_RANGE.start(),
+        MIN_JITTER_BUFFER_MS
+    );
+    assert_eq!(MIN_JITTER_BUFFER_MS, 200);
 }

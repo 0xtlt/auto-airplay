@@ -435,7 +435,7 @@ fn jitter_buffer_defaults_to_400_ms_and_is_written_by_default() {
 
 #[test]
 fn jitter_buffer_can_be_configured_up_to_two_seconds_and_more() {
-    for value in [50, 400, 2_000, 5_000, 10_000] {
+    for value in [200, 400, 2_000, 5_000, 10_000] {
         let config = config_from(&format!("[audio]\njitter_buffer_ms = {value}\n"));
 
         assert_eq!(config.audio.jitter_buffer_ms, value);
@@ -445,12 +445,12 @@ fn jitter_buffer_can_be_configured_up_to_two_seconds_and_more() {
 
 #[test]
 fn jitter_buffer_bounds_are_validated() {
-    for value in [0, 49, 10_001, 100_000] {
+    for value in [0, 49, 50, 100, 199, 10_001, 100_000] {
         let config = config_from(&format!("[audio]\njitter_buffer_ms = {value}\n"));
 
         let message = config.validate_detection().unwrap_err();
         assert!(
-            message.contains("jitter_buffer_ms must be between 50 and 10000"),
+            message.contains("jitter_buffer_ms must be between 200 and 10000"),
             "{message}"
         );
     }

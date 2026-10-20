@@ -120,9 +120,12 @@ fn is_valid_dbfs(value: f32) -> bool {
     value.is_finite() && (-120.0..=0.0).contains(&value)
 }
 
-/// Accepted values of `audio.jitter_buffer_ms`: from "barely any cushion" to
-/// ten seconds, far beyond what a turntable needs.
-pub const JITTER_BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> = 50..=10_000;
+/// Accepted values of `audio.jitter_buffer_ms`: from the least that still
+/// leaves room to conceal a lost packet (see
+/// [`MIN_JITTER_BUFFER_MS`](crate::plc::MIN_JITTER_BUFFER_MS)) to ten seconds,
+/// far beyond what a turntable needs.
+pub const JITTER_BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> =
+    crate::plc::MIN_JITTER_BUFFER_MS..=10_000;
 
 /// Default of `audio.jitter_buffer_ms`.
 pub const DEFAULT_JITTER_BUFFER_MS: u32 = 400;

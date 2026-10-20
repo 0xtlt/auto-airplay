@@ -22,7 +22,7 @@ mod gap;
 mod pace;
 mod stats;
 
-pub use buffer::{JitterBuffer, PLAYOUT_CHUNK_FRAMES};
+pub use buffer::{JitterBuffer, MIN_JITTER_BUFFER_MS, PLAYOUT_CHUNK_FRAMES};
 pub use gap::{GapDetector, GapVerdict};
 pub use pace::{Due, Pacer};
 pub use stats::StatsSnapshot;

@@ -96,6 +96,12 @@ silence_threshold_dbfs = -40.0
 idle_silence_seconds = 30
 # The input must stay at or above the sound threshold this long (250 to 60000 ms).
 sound_confirm_ms = 2000
+# After another AirPlay source takes the speaker: silence required before new sound
+# may re-acquire it (1 to 3600 s), then the backoff before reconnecting, doubling for
+# each consecutive takeover up to the maximum.
+preempted_silence_seconds = 5
+preemption_backoff_seconds = 30
+preemption_backoff_max_seconds = 600
 # Wait this long before retrying after a failed connection.
 reconnect_delay_seconds = 3
 
@@ -125,7 +131,7 @@ Two levels, in dBFS (RMS), decide what counts as sound:
 - `audio.silence_threshold_dbfs` (default `-40.0`): while the speaker is held, a level below this counts as silence and runs the `idle_silence_seconds` countdown.
 - `audio.sound_threshold_dbfs` (optional, default `silence_threshold_dbfs + 6`, so `-34.0` with the default): while the speaker is released, the level must reach this and stay there for the confirm window before the speaker is acquired. It must not be lower than the silence threshold.
 
-The gap between the two is deliberate. Idle noise of a Bluetooth turntable such as the AT-LP60-BT hovers around `-50` to `-38` with no record playing, so it can sit above the silence threshold without ever being loud enough to acquire the speaker. Releasing is unchanged: only levels below `silence_threshold_dbfs` count as silence.
+The gap between the two is deliberate. The idle noise of a Bluetooth turntable such as the AT-LP60-BT stays above `-50` with no record playing and can drift above the silence threshold; with the gap it is not loud enough to acquire the speaker. Releasing is unchanged: only levels below `silence_threshold_dbfs` count as silence.
 
 When the speaker is acquired, the log line `sound detected; acquiring AirPlay output` carries `min_dbfs` and `max_dbfs` (the lowest and highest level during the confirm window), `sound_threshold_dbfs`, and `confirm_ms`. Use them to tune:
 
@@ -134,7 +140,21 @@ When the speaker is acquired, the log line `sound detected; acquiring AirPlay ou
 - If the speaker is never released because hum or noise stays above `silence_threshold_dbfs`, raise it toward `-35`; raise `sound_threshold_dbfs` with it, since it cannot be lower.
 - If quiet passages are cut or the speaker is released during soft music, lower `silence_threshold_dbfs` toward `-50` or `-60`.
 
-If the connection to the speaker fails or is lost, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
+### When another source takes over the speaker
+
+If an Apple TV, an iPhone, or another source starts playing on the speaker while the bridge streams, the speaker closes the bridge's session. The bridge recognizes this (the receiver closed the connection: `error_kind` `eof` or `reset-or-broken-pipe` in the logs) and does not fight for the speaker. It logs a warning, `AirPlay output taken by another source; waiting for silence then new sound before reconnecting`, with `consecutive_preemptions`, `backoff_seconds`, `error_kind`, and `since_stream_start_ms`, and then restarts into a waiting state. This is not an error: it happens whatever `output.auto_reconnect` is set to, and the process does not exit.
+
+The speaker is only taken back when all of these hold:
+
+1. The backoff has elapsed. It starts when the new process starts and is `runtime.preemption_backoff_seconds` (default 30) for the first takeover, doubling for each consecutive one (30, 60, 120, ...) up to `runtime.preemption_backoff_max_seconds` (default 600). Silence heard during the backoff counts for the next condition.
+2. The input has been continuously silent, below `audio.silence_threshold_dbfs`, for `runtime.preempted_silence_seconds` (default 5). Idle noise between the two thresholds is not silence.
+3. After that silence, new sound is confirmed as described above (sound threshold held for `runtime.sound_confirm_ms`).
+
+Sound that never stops, such as a record that is still playing or constant noise, therefore never takes the speaker back: the turntable has to go quiet first, for example when the record ends or is lifted. This also applies when `runtime.idle_silence_seconds = 0`.
+
+The count of consecutive takeovers starts over when a session ends any other way (released on silence, failed or lost connection, failed attempt to connect) and when a session streamed for at least `runtime.preemption_backoff_max_seconds` before being taken over. It is handed to the next process in the `AUTO_AIRPLAY_PREEMPTIONS` environment variable, which is internal: a missing or invalid value means no takeover, and restarting the service (or changing the configuration) always starts clean. Stopping the service or changing the configuration during the wait is handled immediately.
+
+If the connection to the speaker fails or is lost for any other reason, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
 
 Each AirPlay session runs in its own process: after the speaker is released, or after a failed or lost connection, `auto-airplay` replaces itself with a fresh copy of the same command (the PID stays the same). This keeps per-connection resources of the AirPlay library from accumulating over days of use. On these internal restarts the Bluetooth AVRCP Play command is not sent again, so a source that was stopped on purpose stays stopped.
 

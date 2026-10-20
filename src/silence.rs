@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::preemption::PreemptionGate;
+
 const FULL_SCALE: f64 = 32_768.0;
 
 /// RMS level of interleaved 16-bit samples, normalized to `0.0..=1.0`.
@@ -77,6 +79,7 @@ pub struct SilenceMonitor {
     /// sound threshold, with the lowest and highest level seen in it.
     sound_window: Option<SoundWindow>,
     silent_since: Option<Instant>,
+    gate: Option<PreemptionGate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +107,7 @@ impl SilenceMonitor {
             state: OutputState::Released,
             sound_window: None,
             silent_since: None,
+            gate: None,
         }
     }
 
@@ -121,8 +125,15 @@ impl SilenceMonitor {
     pub fn observe(&mut self, level_dbfs: f32, now: Instant) -> Option<Action> {
         match self.state {
             OutputState::Released => {
+                let gate_open = match self.gate.as_mut() {
+                    Some(gate) => {
+                        gate.observe(level_dbfs < self.silence_threshold_dbfs, now);
+                        gate.is_open(now)
+                    }
+                    None => true,
+                };
                 if self.idle.is_zero() {
-                    return Some(Action::Acquire);
+                    return gate_open.then_some(Action::Acquire);
                 }
                 if level_dbfs < self.sound_threshold_dbfs {
                     self.sound_window = None;
@@ -136,7 +147,7 @@ impl SilenceMonitor {
                 window.min_dbfs = window.min_dbfs.min(level_dbfs);
                 window.max_dbfs = window.max_dbfs.max(level_dbfs);
                 let confirmed = now.saturating_duration_since(window.since) >= self.confirm;
-                confirmed.then_some(Action::Acquire)
+                (confirmed && gate_open).then_some(Action::Acquire)
             }
             OutputState::Active => {
                 if self.idle.is_zero() {
@@ -152,11 +163,27 @@ impl SilenceMonitor {
         }
     }
 
+    /// Holds acquisition back until `gate` opens, whatever the level does. The
+    /// gate is dropped as soon as the output is acquired or released.
+    pub fn with_gate(mut self, gate: PreemptionGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Whether a gate is waiting and the input has been quiet long enough for
+    /// it; only new sound (and the backoff) is missing.
+    pub fn gate_quiet_reached(&self) -> bool {
+        self.gate
+            .as_ref()
+            .is_some_and(PreemptionGate::quiet_reached)
+    }
+
     /// The output was acquired; start watching for silence.
     pub fn mark_active(&mut self, _now: Instant) {
         self.state = OutputState::Active;
         self.sound_window = None;
         self.silent_since = None;
+        self.gate = None;
     }
 
     /// The output was released; start watching for sound.
@@ -164,6 +191,7 @@ impl SilenceMonitor {
         self.state = OutputState::Released;
         self.sound_window = None;
         self.silent_since = None;
+        self.gate = None;
     }
 }
 
@@ -591,5 +619,112 @@ mod tests {
             feed(&mut monitor, start, vec![THRESHOLD; 20]),
             Some((CONFIRM, Action::Acquire))
         );
+    }
+
+    const QUIET: Duration = Duration::from_secs(5);
+
+    fn gated_monitor(start: Instant, backoff: Duration) -> SilenceMonitor {
+        monitor().with_gate(PreemptionGate::new(QUIET, start + backoff))
+    }
+
+    #[test]
+    fn gated_sound_that_never_stops_never_acquires() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, secs(30));
+
+        // A record still playing, or constant noise above the sound threshold.
+        assert_eq!(feed(&mut monitor, start, vec![SOUND; 14_400]), None);
+        assert!(!monitor.gate_quiet_reached());
+    }
+
+    #[test]
+    fn gated_silence_shorter_than_required_then_sound_does_not_acquire() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, Duration::ZERO);
+
+        // 4.75 s of silence, then sound.
+        let levels = vec![SILENT; 20].into_iter().chain(vec![SOUND; 14_400]);
+        assert_eq!(feed(&mut monitor, start, levels), None);
+        assert!(!monitor.gate_quiet_reached());
+    }
+
+    #[test]
+    fn gated_noise_between_the_thresholds_does_not_count_as_silence() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, Duration::ZERO);
+        let between = (THRESHOLD + SOUND_THRESHOLD) / 2.0;
+
+        // Silence interrupted by idle noise every 4 s never adds up to 5 s.
+        let levels = (0..14_400).map(|index| if index % 16 == 15 { between } else { SILENT });
+        assert_eq!(feed(&mut monitor, start, levels), None);
+        assert!(!monitor.gate_quiet_reached());
+    }
+
+    #[test]
+    fn gated_silence_then_confirmed_sound_acquires_once_the_backoff_elapsed() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, secs(30));
+
+        // 10 s of silence, then sound: confirmed after 2 s, at 12 s...
+        let levels = vec![SILENT; 40].into_iter().chain(vec![SOUND; 200]);
+        let acquired = feed(&mut monitor, start, levels);
+
+        // ...but the backoff holds it back until 30 s.
+        assert_eq!(acquired, Some((secs(30), Action::Acquire)));
+        assert!(monitor.gate_quiet_reached());
+    }
+
+    #[test]
+    fn gated_acquires_after_the_confirm_window_when_the_backoff_is_over() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, secs(30));
+
+        // Backoff elapsed during a long silence; new sound is then confirmed
+        // as usual, with no extra wait.
+        let levels = vec![SILENT; 200].into_iter().chain(vec![SOUND; 20]);
+        assert_eq!(
+            feed(&mut monitor, start, levels),
+            Some((secs(50) + CONFIRM, Action::Acquire))
+        );
+    }
+
+    #[test]
+    fn gated_pops_after_the_silence_still_need_the_confirm_window() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, Duration::ZERO);
+
+        let pops = (0..4_000).map(|index| if index % 8 == 7 { SILENT } else { SOUND });
+        let levels = vec![SILENT; 24].into_iter().chain(pops);
+        assert_eq!(feed(&mut monitor, start, levels), None);
+        assert!(monitor.gate_quiet_reached());
+    }
+
+    #[test]
+    fn gate_applies_even_when_idle_release_is_disabled() {
+        let start = Instant::now();
+        let mut monitor = SilenceMonitor::new(THRESHOLD, SOUND_THRESHOLD, Duration::ZERO, CONFIRM)
+            .with_gate(PreemptionGate::new(QUIET, start));
+
+        assert_eq!(feed(&mut monitor, start, vec![SOUND; 100]), None);
+        assert_eq!(
+            monitor.observe(SILENT, start + secs(100)),
+            None,
+            "starts counting silence only now"
+        );
+        assert_eq!(
+            monitor.observe(SILENT, start + secs(105)),
+            Some(Action::Acquire)
+        );
+    }
+
+    #[test]
+    fn the_gate_is_dropped_once_the_output_is_active() {
+        let start = Instant::now();
+        let mut monitor = gated_monitor(start, secs(600));
+        monitor.mark_active(start);
+        monitor.mark_released(start);
+
+        let acquired = feed(&mut monitor, start, vec![SOUND; 20]);
+        assert_eq!(acquired, Some((CONFIRM, Action::Acquire)));
     }
 }

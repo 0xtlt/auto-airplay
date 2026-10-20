@@ -23,6 +23,11 @@ use crate::config::ConfigStore;
 #[cfg(target_os = "linux")]
 use crate::config::{AppConfig, OutputProtocol};
 #[cfg(target_os = "linux")]
+use crate::preemption::{
+    PREEMPTIONS_ENV, PreemptionGate, backoff_delay, decode_preemptions, encode_preemptions,
+    is_preemption_kind, next_consecutive,
+};
+#[cfg(target_os = "linux")]
 use crate::shutdown::ShutdownFlag;
 #[cfg(target_os = "linux")]
 use crate::silence::{Action, SilenceMonitor, linear_to_dbfs};
@@ -46,17 +51,28 @@ async fn run_linux(store: ConfigStore) -> Result<()> {
             "obsolete configuration field ignored: auto-airplay no longer changes the speaker volume"
         );
     }
+    let started = Instant::now();
     let recycled = std::env::var_os(RECYCLED_ENV).is_some();
-    tracing::info!(path = %store.path().display(), recycled, "starting auto-airplay");
+    let preemptions = decode_preemptions(
+        std::env::var_os(PREEMPTIONS_ENV)
+            .as_deref()
+            .and_then(|raw| raw.to_str()),
+    );
+    tracing::info!(
+        path = %store.path().display(),
+        recycled,
+        preemptions,
+        "starting auto-airplay"
+    );
 
-    match run_session(&store, config, recycled).await? {
+    match run_session(&store, config, recycled, preemptions, started).await? {
         SessionExit::ConfigurationChanged => {
             tracing::info!("configuration changed; exiting for a clean supervisor restart");
         }
         SessionExit::Shutdown => tracing::info!("shutdown requested"),
-        SessionExit::Recycle(shutdown) => {
+        SessionExit::Recycle(shutdown, preemptions) => {
             tracing::info!("restarting in a fresh process for the next AirPlay session");
-            return recycle_process(&shutdown);
+            return recycle_process(&shutdown, preemptions);
         }
     }
     Ok(())
@@ -68,7 +84,8 @@ enum SessionExit {
     Shutdown,
     /// The AirPlay session is over (released, lost, or could not start); run
     /// the next one in a fresh process image, unless a shutdown arrives first.
-    Recycle(ShutdownFlag),
+    /// The count is the consecutive preemptions to carry over (0 for none).
+    Recycle(ShutdownFlag, u32),
 }
 
 /// Set on processes started by [`recycle_process`].
@@ -108,6 +125,13 @@ struct OutputTarget {
 /// Runs at most one AirPlay session: wait for sound, acquire the speaker,
 /// stream until the input goes silent, then release it.
 ///
+/// `preemptions` is the number of consecutive times another AirPlay source took
+/// the speaker over (from [`PREEMPTIONS_ENV`]). While it is positive, the
+/// speaker is not re-acquired before the backoff (counted from `started`) has
+/// elapsed, the input has been silent for `runtime.preempted_silence_seconds`,
+/// and new sound has been confirmed. A preemption is not an error: it always
+/// recycles into that wait, whatever `output.auto_reconnect` says.
+///
 /// The pinned AirPlay library leaks a polling thread, sockets and an mDNS
 /// daemon per connection, and none of them stop on disconnect. Instead of
 /// reconnecting in-process, the session ends with [`SessionExit::Recycle`] and
@@ -117,6 +141,8 @@ async fn run_session(
     store: &ConfigStore,
     config: AppConfig,
     recycled: bool,
+    preemptions: u32,
+    started: Instant,
 ) -> Result<SessionExit> {
     if config.output.protocol != OutputProtocol::AirPlay2 {
         bail!("live streaming currently requires `output.protocol = \"air_play2\"`");
@@ -163,7 +189,19 @@ async fn run_session(
         sound_confirm,
     );
     let reconnect_delay = Duration::from_secs(config.runtime.reconnect_delay_seconds.max(1));
-    if idle.is_zero() {
+    let backoff_base = Duration::from_secs(config.runtime.preemption_backoff_seconds);
+    let backoff_max = Duration::from_secs(config.runtime.preemption_backoff_max_seconds);
+    if preemptions > 0 {
+        let backoff = backoff_delay(backoff_base, backoff_max, preemptions);
+        let quiet = Duration::from_secs(config.runtime.preempted_silence_seconds);
+        monitor = monitor.with_gate(PreemptionGate::new(quiet, started + backoff));
+        tracing::info!(
+            consecutive_preemptions = preemptions,
+            backoff_seconds = backoff.as_secs(),
+            silence_seconds = quiet.as_secs(),
+            "AirPlay output was taken by another source; waiting for the backoff, then silence, then new sound before reconnecting"
+        );
+    } else if idle.is_zero() {
         tracing::info!("silence release disabled; acquiring the AirPlay output");
     } else {
         tracing::info!("waiting for sound before acquiring the AirPlay output");
@@ -185,6 +223,8 @@ async fn run_session(
     // timeout and for any receiver status, so this is the last time it returned
     // Ok, not proof that the receiver answered the feedback.
     let mut last_feedback_ok_return: Option<Instant> = None;
+    // Logged once, when a preemption gate has seen enough silence.
+    let mut quiet_logged = false;
     // Pause before recycling after a failure, so a missing speaker is not
     // hammered with attempts.
     let mut retry_delay: Option<Duration> = None;
@@ -212,7 +252,7 @@ async fn run_session(
                                 release_output(active, &sink).await;
                             }
                             monitor.mark_released(now);
-                            break Ok(signals.recycle());
+                            break Ok(signals.recycle(0));
                         }
                         Some(Action::Acquire) => {
                             let (min_dbfs, max_dbfs) = monitor.sound_levels().unzip();
@@ -239,12 +279,18 @@ async fn run_session(
                                         "cannot acquire AirPlay output"
                                     );
                                     retry_delay = Some(reconnect_delay);
-                                    break Ok(signals.recycle());
+                                    break Ok(signals.recycle(0));
                                 }
                                 Acquisition::Interrupted(exit) => break exit,
                             }
                         }
                         None => {}
+                    }
+                    if !quiet_logged && monitor.gate_quiet_reached() {
+                        quiet_logged = true;
+                        tracing::info!(
+                            "input quiet after the preemption; waiting for new sound before reconnecting"
+                        );
                     }
                 }
             }
@@ -271,11 +317,12 @@ async fn run_session(
             let since_ms = |earlier: Option<Instant>| {
                 earlier.map(|earlier| now.duration_since(earlier).as_millis() as u64)
             };
+            let since_stream_start_ms = since_ms(stream_started);
             let stats = client.as_ref().map(AirPlayClient::stats_snapshot);
             tracing::warn!(
                 error = format!("{error:#}"),
                 error_kind,
-                since_stream_start_ms = since_ms(stream_started),
+                since_stream_start_ms,
                 since_last_feedback_ok_return_ms = since_ms(last_feedback_ok_return),
                 packets_sent = stats.as_ref().map(|stats| stats.packets_sent),
                 underruns = stats.as_ref().map(|stats| stats.underruns),
@@ -285,6 +332,22 @@ async fn run_session(
             );
             if let Some(active) = client.take() {
                 release_output(active, &sink).await;
+            }
+            if is_preemption_kind(error_kind) {
+                // The receiver closed the session: someone else took the
+                // speaker. Not an error, and `auto_reconnect` does not apply.
+                let streamed = stream_started.map_or(Duration::ZERO, |at| now.duration_since(at));
+                let consecutive = next_consecutive(preemptions, streamed, backoff_max);
+                let backoff = backoff_delay(backoff_base, backoff_max, consecutive);
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    error_kind,
+                    consecutive_preemptions = consecutive,
+                    backoff_seconds = backoff.as_secs(),
+                    since_stream_start_ms,
+                    "AirPlay output taken by another source; waiting for silence then new sound before reconnecting"
+                );
+                break Ok(signals.recycle(consecutive));
             }
             if !config.output.auto_reconnect {
                 break Err(error);
@@ -296,7 +359,7 @@ async fn run_session(
                 "AirPlay output lost; reconnecting once sound is present"
             );
             retry_delay = Some(reconnect_delay);
-            break Ok(signals.recycle());
+            break Ok(signals.recycle(0));
         }
     };
 
@@ -306,7 +369,7 @@ async fn run_session(
     }
     drop(capture);
 
-    if let Ok(SessionExit::Recycle(_)) = result {
+    if let Ok(SessionExit::Recycle(..)) = result {
         // Signals and config changes that arrived during teardown must win
         // over the restart; `exec` would drop them.
         if signals.requested() {
@@ -328,7 +391,7 @@ async fn run_session(
 /// Returns `Ok` without restarting if a shutdown was requested; otherwise
 /// only returns on failure, and the caller exits so systemd restarts us.
 #[cfg(target_os = "linux")]
-fn recycle_process(shutdown: &ShutdownFlag) -> Result<()> {
+fn recycle_process(shutdown: &ShutdownFlag, preemptions: u32) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let program = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
@@ -336,6 +399,11 @@ fn recycle_process(shutdown: &ShutdownFlag) -> Result<()> {
     command
         .args(std::env::args_os().skip(1))
         .env(RECYCLED_ENV, "1");
+    // Explicit either way: a stale count must not outlive the preemption.
+    match encode_preemptions(preemptions) {
+        Some(count) => command.env(PREEMPTIONS_ENV, count),
+        None => command.env_remove(PREEMPTIONS_ENV),
+    };
     // Last check, as close to exec as possible.
     if shutdown.is_requested() {
         tracing::info!("shutdown requested");
@@ -370,8 +438,8 @@ impl ShutdownSignals {
         self.flag.is_requested()
     }
 
-    fn recycle(&self) -> SessionExit {
-        SessionExit::Recycle(self.flag.clone())
+    fn recycle(&self, preemptions: u32) -> SessionExit {
+        SessionExit::Recycle(self.flag.clone(), preemptions)
     }
 
     async fn recv(&mut self) {
@@ -620,6 +688,7 @@ mod tests {
     use std::io::{Error as IoError, ErrorKind};
 
     use super::classify_error;
+    use crate::preemption::is_preemption_kind;
 
     fn io(kind: ErrorKind) -> anyhow::Error {
         airplay_core::error::Error::from(IoError::new(kind, "x")).into()
@@ -661,5 +730,35 @@ mod tests {
         let error = anyhow::Error::from(IoError::new(ErrorKind::UnexpectedEof, "early eof"))
             .context("feedback");
         assert_eq!(classify_error(&error), "eof");
+    }
+
+    fn is_preempted(error: &anyhow::Error) -> bool {
+        is_preemption_kind(classify_error(error))
+    }
+
+    #[test]
+    fn the_receiver_closing_the_session_is_a_preemption() {
+        assert!(is_preempted(&io(ErrorKind::UnexpectedEof)));
+        assert!(is_preempted(&io(ErrorKind::ConnectionReset)));
+        assert!(is_preempted(&io(ErrorKind::ConnectionAborted)));
+        assert!(is_preempted(&io(ErrorKind::BrokenPipe)));
+
+        // Early eof on a feedback request, with context added on the way up.
+        let feedback = anyhow::Error::from(IoError::new(ErrorKind::UnexpectedEof, "early eof"))
+            .context("POST /feedback");
+        assert!(is_preempted(&feedback));
+    }
+
+    #[test]
+    fn other_failures_are_not_preemptions() {
+        assert!(!is_preempted(&io(ErrorKind::TimedOut)));
+        assert!(!is_preempted(&io(ErrorKind::PermissionDenied)));
+        assert!(!is_preempted(&airplay_core::error::Error::Timeout.into()));
+        assert!(!is_preempted(&anyhow::anyhow!(
+            "AirPlay feedback timed out"
+        )));
+        assert!(!is_preempted(&anyhow::anyhow!(
+            "AirPlay stream stopped accepting audio"
+        )));
     }
 }

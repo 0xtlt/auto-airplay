@@ -46,7 +46,7 @@ impl AppConfig {
         fields
     }
 
-    /// Checks the settings that drive sound detection. The daemon refuses to
+    /// Checks the settings that drive sound detection and preemption handling. The daemon refuses to
     /// start with a configuration that fails this check.
     pub fn validate_detection(&self) -> Result<(), String> {
         let silence = self.audio.silence_threshold_dbfs;
@@ -70,6 +70,28 @@ impl AppConfig {
                 SOUND_CONFIRM_MS_RANGE.end()
             ));
         }
+        let runtime = &self.runtime;
+        if !PREEMPTED_SILENCE_SECONDS_RANGE.contains(&runtime.preempted_silence_seconds) {
+            return Err(format!(
+                "runtime preempted_silence_seconds must be between {} and {}",
+                PREEMPTED_SILENCE_SECONDS_RANGE.start(),
+                PREEMPTED_SILENCE_SECONDS_RANGE.end()
+            ));
+        }
+        if runtime.preemption_backoff_seconds < 1 {
+            return Err("runtime preemption_backoff_seconds must be at least 1".into());
+        }
+        if runtime.preemption_backoff_max_seconds < runtime.preemption_backoff_seconds {
+            return Err(
+                "runtime preemption_backoff_max_seconds must not be below preemption_backoff_seconds"
+                    .into(),
+            );
+        }
+        if runtime.preemption_backoff_max_seconds > MAX_PREEMPTION_BACKOFF_SECONDS {
+            return Err(format!(
+                "runtime preemption_backoff_max_seconds must be at most {MAX_PREEMPTION_BACKOFF_SECONDS}"
+            ));
+        }
         Ok(())
     }
 }
@@ -77,6 +99,12 @@ impl AppConfig {
 fn is_valid_dbfs(value: f32) -> bool {
     value.is_finite() && (-120.0..=0.0).contains(&value)
 }
+
+/// Accepted values of `runtime.preempted_silence_seconds`.
+pub const PREEMPTED_SILENCE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 1..=3_600;
+
+/// Upper bound of `runtime.preemption_backoff_max_seconds` (one day).
+pub const MAX_PREEMPTION_BACKOFF_SECONDS: u64 = 86_400;
 
 /// Accepted values of `runtime.sound_confirm_ms`.
 pub const SOUND_CONFIRM_MS_RANGE: std::ops::RangeInclusive<u64> = 250..=60_000;
@@ -226,6 +254,13 @@ pub struct RuntimeConfig {
     /// How long the input must stay at or above the sound threshold, without a
     /// single dip below it, before the AirPlay output is acquired.
     pub sound_confirm_ms: u64,
+    /// After another AirPlay source takes over the speaker, the input must be
+    /// silent for this long (seconds) before new sound may re-acquire it.
+    pub preempted_silence_seconds: u64,
+    /// Pause (seconds) before re-acquiring after a preemption; doubles for
+    /// every consecutive one, up to `preemption_backoff_max_seconds`.
+    pub preemption_backoff_seconds: u64,
+    pub preemption_backoff_max_seconds: u64,
     pub log_level: String,
 }
 
@@ -235,6 +270,9 @@ impl Default for RuntimeConfig {
             reconnect_delay_seconds: 3,
             idle_silence_seconds: 30,
             sound_confirm_ms: 2_000,
+            preempted_silence_seconds: 5,
+            preemption_backoff_seconds: 30,
+            preemption_backoff_max_seconds: 600,
             log_level: "info".into(),
         }
     }

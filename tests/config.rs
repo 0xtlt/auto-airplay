@@ -223,6 +223,9 @@ fn sound_detection_defaults_apply_to_configs_without_the_new_keys() {
     assert_eq!(config.audio.sound_threshold_dbfs, None);
     assert_eq!(config.audio.effective_sound_threshold_dbfs(), -34.0);
     assert_eq!(config.runtime.sound_confirm_ms, 2_000);
+    assert_eq!(config.runtime.preempted_silence_seconds, 5);
+    assert_eq!(config.runtime.preemption_backoff_seconds, 30);
+    assert_eq!(config.runtime.preemption_backoff_max_seconds, 600);
     assert!(config.validate_detection().is_ok());
     assert_eq!(config_from(""), AppConfig::default());
 }
@@ -298,4 +301,76 @@ fn sound_detection_validation_accepts_the_edges() {
     config.audio.sound_threshold_dbfs = Some(0.0);
     config.runtime.sound_confirm_ms = 60_000;
     assert!(config.validate_detection().is_ok());
+}
+
+#[test]
+fn preemption_keys_can_be_configured_and_survive_a_save() {
+    let config = config_from(
+        "[runtime]\npreempted_silence_seconds = 10\npreemption_backoff_seconds = 60\npreemption_backoff_max_seconds = 900\n",
+    );
+    assert_eq!(config.runtime.preempted_silence_seconds, 10);
+    assert_eq!(config.runtime.preemption_backoff_seconds, 60);
+    assert_eq!(config.runtime.preemption_backoff_max_seconds, 900);
+    assert!(config.validate_detection().is_ok());
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(directory.path().join("config.toml"));
+    store.save(&config).unwrap();
+    assert_eq!(store.load().unwrap(), config);
+}
+
+#[test]
+fn preemption_validation_rejects_bad_values() {
+    let error = |edit: &dyn Fn(&mut AppConfig)| {
+        let mut config = AppConfig::default();
+        edit(&mut config);
+        config.validate_detection().unwrap_err()
+    };
+
+    for bad in [0, 3_601] {
+        assert!(
+            error(&|c| c.runtime.preempted_silence_seconds = bad)
+                .contains("preempted_silence_seconds")
+        );
+    }
+    assert!(
+        error(&|c| c.runtime.preemption_backoff_seconds = 0)
+            .contains("preemption_backoff_seconds must be at least 1")
+    );
+    // The maximum may not be below the base (30 by default).
+    assert!(
+        error(&|c| c.runtime.preemption_backoff_max_seconds = 29)
+            .contains("must not be below preemption_backoff_seconds")
+    );
+    assert!(
+        error(&|c| c.runtime.preemption_backoff_max_seconds = 86_401).contains("at most 86400")
+    );
+}
+
+#[test]
+fn preemption_validation_accepts_the_edges() {
+    let mut config = AppConfig::default();
+    config.runtime.preempted_silence_seconds = 1;
+    config.runtime.preemption_backoff_seconds = 1;
+    config.runtime.preemption_backoff_max_seconds = 1;
+    assert!(config.validate_detection().is_ok());
+
+    config.runtime.preempted_silence_seconds = 3_600;
+    config.runtime.preemption_backoff_seconds = 86_400;
+    config.runtime.preemption_backoff_max_seconds = 86_400;
+    assert!(config.validate_detection().is_ok());
+}
+
+#[test]
+fn changing_a_preemption_key_counts_as_a_configuration_change() {
+    let base = AppConfig::default();
+    for edit in [
+        (|c: &mut AppConfig| c.runtime.preempted_silence_seconds = 6) as fn(&mut AppConfig),
+        |c| c.runtime.preemption_backoff_seconds = 31,
+        |c| c.runtime.preemption_backoff_max_seconds = 601,
+    ] {
+        let mut changed = base.clone();
+        edit(&mut changed);
+        assert_ne!(base, changed);
+    }
 }

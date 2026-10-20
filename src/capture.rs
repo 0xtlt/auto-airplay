@@ -3,12 +3,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use airplay_client::{LiveFrameSender, LivePcmFrame};
+use airplay_client::LiveFrameSender;
 use alsa::pcm::PCM;
 use anyhow::{Context, Result};
 
 use crate::platform::linux::{OpenedInput, SampleEncoding};
-use crate::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES, Pacer, STATS_INTERVAL};
+use crate::playout::{Feed, Stream};
+use crate::plc::{JitterBuffer, STATS_INTERVAL};
 
 /// The jitter buffer shared by the capture and playout threads. Critical
 /// sections are one capture period of copying at most.
@@ -19,7 +20,7 @@ type SharedBuffer = Arc<Mutex<JitterBuffer>>;
 /// playout thread forwards it, paced, while an AirPlay stream is attached.
 #[derive(Default)]
 pub struct AudioSink {
-    stream: Mutex<Stream>,
+    stream: Mutex<Option<Stream>>,
     /// Peak linear RMS since the last read, as `f32` bits. Levels are never
     /// negative, so the bit patterns order the same way as the values.
     level_bits: AtomicU32,
@@ -28,23 +29,6 @@ pub struct AudioSink {
     /// buffer.
     buffer: Mutex<Option<SharedBuffer>>,
 }
-
-/// The attached stream, if any, and how long it has been refusing frames.
-#[derive(Default)]
-struct Stream {
-    sender: Option<LiveFrameSender>,
-    /// Paces the audio taken from the jitter buffer.
-    pacer: Option<Pacer>,
-    /// Stall detection only runs once the stream is playing: while it starts
-    /// up, the queue legitimately stays full and refused frames are dropped.
-    armed: bool,
-    refusing_since: Option<Instant>,
-}
-
-/// How long a stream may refuse every frame before it counts as dead.
-/// `try_send` cannot tell a briefly full queue from a closed one, so a single
-/// refusal only delays that frame.
-const STALL_LIMIT: Duration = Duration::from_secs(5);
 
 /// How long the playout thread sleeps when there is nothing to send.
 const PLAYOUT_IDLE: Duration = Duration::from_millis(3);
@@ -58,31 +42,26 @@ impl AudioSink {
     /// Playback starts from the audio queued in the jitter buffer.
     pub fn attach(&self, sender: LiveFrameSender) {
         let mut stream = self.stream();
-        let pacer = self.installed().map(|buffer| {
+        *stream = self.installed().map(|buffer| {
             let mut buffer = lock(&buffer);
             buffer.start_playout();
-            buffer.pacer()
+            Stream::new(sender, buffer.pacer())
         });
-        *stream = Stream {
-            sender: Some(sender),
-            pacer,
-            ..Stream::default()
-        };
         self.failed.store(false, Ordering::Release);
     }
 
     /// The stream is now playing: from here on, a stream that keeps refusing
     /// frames counts as dead.
     pub fn arm(&self) {
-        let mut stream = self.stream();
-        stream.armed = true;
-        stream.refusing_since = None;
+        if let Some(stream) = self.stream().as_mut() {
+            stream.arm();
+        }
     }
 
     /// Stops forwarding frames. The capture thread keeps measuring the level.
     pub fn detach(&self) {
         let mut stream = self.stream();
-        *stream = Stream::default();
+        *stream = None;
         if let Some(buffer) = self.installed() {
             lock(&buffer).stop_playout();
         }
@@ -117,11 +96,8 @@ impl AudioSink {
     }
 
     /// Hands the next chunk to the attached stream if it is due. Returns
-    /// whether a chunk went out.
-    ///
-    /// The queue of the AirPlay sender is only offered audio while it has
-    /// room, at the pace of the [`Pacer`]. Never sleeps and never keeps the
-    /// stream lock beyond one chunk.
+    /// whether a chunk went out. Never sleeps and never keeps the stream lock
+    /// beyond one chunk.
     fn feed(
         &self,
         buffer: &Mutex<JitterBuffer>,
@@ -130,57 +106,23 @@ impl AudioSink {
         now: Duration,
     ) -> bool {
         let mut guard = self.stream();
-        let stream = &mut *guard;
-        let (Some(sender), Some(pacer)) = (stream.sender.as_ref(), stream.pacer.as_mut()) else {
+        let Some(stream) = guard.as_mut() else {
             return false;
         };
-        if sender.is_full() {
-            pacer.blocked(now);
-            self.note_refusal(stream, buffer);
-            return false;
-        }
-        stream.refusing_since = None;
-        if !lock(buffer).pull_chunk(pacer, now, chunk) {
-            return false;
-        }
-
-        // The AirPlay resampler takes nothing but whole playout chunks.
-        let expected = PLAYOUT_CHUNK_FRAMES * usize::from(format.0);
-        debug_assert_eq!(chunk.len(), expected);
-        if chunk.len() != expected {
-            return false;
-        }
-        let frame = LivePcmFrame {
-            samples: chunk.to_vec(),
-            channels: format.0,
-            sample_rate: format.1,
-        };
-        if sender.try_send(frame) {
-            pacer.sent(PLAYOUT_CHUNK_FRAMES);
-            true
-        } else {
-            self.note_refusal(stream, buffer);
-            false
+        match stream.feed(buffer, chunk, format, now, Instant::now()) {
+            Feed::Sent => true,
+            Feed::Idle => false,
+            Feed::Dead => {
+                tracing::debug!("AirPlay stream stopped accepting audio; detaching the sink");
+                *guard = None;
+                lock(buffer).stop_playout();
+                self.failed.store(true, Ordering::Release);
+                false
+            }
         }
     }
 
-    fn note_refusal(&self, stream: &mut Stream, buffer: &Mutex<JitterBuffer>) {
-        if !stream.armed {
-            return;
-        }
-        let now = Instant::now();
-        let since = *stream.refusing_since.get_or_insert(now);
-        if now.duration_since(since) < STALL_LIMIT {
-            tracing::debug!("AirPlay stream is behind; holding audio back");
-        } else {
-            tracing::debug!("AirPlay stream stopped accepting audio; detaching the sink");
-            *stream = Stream::default();
-            lock(buffer).stop_playout();
-            self.failed.store(true, Ordering::Release);
-        }
-    }
-
-    fn stream(&self) -> MutexGuard<'_, Stream> {
+    fn stream(&self) -> MutexGuard<'_, Option<Stream>> {
         self.stream
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod output;
 pub mod platform;
+pub mod plc;
 pub mod preemption;
 #[cfg(unix)]
 pub mod shutdown;

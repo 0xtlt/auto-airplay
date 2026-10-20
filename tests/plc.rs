@@ -1,0 +1,1073 @@
+//! Packet loss concealment, jitter buffer, gap detection and pacing, on
+//! simulated Bluetooth streams. Signals are near-full-scale sines: any splice
+//! shows as a step much bigger than the sine's own slope.
+
+use std::time::Duration;
+
+use auto_airplay::plc::{Due, GapDetector, GapVerdict, JitterBuffer, Pacer};
+
+const RATE: u32 = 48_000;
+const CH: usize = 2;
+const AMPLITUDE: f32 = 0.9 * 32_767.0;
+const LEFT_HZ: f32 = 1_000.0;
+const RIGHT_HZ: f32 = 1_300.0;
+/// A step may exceed the signal's own maximum slope by this factor.
+const STEP_MARGIN: f32 = 1.5;
+const PERIOD: usize = 1024;
+
+fn frames(ms: u32) -> usize {
+    (RATE as usize * ms as usize) / 1000
+}
+
+fn ms(duration: usize) -> f64 {
+    duration as f64 * 1000.0 / f64::from(RATE)
+}
+
+/// `count` stereo frames of the source starting at absolute frame `start`.
+/// Left and right differ in frequency, so channels are told apart.
+fn source(start: usize, count: usize) -> Vec<i16> {
+    let mut samples = Vec::with_capacity(count * CH);
+    for frame in start..start + count {
+        for hz in [LEFT_HZ, RIGHT_HZ] {
+            let phase = std::f32::consts::TAU * hz * frame as f32 / RATE as f32;
+            samples.push((phase.sin() * AMPLITUDE) as i16);
+        }
+    }
+    samples
+}
+
+fn natural_step(hz: f32) -> f32 {
+    AMPLITUDE * std::f32::consts::TAU * hz / RATE as f32
+}
+
+fn max_step(samples: &[i16], channel: usize) -> f32 {
+    let values: Vec<f32> = samples
+        .iter()
+        .skip(channel)
+        .step_by(CH)
+        .map(|&sample| f32::from(sample))
+        .collect();
+    values
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .fold(0.0, f32::max)
+}
+
+/// No step in either channel is bigger than the sine's own slope (plus margin).
+#[track_caller]
+fn assert_continuous(samples: &[i16]) {
+    for (channel, hz) in [(0, LEFT_HZ), (1, RIGHT_HZ)] {
+        let step = max_step(samples, channel);
+        let limit = STEP_MARGIN * natural_step(hz);
+        assert!(
+            step <= limit,
+            "channel {channel}: step {step} exceeds {limit} (natural {})",
+            natural_step(hz)
+        );
+    }
+}
+
+fn pull_all(buffer: &mut JitterBuffer, count: usize) -> Vec<i16> {
+    let mut out = vec![0_i16; count * CH];
+    assert!(buffer.pull(&mut out, true));
+    out
+}
+
+/// Takes every complete chunk of real audio out of the buffer.
+fn drain(buffer: &mut JitterBuffer) -> Vec<i16> {
+    let mut all = Vec::new();
+    let mut chunk = vec![0_i16; buffer.chunk_frames() * CH];
+    while buffer.pull(&mut chunk, false) {
+        all.extend_from_slice(&chunk);
+    }
+    all
+}
+
+fn new_buffer(jitter_ms: u32) -> JitterBuffer {
+    JitterBuffer::new(RATE, CH as u8, jitter_ms)
+}
+
+fn at(ms: f64) -> Duration {
+    Duration::from_secs_f64(ms / 1000.0)
+}
+
+fn is_silent(samples: &[i16]) -> bool {
+    samples.iter().all(|&sample| sample == 0)
+}
+
+// ----- output length and startup -----
+
+#[test]
+fn pull_always_returns_exactly_the_requested_length() {
+    let mut buffer = new_buffer(100);
+    buffer.start_playout();
+    let mut position = 0;
+    for (round, count) in [1, 7, 480, 3, 1000, 480, 480, 2, 9_999, 480]
+        .into_iter()
+        .enumerate()
+    {
+        if round % 3 == 0 {
+            buffer.push(&source(position, 700));
+            position += 700;
+        }
+        let mut out = vec![i16::MAX; count * CH];
+        assert!(buffer.pull(&mut out, true), "round {round}");
+        assert_eq!(out.len(), count * CH);
+    }
+}
+
+#[test]
+fn startup_with_an_empty_buffer_is_silence_then_a_fade_in() {
+    let mut buffer = new_buffer(100);
+    buffer.start_playout();
+
+    let silence = pull_all(&mut buffer, frames(50));
+    assert!(is_silent(&silence));
+    let stats = buffer.take_stats();
+    assert_eq!(
+        (stats.losses, stats.underruns),
+        (0, 0),
+        "startup is not a loss"
+    );
+
+    buffer.push(&source(0, frames(300)));
+    let out = pull_all(&mut buffer, frames(100));
+
+    assert!(
+        out[0].unsigned_abs() < 200 && out[1].unsigned_abs() < 200,
+        "starts from silence"
+    );
+    assert_continuous(&out);
+    // Past the 10 ms crossfade the real audio comes through unchanged.
+    let skip = frames(10) * CH;
+    assert_eq!(out[skip..], source(0, frames(100))[skip..]);
+}
+
+#[test]
+fn attaching_fades_in_over_the_queued_audio() {
+    let mut buffer = new_buffer(400);
+    buffer.push(&source(0, frames(1_000)));
+    buffer.start_playout();
+
+    let out = pull_all(&mut buffer, frames(50));
+
+    assert!(out[0].unsigned_abs() < 200);
+    assert_continuous(&out);
+    assert_eq!(buffer.take_stats().losses, 0);
+}
+
+// ----- underrun concealment -----
+
+#[test]
+fn underrun_is_continuous_and_exactly_the_requested_length() {
+    let mut buffer = new_buffer(100);
+    buffer.start_playout();
+    buffer.push(&source(0, frames(100)));
+    let mut out = pull_all(&mut buffer, frames(60));
+    // Asks for more than is left: 40 ms of audio, then concealment.
+    out.extend(pull_all(&mut buffer, frames(40) + 333));
+    assert_eq!(out.len(), (frames(100) + 333) * CH);
+    out.extend(pull_all(&mut buffer, frames(20)));
+
+    assert_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!((stats.underruns, stats.losses, stats.concealed), (1, 1, 1));
+    assert_eq!(stats.concealed_ms, 26, "333 + 960 frames");
+}
+
+#[test]
+fn a_long_underrun_fades_to_silence_and_stays_silent() {
+    let mut buffer = new_buffer(100);
+    buffer.start_playout();
+    buffer.push(&source(0, frames(100)));
+    let mut out = pull_all(&mut buffer, frames(100));
+    out.extend(pull_all(&mut buffer, frames(300)));
+
+    assert_continuous(&out);
+    let after_fade = &out[(frames(100) + frames(30)) * CH..];
+    assert!(is_silent(after_fade), "silent once the 30 ms fade is over");
+    let during_fade = &out[frames(100) * CH..(frames(100) + frames(15)) * CH];
+    assert!(!is_silent(during_fade), "the signal carries on at first");
+    assert_eq!(buffer.take_stats().underruns, 1, "one event, however long");
+}
+
+#[test]
+fn an_underrun_shorter_than_the_fade_resumes_with_a_crossfade() {
+    let mut buffer = new_buffer(100);
+    buffer.start_playout();
+    buffer.push(&source(0, frames(100)));
+    let mut out = pull_all(&mut buffer, frames(100));
+    out.extend(pull_all(&mut buffer, frames(5)));
+    // The late audio arrives in force: the resume threshold is met at once.
+    buffer.push(&source(frames(300), frames(200)));
+    out.extend(pull_all(&mut buffer, frames(100)));
+
+    assert_continuous(&out);
+    let resumed = &out[(frames(105) + frames(20)) * CH..];
+    assert!(!is_silent(resumed));
+}
+
+#[test]
+fn concealment_waits_for_the_resume_threshold() {
+    let mut buffer = new_buffer(400);
+    buffer.start_playout();
+    buffer.push(&source(0, frames(400)));
+    let mut out = pull_all(&mut buffer, frames(400));
+    out.extend(pull_all(&mut buffer, frames(10)));
+    let resume = buffer.resume_frames();
+    assert_eq!(resume, frames(200));
+
+    // Just below half the target: still concealing, and a pull that would
+    // need real audio is refused.
+    buffer.push(&source(frames(2_000), resume - 1));
+    let mut chunk = vec![0_i16; frames(10) * CH];
+    assert!(!buffer.pull(&mut chunk, false), "below the threshold");
+    assert!(buffer.pull(&mut chunk, true));
+    assert_eq!(
+        buffer.fill_frames(),
+        resume - 1,
+        "audio is kept, not consumed"
+    );
+
+    // At the threshold, real audio resumes, with a crossfade.
+    buffer.push(&source(frames(2_000) + resume - 1, 1));
+    assert!(buffer.pull(&mut chunk, false));
+    out.extend_from_slice(&chunk);
+    assert_continuous(&out);
+    assert_eq!(buffer.fill_frames(), resume - frames(10));
+    assert_eq!(buffer.take_stats().underruns, 1, "no flapping");
+}
+
+#[test]
+fn repeated_back_to_back_underruns_stay_continuous() {
+    let mut buffer = new_buffer(100);
+    buffer.start_playout();
+    let mut out = Vec::new();
+    let mut position = 0;
+    for round in 0..12 {
+        let burst = frames(60 + 7 * round);
+        buffer.push(&source(position, burst));
+        position += burst + frames(40);
+        out.extend(pull_all(&mut buffer, burst + frames(25 + 3 * round)));
+    }
+    out.extend(pull_all(&mut buffer, frames(50)));
+
+    assert_continuous(&out);
+    assert!(buffer.take_stats().underruns >= 6);
+}
+
+#[test]
+fn a_second_underrun_straight_after_resuming_is_continuous() {
+    let mut buffer = new_buffer(50);
+    buffer.start_playout();
+    buffer.push(&source(0, frames(50)));
+    let mut out = pull_all(&mut buffer, frames(60));
+    // Enough to resume (25 ms), consumed immediately, over and over.
+    for round in 0..8 {
+        buffer.push(&source(frames(1_000 * (round + 1)), frames(26)));
+        out.extend(pull_all(&mut buffer, frames(30)));
+    }
+
+    assert_continuous(&out);
+}
+
+// ----- lost audio found from the arrival times -----
+
+/// Real-time arrival of `PERIOD`-frame blocks of the source, with some blocks
+/// lost, optionally delayed, as the capture thread would push them. Pulls
+/// 10 ms chunks through a [`Pacer`] like the playout thread. Everything that
+/// came out is in `out`.
+struct Pipeline {
+    buffer: JitterBuffer,
+    pacer: Pacer,
+    out: Vec<i16>,
+    now_ms: f64,
+    pushed_frames: usize,
+}
+
+impl Pipeline {
+    fn attached(jitter_ms: u32, prefill_ms: u32) -> Self {
+        let mut buffer = new_buffer(jitter_ms);
+        // The stream has been running for a while: audio is queued already.
+        let blocks = frames(prefill_ms) / PERIOD;
+        for block in 0..blocks {
+            buffer.push_at(
+                at(block as f64 * block_ms()),
+                &source(block * PERIOD, PERIOD),
+                0,
+            );
+        }
+        let pushed_frames = blocks * PERIOD;
+        let now_ms = blocks as f64 * block_ms();
+        buffer.start_playout();
+        let pacer = buffer.pacer();
+        Self {
+            buffer,
+            pacer,
+            out: Vec::new(),
+            now_ms,
+            pushed_frames,
+        }
+    }
+
+    /// Runs 1 ms steps. `arrival(block)` is when source block `block` reaches
+    /// the buffer, in ms of the source clock, or `None` if it is lost.
+    fn run(&mut self, seconds: usize, first_block: usize, arrival: impl Fn(usize) -> Option<f64>) {
+        let mut pending: Vec<(f64, usize)> = (first_block..)
+            .take_while(|&block| {
+                (block as f64 * block_ms()) < self.now_ms + seconds as f64 * 1e3 + 500.0
+            })
+            .filter_map(|block| arrival(block).map(|time| (time, block)))
+            .collect();
+        pending.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut next = 0;
+        let end = self.now_ms + seconds as f64 * 1000.0;
+        let chunk_len = self.buffer.chunk_frames();
+        let mut chunk = vec![0_i16; chunk_len * CH];
+
+        while self.now_ms < end {
+            self.now_ms += 1.0;
+            while next < pending.len() && pending[next].0 <= self.now_ms {
+                let (time, block) = pending[next];
+                self.buffer
+                    .push_at(at(time), &source(block * PERIOD, PERIOD), 0);
+                self.pushed_frames += PERIOD;
+                next += 1;
+            }
+            loop {
+                let allow = match self.pacer.due(at(self.now_ms)) {
+                    Due::Wait => break,
+                    Due::Optional => false,
+                    Due::Required => true,
+                };
+                if !self.buffer.pull(&mut chunk, allow) {
+                    break;
+                }
+                self.pacer.sent(chunk_len);
+                self.out.extend_from_slice(&chunk);
+            }
+        }
+    }
+}
+
+fn block_ms() -> f64 {
+    ms(PERIOD)
+}
+
+#[test]
+fn a_170_ms_hole_is_concealed_in_place() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    // 8 blocks (170.7 ms) never arrive; the source clock keeps going.
+    let lost = first + 40..first + 48;
+    pipeline.run(10, first, |block| {
+        (!lost.contains(&block)).then(|| block as f64 * block_ms())
+    });
+
+    assert_continuous(&pipeline.out);
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!(stats.gaps, 1, "{stats}");
+    assert_eq!(
+        (stats.losses, stats.concealed, stats.underruns),
+        (1, 1, 0),
+        "{stats}"
+    );
+    assert!((stats.concealed_ms as i64 - 170).abs() <= 3, "{stats}");
+    // The timeline stays whole: audio out == real audio in + concealment.
+    let queued = pipeline.buffer.fill_frames();
+    let concealed = (stats.concealed_ms as usize * RATE as usize) / 1000;
+    let accounted = pipeline.pushed_frames + concealed;
+    let played = pipeline.out.len() / CH;
+    assert!(
+        (accounted as i64 - (played + queued) as i64).abs() <= 400,
+        "pushed {} + concealed {concealed} vs played {played} + queued {queued}",
+        pipeline.pushed_frames,
+    );
+    // The cushion survives the loss.
+    assert!(
+        ms(queued) > 250.0 && ms(queued) < 450.0,
+        "fill {} ms",
+        ms(queued)
+    );
+}
+
+#[test]
+fn the_hole_is_bridged_by_a_fade_and_a_crossfade() {
+    let mut buffer = new_buffer(2_000);
+    let mut clock = 0.0;
+    let mut position = 0;
+    for _ in 0..40 {
+        buffer.push_at(at(clock), &source(position, PERIOD), 0);
+        position += PERIOD;
+        clock += block_ms();
+    }
+    // Eight blocks go missing.
+    position += 8 * PERIOD;
+    clock += 8.0 * block_ms();
+    for _ in 0..20 {
+        buffer.push_at(at(clock), &source(position, PERIOD), 0);
+        position += PERIOD;
+        clock += block_ms();
+    }
+    buffer.start_playout();
+    let all = drain(&mut buffer);
+
+    assert_continuous(&all);
+    // 170 ms of source audio replaced: fading out over 30 ms, then silent,
+    // then back in over 10 ms.
+    let hole = 40 * PERIOD;
+    let silent = &all[(hole + frames(31)) * CH..(hole + 8 * PERIOD - frames(1)) * CH];
+    assert!(is_silent(silent));
+    assert!(!is_silent(&all[hole * CH..(hole + frames(10)) * CH]));
+    assert_eq!(buffer.take_stats().gaps, 1);
+}
+
+/// `late_blocks` blocks reach the buffer together, long after their time.
+fn late_burst(jitter_ms: u32, prefill_ms: u32, late_blocks: usize, seconds: usize) -> Pipeline {
+    let mut pipeline = Pipeline::attached(jitter_ms, prefill_ms);
+    let first = pipeline.pushed_frames / PERIOD;
+    let late = first + 40..first + 40 + late_blocks;
+    let burst = (first + 40 + late_blocks) as f64 * block_ms();
+    pipeline.run(seconds, first, |block| {
+        Some(if late.contains(&block) {
+            burst
+        } else {
+            block as f64 * block_ms()
+        })
+    });
+    pipeline
+}
+
+#[test]
+fn audio_that_is_merely_late_costs_no_click() {
+    let mut pipeline = late_burst(400, 400, 8, 30);
+
+    assert_continuous(&pipeline.out);
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!((stats.gaps, stats.underruns), (1, 0), "{stats}");
+    assert!(stats.buffer_fill_ms <= 500, "within the band: {stats}");
+}
+
+#[test]
+fn a_surplus_from_late_audio_is_trimmed_click_free() {
+    // 400 ms late with a 1 s cushion: the concealed hole *and* the audio that
+    // follows both end up queued, 400 ms above the nominal fill.
+    let mut pipeline = late_burst(1_000, 900, 19, 60);
+
+    assert_continuous(&pipeline.out);
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!((stats.gaps, stats.underruns), (1, 0), "{stats}");
+    assert!(
+        stats.drift_corrections >= 1,
+        "the surplus is trimmed: {stats}"
+    );
+    assert!(
+        stats.buffer_fill_ms <= 1_100,
+        "back within the band: {stats}"
+    );
+}
+
+#[test]
+fn normal_arrival_jitter_is_not_a_gap() {
+    let mut state = 12_345_u32;
+    let mut jitter = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(state >> 8) / f64::from(1_u32 << 24)
+    };
+    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    for block in 0..60_000 / 21 {
+        // Up to 15 ms late, in no particular order.
+        let time = block as f64 * block_ms() + 15.0 * jitter();
+        assert_eq!(
+            detector.observe(at(time), PERIOD, 0),
+            GapVerdict::OnTime,
+            "block {block}"
+        );
+    }
+}
+
+#[test]
+fn bursty_packet_delivery_is_not_a_gap() {
+    // A2DP delivers a few ms of audio per packet, every ~20 ms: the capture
+    // device returns what is there, in uneven pieces.
+    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    let mut delivered = 0;
+    for tick in 0..30_000 {
+        let time = f64::from(tick) * 2.0;
+        let due = (time / 1000.0 * f64::from(RATE)) as usize;
+        let packet = if tick % 10 == 9 { due - delivered } else { 0 };
+        if packet > 0 {
+            delivered += packet;
+            assert_eq!(
+                detector.observe(at(time), packet, 0),
+                GapVerdict::OnTime,
+                "tick {tick}"
+            );
+        }
+    }
+}
+
+#[test]
+fn slow_clock_drift_is_not_a_gap() {
+    for ppm in [-300.0_f64, -100.0, -20.0, 20.0, 100.0, 300.0] {
+        let mut detector =
+            GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+        // The source's second is `1 + ppm/1e6` of ours.
+        let scale = 1.0 + ppm / 1e6;
+        for block in 0..60 * 48_000 / PERIOD {
+            let time = block as f64 * block_ms() * scale;
+            assert_eq!(
+                detector.observe(at(time), PERIOD, 0),
+                GapVerdict::OnTime,
+                "{ppm} ppm, block {block}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_hole_is_reported_with_its_length() {
+    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    for block in 0..100 {
+        assert_eq!(
+            detector.observe(at(block as f64 * block_ms()), PERIOD, 0),
+            GapVerdict::OnTime
+        );
+    }
+    let verdict = detector.observe(at(108.0 * block_ms()), PERIOD, 0);
+
+    // The baseline creeps up by the drift allowance (1 ms per second) meanwhile.
+    let GapVerdict::Gap(missing) = verdict else {
+        panic!("expected a gap, got {verdict:?}");
+    };
+    assert!(missing.abs_diff(8 * PERIOD) <= 16, "{missing}");
+    // The hole is filled: the next block is on time again.
+    assert_eq!(
+        detector.observe(at(109.0 * block_ms()), PERIOD, 0),
+        GapVerdict::OnTime
+    );
+}
+
+#[test]
+fn frames_waiting_in_the_capture_device_are_late_not_lost() {
+    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    for block in 0..100 {
+        detector.observe(at(block as f64 * block_ms()), PERIOD, 0);
+    }
+    // The thread overslept 90 ms; the device kept the audio meanwhile.
+    let backlog = 4 * PERIOD;
+    assert_eq!(
+        detector.observe(at(104.0 * block_ms()), PERIOD, backlog),
+        GapVerdict::OnTime
+    );
+}
+
+#[test]
+fn a_long_stall_is_a_restart_not_a_loss() {
+    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    for block in 0..100 {
+        detector.observe(at(block as f64 * block_ms()), PERIOD, 0);
+    }
+    assert_eq!(
+        detector.observe(at((100.0 + 600.0) * block_ms()), PERIOD, 0),
+        GapVerdict::Restart
+    );
+    assert_eq!(
+        detector.observe(at(701.0 * block_ms()), PERIOD, 0),
+        GapVerdict::OnTime
+    );
+}
+
+#[test]
+fn a_restart_is_spliced_without_a_click_or_a_loss() {
+    let mut buffer = new_buffer(2_000);
+    let mut clock = 0.0;
+    let mut position = 0;
+    for _ in 0..40 {
+        buffer.push_at(at(clock), &source(position, PERIOD), 0);
+        position += PERIOD;
+        clock += block_ms();
+    }
+    clock += 5_000.0;
+    position += 234 * PERIOD;
+    for _ in 0..20 {
+        buffer.push_at(at(clock), &source(position, PERIOD), 0);
+        position += PERIOD;
+        clock += block_ms();
+    }
+    buffer.start_playout();
+    let all = drain(&mut buffer);
+
+    assert_continuous(&all);
+    assert_eq!(buffer.take_stats().losses, 0);
+    // No time was invented (a drained buffer may stretch by 20 ms at the end).
+    let played = all.len() / CH;
+    assert!(
+        (60 * PERIOD..60 * PERIOD + frames(40)).contains(&played),
+        "{played}"
+    );
+}
+
+#[test]
+fn a_hole_right_after_a_hole_while_the_crossfade_is_running() {
+    let mut buffer = new_buffer(1_000);
+    let mut clock = 0.0;
+    let mut position = 0;
+    let push = |buffer: &mut JitterBuffer, clock: &mut f64, position: &mut usize, count: usize| {
+        buffer.push_at(at(*clock), &source(*position, count), 0);
+        *position += count;
+        *clock += ms(count);
+    };
+    for _ in 0..40 {
+        push(&mut buffer, &mut clock, &mut position, PERIOD);
+    }
+    for _ in 0..3 {
+        // 100 ms lost, then 100 frames (2 ms) of audio: inside the crossfade.
+        position += frames(100);
+        clock += 100.0;
+        push(&mut buffer, &mut clock, &mut position, 100);
+    }
+    for _ in 0..20 {
+        push(&mut buffer, &mut clock, &mut position, PERIOD);
+    }
+    buffer.start_playout();
+    let all = drain(&mut buffer);
+
+    assert_continuous(&all);
+    assert_eq!(buffer.take_stats().gaps, 3);
+}
+
+#[test]
+fn an_xrun_and_the_hole_it_leaves_are_one_loss() {
+    let mut buffer = new_buffer(400);
+    let mut clock = 0.0;
+    for block in 0..40 {
+        buffer.push_at(at(clock), &source(block * PERIOD, PERIOD), 0);
+        clock += block_ms();
+    }
+    buffer.note_xrun();
+    clock += 100.0;
+    buffer.push_at(at(clock), &source(40 * PERIOD, PERIOD), 0);
+
+    let stats = buffer.take_stats();
+    assert_eq!(
+        (stats.xruns, stats.gaps, stats.losses),
+        (1, 0, 1),
+        "{stats}"
+    );
+    assert_eq!(stats.concealed, 1, "the hole is still concealed");
+}
+
+// ----- zero runs -----
+
+#[test]
+fn a_run_of_zeros_inside_music_is_concealed() {
+    let mut buffer = new_buffer(400);
+    let mut input = source(0, frames(100));
+    input.extend(vec![0_i16; frames(20) * CH]);
+    input.extend(source(frames(120), frames(100)));
+    for chunk in input.chunks(PERIOD * CH) {
+        buffer.push(chunk);
+    }
+    let out = drain(&mut buffer);
+
+    assert!(out.len() >= input.len() - 480 * CH);
+    assert_continuous(&out);
+    let hole = &out[frames(100) * CH..frames(120) * CH];
+    assert!(
+        !is_silent(hole),
+        "the zeros were replaced by a fading continuation"
+    );
+    let stats = buffer.take_stats();
+    assert_eq!(
+        (stats.zero_runs, stats.losses, stats.concealed),
+        (1, 1, 1),
+        "{stats}"
+    );
+    assert!(stats.concealed_ms == 20, "{stats}");
+}
+
+#[test]
+fn a_zero_run_split_over_many_pushes_is_one_event() {
+    let mut buffer = new_buffer(1_000);
+    buffer.push(&source(0, frames(100)));
+    for _ in 0..13 {
+        buffer.push(&vec![0_i16; 100 * CH]);
+    }
+    buffer.push(&source(frames(100) + 1_300, frames(100)));
+    let out = drain(&mut buffer);
+
+    assert_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!((stats.zero_runs, stats.concealed), (1, 1), "{stats}");
+}
+
+#[test]
+fn a_long_run_of_zeros_ends_in_silence_and_counts_once() {
+    let mut buffer = new_buffer(1_000);
+    let mut input = source(0, frames(100));
+    input.extend(vec![0_i16; frames(300) * CH]);
+    input.extend(source(frames(400), frames(100)));
+    buffer.push(&input);
+    let out = drain(&mut buffer);
+
+    assert_continuous(&out);
+    assert!(is_silent(
+        &out[(frames(100) + frames(31)) * CH..(frames(400) - frames(1)) * CH]
+    ));
+    assert_eq!(buffer.take_stats().zero_runs, 1);
+}
+
+#[test]
+fn silence_after_silence_passes_through_untouched() {
+    let mut buffer = new_buffer(1_000);
+    let mut input = vec![0_i16; frames(500) * CH];
+    input.extend(source(0, frames(100)));
+    buffer.push(&input);
+    let out = drain(&mut buffer);
+
+    assert_eq!(out[..frames(500) * CH], input[..frames(500) * CH]);
+    assert_eq!(buffer.take_stats().losses, 0);
+}
+
+#[test]
+fn zeros_after_the_music_faded_out_are_just_silence() {
+    let mut buffer = new_buffer(1_000);
+    // A fade-out to near zero (peak under 32), then digital silence.
+    let mut input = source(0, frames(100));
+    input.extend((0..frames(10)).flat_map(|n| {
+        let value = (20.0 * (1.0 - n as f32 / frames(10) as f32)) as i16;
+        [value, value]
+    }));
+    input.extend(vec![0_i16; frames(300) * CH]);
+    buffer.push(&input);
+    let out = drain(&mut buffer);
+
+    assert_eq!(buffer.take_stats().losses, 0);
+    assert!(out[..frames(100) * CH + frames(10) * CH] == input[..frames(110) * CH]);
+    assert!(is_silent(&out[frames(110) * CH..frames(400) * CH]));
+}
+
+#[test]
+fn short_runs_of_zeros_are_untouched() {
+    let mut buffer = new_buffer(1_000);
+    let mut input = source(0, frames(100));
+    // 1 ms of zeros, and a single zero frame, inside the music.
+    input[frames(40) * CH..frames(41) * CH].fill(0);
+    input[frames(60) * CH..frames(60) * CH + CH].fill(0);
+    buffer.push(&input);
+    let out = drain(&mut buffer);
+
+    assert_eq!(out[..], input[..out.len()]);
+    assert_eq!(buffer.take_stats().losses, 0);
+}
+
+#[test]
+fn zeros_in_one_channel_only_are_not_a_run() {
+    let mut buffer = new_buffer(1_000);
+    let mut input = source(0, frames(300));
+    for frame in frames(100)..frames(200) {
+        input[frame * CH] = 0;
+    }
+    buffer.push(&input);
+    let out = drain(&mut buffer);
+
+    assert_eq!(out[..], input[..out.len()]);
+    assert_eq!(buffer.take_stats().losses, 0);
+}
+
+// ----- cushion, capacity, drift -----
+
+#[test]
+fn without_a_consumer_only_the_most_recent_target_is_kept() {
+    let mut buffer = new_buffer(400);
+    let total = frames(5_000);
+    let all = source(0, total);
+    for chunk in all.chunks(PERIOD * CH) {
+        buffer.push(chunk);
+        assert!(buffer.fill_frames() <= buffer.target_frames());
+    }
+
+    assert_eq!(buffer.fill_frames(), buffer.target_frames());
+    let kept = drain(&mut buffer);
+    let kept_frames = kept.len() / CH;
+    assert!(kept_frames + buffer.chunk_frames() > frames(400));
+    assert_eq!(
+        kept[..],
+        all[(total - kept_frames - buffer.fill_frames()) * CH..][..kept.len()]
+    );
+}
+
+#[test]
+fn a_two_second_buffer_holds_the_most_recent_two_seconds() {
+    let mut buffer = new_buffer(2_000);
+    let total = frames(7_000);
+    let all = source(0, total);
+    for chunk in all.chunks(PERIOD * CH) {
+        buffer.push(chunk);
+    }
+    assert_eq!(buffer.target_frames(), frames(2_000));
+    assert_eq!(buffer.fill_frames(), frames(2_000));
+    assert_eq!(buffer.take_stats().buffer_fill_ms, 2_000);
+
+    // Attaching starts playback straight away, from exactly those 2 s.
+    buffer.start_playout();
+    let out = drain(&mut buffer);
+
+    assert!(out.len() / CH >= frames(2_000));
+    assert_continuous(&out);
+    // The first second is the most recent audio, unchanged past the 10 ms
+    // fade-in. (Draining the buffer dry later stretches it near the end.)
+    let start = total - frames(2_000);
+    let fade = frames(10);
+    let second = frames(1_000);
+    assert_eq!(
+        out[fade * CH..second * CH],
+        all[(start + fade) * CH..(start + second) * CH]
+    );
+    assert_eq!(buffer.take_stats().losses, 0);
+}
+
+#[test]
+fn a_two_second_buffer_survives_ten_minutes_of_streaming_without_growing() {
+    let mut buffer = new_buffer(2_000);
+    buffer.push(&source(0, frames(2_000)));
+    buffer.start_playout();
+    let mut position = frames(2_000);
+    let mut peak = 0;
+    let mut out = vec![0_i16; frames(10) * CH];
+    for _ in 0..600 * 100 {
+        buffer.push(&source(position, frames(10)));
+        position += frames(10);
+        assert!(buffer.pull(&mut out, true));
+        peak = peak.max(buffer.fill_frames());
+    }
+
+    assert!(peak <= 2 * buffer.target_frames(), "peak {} ms", ms(peak));
+    assert_eq!(buffer.take_stats().losses, 0);
+}
+
+#[test]
+fn the_capacity_follows_the_configured_size() {
+    for jitter in [50, 400, 2_000, 10_000] {
+        let mut buffer = new_buffer(jitter);
+        buffer.start_playout();
+        // Nobody pulls for far longer than the buffer holds.
+        for _ in 0..(frames(jitter) * 3 / PERIOD + 10) {
+            buffer.push(&source(0, PERIOD));
+        }
+        assert!(
+            buffer.fill_frames() <= 2 * frames(jitter) + frames(200),
+            "{jitter} ms: {} ms",
+            ms(buffer.fill_frames())
+        );
+        assert!(buffer.fill_frames() >= frames(jitter), "{jitter} ms");
+    }
+}
+
+/// Pushes `push` frames per `pull` frames pulled, as a source whose clock
+/// runs fast or slow does, for `seconds` of playback.
+fn run_drift(
+    buffer: &mut JitterBuffer,
+    seconds: usize,
+    push: usize,
+    pull: usize,
+) -> (Vec<i16>, usize) {
+    let mut position = 0;
+    let mut out = Vec::new();
+    let mut peak = 0;
+    for _ in 0..seconds * 1000 / 10 {
+        buffer.push(&source(position, push));
+        position += push;
+        out.extend(pull_all(buffer, pull));
+        peak = peak.max(buffer.fill_frames());
+    }
+    (out, peak)
+}
+
+#[test]
+fn a_fast_source_is_trimmed_toward_the_target_without_a_click() {
+    let mut buffer = new_buffer(100);
+    buffer.push(&source(0, frames(100)));
+    buffer.start_playout();
+    // Two frames more per 10 ms: 0.4 % fast, +125 ms over a minute.
+    let (out, peak) = run_drift(&mut buffer, 60, 482, 480);
+
+    assert_continuous(&out);
+    let stats = buffer.take_stats();
+    assert!(stats.drift_corrections >= 1, "{stats}");
+    assert_eq!(stats.losses, 0, "{stats}");
+    assert!(ms(peak) < 230.0, "peak fill {} ms stays bounded", ms(peak));
+}
+
+#[test]
+fn a_slow_source_is_stretched_toward_the_target_without_a_click() {
+    let mut buffer = new_buffer(100);
+    buffer.push(&source(0, frames(100)));
+    buffer.start_playout();
+    // One frame less per 10 ms: 0.2 % slow, -125 ms over a minute.
+    let (out, _) = run_drift(&mut buffer, 60, 479, 480);
+
+    assert_continuous(&out);
+    let stats = buffer.take_stats();
+    assert!(stats.drift_corrections >= 1, "{stats}");
+    assert_eq!(stats.underruns, 0, "{stats}");
+}
+
+#[test]
+fn drift_corrections_are_rare() {
+    let mut buffer = new_buffer(400);
+    buffer.push(&source(0, frames(400)));
+    buffer.start_playout();
+    // 100 ppm: ~5 frames per second.
+    let mut position = 0;
+    let mut credit = 0.0;
+    for _ in 0..600 * 100 {
+        credit += 480.0 * 1.0001;
+        let count = credit as usize;
+        credit -= count as f64;
+        buffer.push(&source(position, count));
+        position += count;
+        pull_all(&mut buffer, 480);
+    }
+
+    let stats = buffer.take_stats();
+    assert!(stats.drift_corrections <= 2, "{stats}");
+    assert_eq!(stats.losses, 0, "{stats}");
+}
+
+// ----- the startup burst -----
+
+#[test]
+fn the_startup_burst_is_not_counted_as_a_loss() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    pipeline.run(20, first, |block| Some(block as f64 * block_ms()));
+
+    assert_continuous(&pipeline.out);
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!(
+        (stats.losses, stats.concealed, stats.concealed_ms),
+        (0, 0, 0),
+        "{stats}"
+    );
+    // The output ran in real time, ahead by no more than the lead.
+    let played = ms(pipeline.out.len() / CH);
+    assert!((played - 20_000.0).abs() < 200.0, "{played} ms");
+    assert!(
+        stats.buffer_fill_ms >= 250,
+        "the cushion is intact: {stats}"
+    );
+}
+
+#[test]
+fn an_outage_longer_than_the_cushion_is_concealed_and_recovers() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    // Two seconds without any audio, then it is back (and was lost meanwhile).
+    let lost = first + 100..first + 194;
+    pipeline.run(15, first, |block| {
+        (!lost.contains(&block)).then(|| block as f64 * block_ms())
+    });
+
+    assert_continuous(&pipeline.out);
+    let stats = pipeline.buffer.take_stats();
+    // The output stage bridged the outage once the cushion ran dry; the hole
+    // found at the capture side is the same loss and is not counted twice.
+    assert_eq!(
+        (stats.underruns, stats.gaps, stats.losses),
+        (1, 0, 1),
+        "{stats}"
+    );
+    assert!((1_500..2_200).contains(&stats.concealed_ms), "{stats}");
+    assert!(stats.buffer_fill_ms >= 100, "refilled: {stats}");
+}
+
+// ----- stats -----
+
+#[test]
+fn stats_count_every_kind_of_loss_and_reset_each_minute() {
+    let mut buffer = new_buffer(400);
+    buffer.start_playout();
+    buffer.push(&source(0, frames(300)));
+    let mut out = pull_all(&mut buffer, frames(300) + frames(25));
+    buffer.note_xrun();
+    buffer.note_xrun();
+    let mut zeros = source(frames(1_000), frames(100));
+    zeros.extend(vec![0_i16; frames(10) * CH]);
+    zeros.extend(source(frames(1_110), frames(400)));
+    buffer.push(&zeros);
+    out.extend(pull_all(&mut buffer, frames(50)));
+
+    let stats = buffer.take_stats();
+    assert_eq!(stats.underruns, 1);
+    assert_eq!(stats.xruns, 2);
+    assert_eq!(stats.zero_runs, 1);
+    assert_eq!(stats.gaps, 0);
+    assert_eq!(stats.losses, 4);
+    assert_eq!(stats.concealed, 2, "the underrun and the zero run");
+    assert_eq!(stats.concealed_ms, 25 + 10);
+    assert_eq!(stats.buffer_fill_ms, ms(buffer.fill_frames()) as u64);
+
+    let next = buffer.take_stats();
+    assert_eq!((next.losses, next.concealed, next.concealed_ms), (0, 0, 0));
+    assert_eq!(
+        next.buffer_fill_ms, stats.buffer_fill_ms,
+        "the level is current"
+    );
+}
+
+#[test]
+fn the_stats_line_has_the_greppable_shape() {
+    let mut buffer = new_buffer(400);
+    buffer.push(&source(0, frames(250)));
+    let line = buffer.take_stats().to_string();
+
+    assert_eq!(
+        line,
+        "bt_input stats: losses_per_min=0 concealed_per_min=0 concealed_ms=0 buffer_fill_ms=250 \
+         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0"
+    );
+}
+
+// ----- pacing -----
+
+#[test]
+fn the_pacer_allows_a_lead_then_follows_real_time() {
+    let mut pacer = Pacer::new(RATE, Duration::from_millis(100));
+    let chunk = frames(10);
+
+    // The initial burst: real audio only, up to the lead.
+    let mut burst = 0;
+    while pacer.due(at(0.0)) == Due::Optional {
+        pacer.sent(chunk);
+        burst += 1;
+    }
+    assert_eq!(burst, 10);
+    assert_eq!(pacer.due(at(0.0)), Due::Wait);
+
+    // Then one chunk per 10 ms.
+    assert_eq!(pacer.due(at(10.0)), Due::Optional);
+    pacer.sent(chunk);
+    assert_eq!(pacer.due(at(10.0)), Due::Wait);
+
+    // Only once the output is behind real time is audio required.
+    assert_eq!(pacer.due(at(110.0)), Due::Optional);
+    assert_eq!(pacer.due(at(110.5)), Due::Required);
+}
+
+#[test]
+fn a_blocked_sender_does_not_make_the_pacer_burst_later() {
+    let mut pacer = Pacer::new(RATE, Duration::from_millis(100));
+    assert_eq!(pacer.due(at(0.0)), Due::Optional);
+    // The sender's queue stays full for two seconds.
+    for step in 0..200 {
+        pacer.blocked(at(f64::from(step) * 10.0));
+    }
+    let mut burst = 0;
+    while pacer.due(at(2_000.0)) == Due::Optional {
+        pacer.sent(frames(10));
+        burst += 1;
+    }
+    assert_eq!(burst, 10, "no more than the lead");
+}

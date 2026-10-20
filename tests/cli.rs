@@ -73,19 +73,52 @@ fn cli_rejects_invalid_bluetooth_addresses_without_writing_them() {
 }
 
 #[test]
-fn cli_updates_volume_as_a_percentage() {
+fn cli_volume_command_is_removed_and_never_touches_the_config() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("config.toml");
+    let original = "[audio]\nvolume = 0.5\nchannels = 2\n";
+    std::fs::write(&config, original).unwrap();
 
     Command::cargo_bin("auto-airplay")
         .unwrap()
         .args(["--config", config.to_str().unwrap(), "volume", "42"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("42%"));
+        .failure()
+        .stderr(predicate::str::contains(
+            "no longer changes the speaker volume",
+        ));
 
-    let raw = std::fs::read_to_string(config).unwrap();
-    assert!(raw.contains("volume = 0.42"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+}
+
+#[test]
+fn cli_volume_command_does_not_create_a_config_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+
+    Command::cargo_bin("auto-airplay")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "volume",
+            "--whatever",
+            "x",
+        ])
+        .assert()
+        .failure();
+
+    assert!(!config.exists());
+}
+
+#[test]
+fn cli_help_does_not_advertise_the_removed_volume_command() {
+    Command::cargo_bin("auto-airplay")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("volume").not());
 }
 
 #[test]

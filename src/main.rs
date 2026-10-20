@@ -25,8 +25,12 @@ enum Command {
     Output(OutputArgs),
     /// Run the audio bridge in the foreground.
     Run,
-    /// Set output volume from 0 to 100 percent.
-    Volume { percent: u8 },
+    /// Removed: auto-airplay no longer changes the speaker volume.
+    #[command(hide = true)]
+    Volume {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Check the host and configured devices.
     Doctor,
 }
@@ -266,14 +270,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Run => {
             auto_airplay::daemon::run(store).await?;
         }
-        Command::Volume { percent } => {
-            if percent > 100 {
-                bail!("volume must be between 0 and 100");
-            }
-            let mut config = store.load_or_create()?;
-            config.audio.volume = percent as f32 / 100.0;
-            store.save(&config)?;
-            println!("Volume set to {percent}%");
+        Command::Volume { .. } => {
+            bail!(
+                "the `volume` command was removed: auto-airplay no longer changes the speaker \
+                 volume; adjust it on the speaker, the iPhone or the Home app"
+            );
         }
         Command::Doctor => {
             auto_airplay::platform::doctor(&store).await?;

@@ -43,7 +43,6 @@ fn silence_threshold_defaults_when_missing_from_an_existing_file() {
 
     let config = ConfigStore::new(path).load().unwrap();
 
-    assert_eq!(config.audio.volume, 0.5);
     assert_eq!(config.audio.silence_threshold_dbfs, -40.0);
     assert_eq!(
         config.audio.silence_threshold_dbfs,
@@ -72,4 +71,91 @@ fn silence_threshold_survives_a_save_and_load() {
     store.save(&expected).unwrap();
 
     assert_eq!(store.load().unwrap().audio.silence_threshold_dbfs, -60.0);
+}
+
+#[test]
+fn legacy_audio_volume_is_accepted_and_reported_as_obsolete() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[output]\nselector = \"Living Room\"\n\n[audio]\nvolume = 0.5\nchannels = 2\n",
+    )
+    .unwrap();
+
+    let config = ConfigStore::new(path).load().unwrap();
+
+    assert_eq!(config.obsolete_fields(), ["audio.volume"]);
+    assert_eq!(config.output.selector.as_deref(), Some("Living Room"));
+    assert_eq!(config.audio.channels, 2);
+}
+
+#[test]
+fn legacy_audio_volume_accepts_any_value_type() {
+    for value in ["\"loud\"", "42", "true", "[1, 2]", "{ left = 1 }"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, format!("[audio]\nvolume = {value}\n")).unwrap();
+
+        let config = ConfigStore::new(path).load().unwrap();
+
+        assert_eq!(config.obsolete_fields(), ["audio.volume"], "value {value}");
+    }
+}
+
+#[test]
+fn configuration_without_legacy_volume_reports_no_obsolete_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[audio]\nchannels = 2\n").unwrap();
+
+    let config = ConfigStore::new(path).load().unwrap();
+
+    assert!(config.obsolete_fields().is_empty());
+    assert!(AppConfig::default().obsolete_fields().is_empty());
+}
+
+#[test]
+fn saving_a_legacy_configuration_drops_the_volume_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[audio]\nvolume = 0.5\nlatency_ms = 321\n").unwrap();
+    let store = ConfigStore::new(path.clone());
+
+    let config = store.load().unwrap();
+    store.save(&config).unwrap();
+
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(!raw.contains("volume"), "{raw}");
+    assert!(raw.contains("latency_ms = 321"));
+    assert!(store.load().unwrap().obsolete_fields().is_empty());
+}
+
+#[test]
+fn default_configuration_has_no_volume_key() {
+    let raw = toml::to_string_pretty(&AppConfig::default()).unwrap();
+
+    assert!(!raw.contains("volume"), "{raw}");
+}
+
+#[test]
+fn editing_the_obsolete_volume_value_does_not_change_the_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let store = ConfigStore::new(path.clone());
+
+    std::fs::write(&path, "[audio]\nvolume = 0.2\n").unwrap();
+    let before = store.load().unwrap();
+    std::fs::write(&path, "[audio]\nvolume = 0.9\n").unwrap();
+
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn unknown_audio_fields_are_still_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[audio]\nloudness = 0.5\n").unwrap();
+
+    assert!(ConfigStore::new(path).load().is_err());
 }

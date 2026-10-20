@@ -54,10 +54,9 @@ auto-airplay input list
 auto-airplay input pair AA:BB:CC:DD:EE:FF --name "My turntable"
 auto-airplay output list
 auto-airplay output set "Living Room" --protocol airplay2
-auto-airplay volume 35
 ```
 
-Test the output before starting the bridge:
+Test the output before starting the bridge (the tone plays at the speaker's current volume):
 
 ```bash
 auto-airplay output test
@@ -100,6 +99,12 @@ reconnect_delay_seconds = 3
 auto_reconnect = true
 ```
 
+## Speaker volume
+
+`auto-airplay` never changes the speaker volume: not on the first connection, not when it re-acquires the speaker after silence, not after an automatic reconnect, a process recycle, or a restart caused by a configuration change. Set the volume on the speaker, the iPhone, or the Home app and it is kept. `auto-airplay output test` also plays at the speaker's current volume.
+
+Older versions had an `audio.volume` setting and an `auto-airplay volume` command. A leftover `audio.volume` in the configuration file is still accepted but ignored, and the daemon logs a warning at startup (`doctor` reports it too). Delete the line when convenient; any command that rewrites the configuration drops it. The `volume` command was removed and fails without touching the configuration.
+
 ## Releasing the speaker on silence
 
 An AirPlay speaker can only play one source at a time, so `auto-airplay` does not hold it while the input is silent:
@@ -131,7 +136,6 @@ auto-airplay input probe
 auto-airplay output list [--seconds 4]
 auto-airplay output set <NAME|ID|IP> [--protocol airplay2]
 auto-airplay output test [--target NAME] [--frequency 880] [--duration 3]
-auto-airplay volume <0-100>
 auto-airplay doctor
 auto-airplay run
 ```
@@ -168,7 +172,7 @@ Do not commit a real configuration file. Common secret and configuration filenam
 ## Development
 
 ```bash
-cargo fmt --all -- --check
+cargo fmt --all -- --check # vendor/airplay-client is excluded via its rustfmt.toml
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
@@ -187,4 +191,4 @@ Pushing a version tag such as `v0.1.0` builds checksum-protected ARM64 and ARMv7
 
 ## License and acknowledgements
 
-GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds.
+GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`.

@@ -38,6 +38,12 @@ pub async fn run(_store: ConfigStore) -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn run_linux(store: ConfigStore) -> Result<()> {
     let config = validate_config(store.load()?)?;
+    for field in config.obsolete_fields() {
+        tracing::warn!(
+            field,
+            "obsolete configuration field ignored: auto-airplay no longer changes the speaker volume"
+        );
+    }
     let recycled = std::env::var_os(RECYCLED_ENV).is_some();
     tracing::info!(path = %store.path().display(), recycled, "starting auto-airplay");
 
@@ -93,7 +99,6 @@ struct OutputTarget {
     selector: String,
     discovery_seconds: u64,
     render_delay_ms: u32,
-    volume: f32,
     sample_rate: u32,
     channels: u8,
 }
@@ -137,7 +142,6 @@ async fn run_session(
         selector,
         discovery_seconds: config.output.discovery_timeout_seconds,
         render_delay_ms: config.output.render_delay_ms,
-        volume: config.audio.volume.clamp(0.0, 1.0),
         sample_rate: input.format.sample_rate,
         channels: input.format.channels,
     };
@@ -440,10 +444,6 @@ async fn start_stream(
     target: &OutputTarget,
     sink: &AudioSink,
 ) -> Result<()> {
-    tokio::time::timeout(REQUEST_TIMEOUT, client.set_volume(target.volume))
-        .await
-        .context("setting the AirPlay volume timed out")??;
-
     let (sender, decoder) = LiveAudioDecoder::create_pair(target.sample_rate, target.channels, 64);
     sink.attach(sender);
     tokio::time::sleep(PREFILL).await;
@@ -493,9 +493,6 @@ fn validate_config(config: AppConfig) -> Result<AppConfig> {
     }
     if config.output.selector.is_none() {
         bail!("no output configured");
-    }
-    if !(0.0..=1.0).contains(&config.audio.volume) {
-        bail!("audio volume must be between 0.0 and 1.0");
     }
     if !config.audio.silence_threshold_dbfs.is_finite()
         || !(-120.0..=0.0).contains(&config.audio.silence_threshold_dbfs)

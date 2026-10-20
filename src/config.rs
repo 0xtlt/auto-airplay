@@ -36,6 +36,17 @@ pub struct AppConfig {
     pub runtime: RuntimeConfig,
 }
 
+impl AppConfig {
+    /// Configuration keys that are still accepted but no longer have any effect.
+    pub fn obsolete_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.audio.legacy_volume.is_some() {
+            fields.push("audio.volume");
+        }
+        fields
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -111,7 +122,11 @@ pub enum OutputProtocol {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
-    pub volume: f32,
+    /// Obsolete: auto-airplay never changes the speaker volume. Older
+    /// configurations may still carry `audio.volume`; any value is accepted,
+    /// ignored, and never written back.
+    #[serde(default, rename = "volume", skip_serializing)]
+    pub legacy_volume: Option<serde::de::IgnoredAny>,
     pub preferred_sample_rate: Option<u32>,
     pub channels: u8,
     pub latency_ms: u32,
@@ -123,7 +138,7 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            volume: 0.35,
+            legacy_volume: None,
             preferred_sample_rate: None,
             channels: 2,
             latency_ms: 500,

@@ -31,3 +31,16 @@ never change the speaker volume, so the crate is vendored and patched.
    "Send initial volume"). Upstream always sent its default volume of `1.0`
    (0 dB, 100 %) there. The public `set_volume()` API is unchanged and still
    sends the volume when called explicitly.
+2. **Answer the receiver's requests on the events channel.** Upstream opens the
+   TCP connection to the receiver's `eventPort` after SETUP phase 1 but never
+   reads it. The receiver sends HomeKit-encrypted RTSP-style requests there and
+   may close the connection when they stay unanswered. New module
+   `src/receiver_events.rs` (public but `#[doc(hidden)]`, only so the host
+   crate's `tests/receiver_events.rs` can run it) derives the events keys from
+   the pairing shared secret (HKDF-SHA512, salt `Events-Salt`, sender encrypts
+   with `Events-Read-Encryption-Key`, decrypts with `Events-Write-Encryption-Key`,
+   swapped once if the first frame fails authentication) and answers every
+   request with a bare `200 OK`. It never acts on a request. `Connection` keeps
+   the shared secret (`events_secret`, filled in all connect paths) and the task
+   handle (`events_task`, aborted in `disconnect()` and `Drop`); without a secret
+   the old behaviour (stream held open, unread) remains.

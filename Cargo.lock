@@ -373,6 +373,7 @@ dependencies = [
  "airplay-audio",
  "airplay-client",
  "airplay-core",
+ "airplay-crypto",
  "alsa",
  "anyhow",
  "assert_cmd",

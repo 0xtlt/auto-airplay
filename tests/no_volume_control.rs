@@ -131,3 +131,17 @@ fn vendored_client_keeps_the_explicit_set_volume_api() {
     let connection = fs::read_to_string(root(VENDORED_SRC).join("connection.rs")).unwrap();
     assert!(connection.contains("pub async fn set_volume("));
 }
+
+#[test]
+fn events_channel_responder_never_mentions_volume_or_set_parameter() {
+    // The responder only answers `200 OK` to the receiver's requests; it must
+    // not contain any code path that could name, let alone send, a volume.
+    let source = fs::read_to_string(root(VENDORED_SRC).join("receiver_events.rs")).unwrap();
+    let code = production_code(&source).to_ascii_lowercase();
+    for forbidden in ["volume", "set_parameter", "setparameter"] {
+        assert!(
+            !code.contains(forbidden),
+            "receiver_events.rs production code mentions `{forbidden}`"
+        );
+    }
+}

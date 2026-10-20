@@ -214,6 +214,10 @@ pub struct Connection {
     control_receiver: Option<Arc<RtpReceiver>>,
     /// Reverse connection to device's events port (required before RECORD)
     events_stream: Option<TcpStream>,
+    /// Pairing shared secret, the input of the events-channel key derivation.
+    events_secret: Option<SharedSecret>,
+    /// Task answering the receiver's requests on the events connection.
+    events_task: Option<JoinHandle<()>>,
     /// Remote PTP master clock identity (from BMCA yield flow)
     ptp_master_clock_id: Option<[u8; 8]>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
@@ -319,6 +323,8 @@ impl Connection {
         // Don't override with shared secret - that's only for RTSP encryption.
         tracing::debug!("Using random shk for audio encryption (sent in SETUP phase 2)");
 
+        let events_secret = pairing.shared_secret().cloned();
+
         session.set_paired()?;
 
         Ok(Self {
@@ -339,6 +345,8 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            events_secret,
+            events_task: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -484,6 +492,10 @@ impl Connection {
             }
         }
 
+        let events_secret = pair_verify
+            .shared_secret()
+            .map(|secret| SharedSecret::new(secret.to_vec()));
+
         session.set_paired()?;
 
         Ok(Self {
@@ -504,6 +516,8 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            events_secret,
+            events_task: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -685,6 +699,10 @@ impl Connection {
             }
         }
 
+        let events_secret = pair_verify
+            .shared_secret()
+            .map(|secret| SharedSecret::new(secret.to_vec()));
+
         session.set_paired()?;
 
         Ok(Self {
@@ -705,6 +723,8 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            events_secret,
+            events_task: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -797,7 +817,7 @@ impl Connection {
         match TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established");
-                self.events_stream = Some(stream);
+                self.start_events_responder(stream, events_addr);
             }
             Err(e) => {
                 // Not fatal - owntone says "proceeding anyway" if this fails
@@ -967,6 +987,23 @@ impl Connection {
         Ok(())
     }
 
+    /// Keep the freshly opened events connection alive by answering the
+    /// receiver's requests on it (replies are always a bare `200 OK`).
+    ///
+    /// Without a pairing secret the keys can not be derived: the stream is just
+    /// held open, as before.
+    fn start_events_responder(&mut self, stream: TcpStream, peer: SocketAddr) {
+        match self.events_secret.as_ref() {
+            Some(secret) => {
+                self.events_task = Some(crate::receiver_events::spawn(stream, secret.as_bytes(), peer));
+            }
+            None => {
+                debug!("No pairing secret for the events channel; not answering receiver requests");
+                self.events_stream = Some(stream);
+            }
+        }
+    }
+
     /// Disconnect and clean up.
     pub async fn disconnect(&mut self) -> Result<()> {
         // Stop streaming if active
@@ -1000,6 +1037,12 @@ impl Connection {
             let teardown_req = RtspRequest::teardown(self.session.request_uri());
             let _ = self.rtsp.send(teardown_req).await;
         }
+
+        // Stop answering events-channel requests
+        if let Some(task) = self.events_task.take() {
+            task.abort();
+        }
+        self.events_stream = None;
 
         // Close connection
         self.rtsp.close().await?;
@@ -1515,7 +1558,7 @@ impl Connection {
         match tokio::net::TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established");
-                self.events_stream = Some(stream);
+                self.start_events_responder(stream, events_addr);
             }
             Err(e) => {
                 warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
@@ -1673,7 +1716,7 @@ impl Connection {
         match TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established (group member)");
-                self.events_stream = Some(stream);
+                self.start_events_responder(stream, events_addr);
             }
             Err(e) => {
                 warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
@@ -1878,6 +1921,14 @@ impl Connection {
     pub fn clone_control_socket_for_recv(&self) -> Option<UdpSocket> {
         self.control_receiver.as_ref()
             .and_then(|rx| rx.try_clone_socket().ok().flatten())
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(task) = self.events_task.take() {
+            task.abort();
+        }
     }
 }
 

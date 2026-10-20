@@ -40,6 +40,9 @@ mod group;
 mod playback;
 mod builder;
 mod events;
+/// Public only so the integration tests of the host crate can drive it.
+#[doc(hidden)]
+pub mod receiver_events;
 mod raop_connection;
 mod stats;
 

@@ -19,7 +19,14 @@
 //! `pair_homekit.c`: "events is opposite"), so the sender encrypts with
 //! `Events-Read-Encryption-Key` and decrypts with `Events-Write-Encryption-Key`.
 //! If the very first frame fails authentication, the roles are swapped once and
-//! the mapping that works is kept (and logged).
+//! the mapping that works is kept (and logged). The spare key copies are
+//! dropped (zeroized) after the first frame; the rest of the key material lives
+//! in the `ControlCipher`, which zeroizes it on drop.
+//!
+//! Failure policy: when the receiver closes or resets the connection the task
+//! ends. After a local failure (authentication, parse, encryption, other I/O
+//! errors) the task logs once, stops reading and keeps the socket open until it
+//! is aborted, as the previous "never read" behaviour did.
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -27,8 +34,10 @@ use std::time::Instant;
 use airplay_crypto::chacha::ControlCipher;
 use airplay_crypto::hkdf::derive_key_32;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 const EVENTS_SALT: &[u8] = b"Events-Salt";
 const EVENTS_WRITE_INFO: &[u8] = b"Events-Write-Encryption-Key";
@@ -39,28 +48,49 @@ const INFO_LOGGED_REQUESTS: u64 = 10;
 /// Upper bound for one buffered message, so a broken peer can not grow memory.
 const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
+/// Which key mapping decrypted the first frame (observable by tests only).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMapping {
+    /// The sender encrypts with `Events-Read` and decrypts with `Events-Write`.
+    Expected,
+    /// Roles swapped, used when the expected mapping fails on the first frame.
+    Swapped,
+}
+
+/// Derive `(encrypt, decrypt)` for the default mapping, from the sender's side:
+/// `Events-Read-Encryption-Key` and `Events-Write-Encryption-Key`.
+#[doc(hidden)]
+pub fn event_keys(
+    secret: &[u8],
+) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), airplay_core::error::CryptoError> {
+    Ok((
+        Zeroizing::new(derive_key_32(secret, EVENTS_SALT, EVENTS_READ_INFO)?),
+        Zeroizing::new(derive_key_32(secret, EVENTS_SALT, EVENTS_WRITE_INFO)?),
+    ))
+}
+
 /// Keys for both directions of the events channel, from the sender's side.
+/// Zeroized on drop; dropped as soon as the key mapping is established.
 struct EventKeys {
     /// Key for frames we send (the receiver's "read" key).
-    encrypt: [u8; 32],
+    encrypt: Zeroizing<[u8; 32]>,
     /// Key for frames we receive (the receiver's "write" key).
-    decrypt: [u8; 32],
+    decrypt: Zeroizing<[u8; 32]>,
 }
 
 impl EventKeys {
     fn derive(secret: &[u8]) -> Result<Self, airplay_core::error::CryptoError> {
-        Ok(Self {
-            encrypt: derive_key_32(secret, EVENTS_SALT, EVENTS_READ_INFO)?,
-            decrypt: derive_key_32(secret, EVENTS_SALT, EVENTS_WRITE_INFO)?,
-        })
+        let (encrypt, decrypt) = event_keys(secret)?;
+        Ok(Self { encrypt, decrypt })
     }
 
     fn cipher(&self) -> ControlCipher {
-        ControlCipher::new(self.encrypt, self.decrypt)
+        ControlCipher::new(*self.encrypt, *self.decrypt)
     }
 
     fn swapped_cipher(&self) -> ControlCipher {
-        ControlCipher::new(self.decrypt, self.encrypt)
+        ControlCipher::new(*self.decrypt, *self.encrypt)
     }
 }
 
@@ -68,19 +98,64 @@ impl EventKeys {
 ///
 /// `secret` is the pairing shared secret (the input of the control-channel key
 /// derivation); it is only used to derive the keys and is not kept. The task
-/// ends when the receiver closes the connection, on a protocol error, or when
-/// the returned handle is aborted.
+/// ends when the receiver closes the connection or when the returned handle is
+/// aborted. After a local failure (key derivation, authentication, parse or
+/// encryption error) the task stops reading and answering but keeps the socket
+/// open until it is aborted, so the receiver does not see us hang up.
 pub fn spawn<S>(stream: S, secret: &[u8], peer: SocketAddr) -> JoinHandle<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_inner(stream, secret, peer, None)
+}
+
+/// Like [`spawn`], and reports which key mapping decrypted the first frame.
+#[doc(hidden)]
+pub fn spawn_observed<S>(
+    stream: S,
+    secret: &[u8],
+    peer: SocketAddr,
+    mapping: oneshot::Sender<KeyMapping>,
+) -> JoinHandle<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_inner(stream, secret, peer, Some(mapping))
+}
+
+fn spawn_inner<S>(
+    mut stream: S,
+    secret: &[u8],
+    peer: SocketAddr,
+    mapping: Option<oneshot::Sender<KeyMapping>>,
+) -> JoinHandle<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let keys = EventKeys::derive(secret);
     tokio::spawn(async move {
-        match keys {
-            Ok(keys) => run(stream, keys, peer).await,
-            Err(err) => warn!(%peer, "events channel: key derivation failed: {err}"),
+        let outcome = match keys {
+            Ok(keys) => run(&mut stream, keys, peer, mapping).await,
+            Err(err) => {
+                warn!(%peer, "events channel: key derivation failed: {err}");
+                Outcome::LocalFailure
+            }
+        };
+        if outcome == Outcome::LocalFailure {
+            // Keep the socket open (without reading it, counters are unknown)
+            // until the task is aborted: closing it ourselves is what the
+            // receiver would notice.
+            std::future::pending::<()>().await;
         }
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The receiver closed or reset the connection; nothing left to do.
+    PeerClosed,
+    /// We gave up for a local reason; the socket must stay open.
+    LocalFailure,
 }
 
 #[derive(Debug)]
@@ -91,22 +166,41 @@ enum FrameError {
     Auth,
 }
 
-async fn run<S>(mut stream: S, keys: EventKeys, peer: SocketAddr)
+/// Errors that mean the receiver closed or reset the connection.
+fn peer_closed(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        err.kind(),
+        UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | NotConnected
+    )
+}
+
+async fn run<S>(
+    stream: &mut S,
+    keys: EventKeys,
+    peer: SocketAddr,
+    mut mapping: Option<oneshot::Sender<KeyMapping>>,
+) -> Outcome
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let started = Instant::now();
     let mut cipher = keys.cipher();
-    let mut mapping_checked = false;
+    // Kept only until the first frame decrypts; then the key copies are dropped.
+    let mut pending_keys = Some(keys);
     let mut buffer: Vec<u8> = Vec::new();
     let mut requests: u64 = 0;
 
     info!(%peer, "events channel: listening for receiver requests");
 
     loop {
-        let plaintext = match read_frame(&mut stream, &mut cipher, &keys, &mut mapping_checked).await
-        {
-            Ok(plaintext) => plaintext,
+        let plaintext = match read_frame(stream, &mut cipher, &mut pending_keys).await {
+            Ok((plaintext, chosen)) => {
+                if let (Some(chosen), Some(report)) = (chosen, mapping.take()) {
+                    let _ = report.send(chosen);
+                }
+                plaintext
+            }
             Err(FrameError::Closed) => {
                 info!(
                     %peer,
@@ -114,25 +208,30 @@ where
                     requests,
                     "events channel closed by receiver"
                 );
-                return;
+                return Outcome::PeerClosed;
             }
             Err(FrameError::Io(err)) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if peer_closed(&err) {
+                    info!(%peer, elapsed_ms, requests, "events channel closed by receiver: {err}");
+                    return Outcome::PeerClosed;
+                }
                 warn!(
                     %peer,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms,
                     requests,
-                    "events channel read error: {err}"
+                    "events channel read error, keeping the socket open without reading: {err}"
                 );
-                return;
+                return Outcome::LocalFailure;
             }
             Err(FrameError::Auth) => {
                 warn!(
                     %peer,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     requests,
-                    "events channel decryption failed, giving up on the channel"
+                    "events channel decryption failed, keeping the socket open without reading"
                 );
-                return;
+                return Outcome::LocalFailure;
             }
         };
         buffer.extend_from_slice(&plaintext);
@@ -142,8 +241,12 @@ where
                 Ok(Some(message)) => message,
                 Ok(None) => break,
                 Err(reason) => {
-                    warn!(%peer, requests, "events channel message parse error: {reason}");
-                    return;
+                    warn!(
+                        %peer,
+                        requests,
+                        "events channel message parse error, keeping the socket open without reading: {reason}"
+                    );
+                    return Outcome::LocalFailure;
                 }
             };
             requests += 1;
@@ -156,31 +259,45 @@ where
             let encrypted = match cipher.encrypt(&reply) {
                 Ok(encrypted) => encrypted,
                 Err(err) => {
-                    warn!(%peer, requests, "events channel encryption failed: {err}");
-                    return;
+                    warn!(
+                        %peer,
+                        requests,
+                        "events channel encryption failed, keeping the socket open without reading: {err}"
+                    );
+                    return Outcome::LocalFailure;
                 }
             };
             if let Err(err) = stream.write_all(&encrypted).await {
-                info!(
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if peer_closed(&err) {
+                    info!(
+                        %peer,
+                        elapsed_ms,
+                        requests,
+                        "events channel write failed (receiver closed it): {err}"
+                    );
+                    return Outcome::PeerClosed;
+                }
+                warn!(
                     %peer,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms,
                     requests,
-                    "events channel write failed (receiver closed it?): {err}"
+                    "events channel write error, keeping the socket open without reading: {err}"
                 );
-                return;
+                return Outcome::LocalFailure;
             }
         }
     }
 }
 
 /// Read and decrypt one HomeKit frame. On the first frame, retry once with the
-/// key roles swapped when authentication fails.
+/// key roles swapped when authentication fails. The mapping is returned with
+/// the first decrypted frame, and the spare key copies are dropped then.
 async fn read_frame<S>(
     stream: &mut S,
     cipher: &mut ControlCipher,
-    keys: &EventKeys,
-    mapping_checked: &mut bool,
-) -> Result<Vec<u8>, FrameError>
+    keys: &mut Option<EventKeys>,
+) -> Result<(Vec<u8>, Option<KeyMapping>), FrameError>
 where
     S: AsyncRead + Unpin,
 {
@@ -190,25 +307,22 @@ where
     let mut block = vec![0u8; block_len as usize + 16];
     read_exact(stream, &mut block).await?;
 
-    match cipher.decrypt_block(&block, block_len) {
-        Ok(plaintext) => {
-            if !*mapping_checked {
-                *mapping_checked = true;
-                info!("events channel keys: expected mapping (sender encrypts with Events-Read)");
-            }
-            Ok(plaintext)
+    match (cipher.decrypt_block(&block, block_len), keys.take()) {
+        (Ok(plaintext), None) => Ok((plaintext, None)),
+        (Ok(plaintext), Some(_)) => {
+            info!("events channel keys: expected mapping (sender encrypts with Events-Read)");
+            Ok((plaintext, Some(KeyMapping::Expected)))
         }
-        Err(_) if !*mapping_checked => {
-            *mapping_checked = true;
+        (Err(_), Some(keys)) => {
             let mut swapped = keys.swapped_cipher();
             let plaintext = swapped
                 .decrypt_block(&block, block_len)
                 .map_err(|_| FrameError::Auth)?;
             *cipher = swapped;
             info!("events channel keys: swapped mapping (sender encrypts with Events-Write)");
-            Ok(plaintext)
+            Ok((plaintext, Some(KeyMapping::Swapped)))
         }
-        Err(_) => Err(FrameError::Auth),
+        (Err(_), None) => Err(FrameError::Auth),
     }
 }
 

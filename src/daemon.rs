@@ -178,7 +178,10 @@ async fn run_session(
     let mut client: Option<AirPlayClient> = None;
     // Timestamps for the failure diagnostics.
     let mut stream_started: Option<Instant> = None;
-    let mut last_ok_feedback: Option<Instant> = None;
+    // Diagnostics only. `send_feedback` returns Ok(()) on its own internal 2 s
+    // timeout and for any receiver status, so this is the last time it returned
+    // Ok, not proof that the receiver answered the feedback.
+    let mut last_feedback_ok_return: Option<Instant> = None;
     // Pause before recycling after a failure, so a missing speaker is not
     // hammered with attempts.
     let mut retry_delay: Option<Duration> = None;
@@ -214,7 +217,7 @@ async fn run_session(
                                 Acquisition::Ready(acquired) => {
                                     client = Some(*acquired);
                                     stream_started = Some(Instant::now());
-                                    last_ok_feedback = None;
+                                    last_feedback_ok_return = None;
                                     sink.arm();
                                     monitor.mark_active(Instant::now());
                                     tracing::info!("streaming started");
@@ -238,7 +241,7 @@ async fn run_session(
             _ = feedback.tick(), if client.is_some() => {
                 if let Some(active) = client.as_mut() {
                     match tokio::time::timeout(FEEDBACK_TIMEOUT, active.send_feedback()).await {
-                        Ok(Ok(())) => last_ok_feedback = Some(Instant::now()),
+                        Ok(Ok(())) => last_feedback_ok_return = Some(Instant::now()),
                         Ok(Err(error)) => failure = Some(error.into()),
                         Err(_) => failure = Some(anyhow!("AirPlay feedback timed out")),
                     }
@@ -263,7 +266,7 @@ async fn run_session(
                 error = format!("{error:#}"),
                 error_kind,
                 since_stream_start_ms = since_ms(stream_started),
-                since_last_ok_feedback_ms = since_ms(last_ok_feedback),
+                since_last_feedback_ok_return_ms = since_ms(last_feedback_ok_return),
                 packets_sent = stats.as_ref().map(|stats| stats.packets_sent),
                 underruns = stats.as_ref().map(|stats| stats.underruns),
                 rtx_requested = stats.as_ref().map(|stats| stats.rtx_requested),

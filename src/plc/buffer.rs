@@ -23,10 +23,16 @@ const FADE_OUT_MS: u32 = 30;
 const CROSSFADE_MS: u32 = 10;
 /// The mirrored continuation is built from this much recent audio.
 const HISTORY_MS: u32 = 20;
-/// The smallest hole in the arrival times that counts as lost audio.
-const GAP_THRESHOLD_MS: u64 = 40;
+/// A late arrival this far past the baseline raises the suspicion of a hole;
+/// below the 20 ms of one lost A2DP packet, above the arrival jitter.
+const GAP_SUSPECT_MS: u64 = 10;
+/// A suspicion must hold this long (over at least three arrivals) to be
+/// confirmed. The audio after the hole waits in the cushion meanwhile.
+const GAP_WINDOW_MS: u64 = 80;
 /// Longer stalls are a restarted stream, not packet loss.
 const GAP_LIMIT_MS: u64 = 2_000;
+/// A capture overrun and the hole it leaves are one loss when this close.
+const XRUN_TOLERANCE: u64 = 4096;
 /// Digital zeros shorter than this are ordinary signal.
 const ZERO_RUN_MS: u32 = 2;
 /// Zeros only count as lost audio when the signal right before them reached
@@ -40,11 +46,14 @@ const DROP_MIN_MS: u32 = 20;
 const DROP_MAX_MS: u32 = 60;
 /// Length of the piece inserted when the buffer runs low.
 const STRETCH_MS: u32 = 20;
+/// The fill must stay below the low watermark this long before audio is
+/// inserted: a loss dips it too, but briefly.
+const LOW_HOLD_MS: u32 = 500;
 /// Least audio played between two clock-drift corrections.
 const CORRECTION_SPACING_MS: u32 = 1_000;
 /// The output may run this far ahead of real time (see [`Pacer`]), capped to a
-/// quarter of the target.
-const LEAD_MS: u32 = 100;
+/// tenth of the target: that audio leaves the queue for the sender's.
+const LEAD_MS: u32 = 50;
 
 /// Bluetooth jitter buffer with packet loss concealment.
 ///
@@ -54,14 +63,22 @@ const LEAD_MS: u32 = 100;
 /// Which audio comes out is decided by these rules, all of which keep the
 /// signal continuous (no step bigger than the signal's own slope):
 ///
-/// * **Cushion.** Playback starts with `jitter_buffer_ms` of audio queued.
-///   With no consumer attached, only the most recent `target` is kept, so a
-///   stream that attaches starts at once with a full cushion.
+/// * **Cushion.** Playback starts only once `jitter_buffer_ms` of audio is
+///   queued (a short wait if less was). With no consumer attached, exactly the
+///   most recent `target` is kept, so a stream that attaches starts at once
+///   with a full cushion. Handing the sender a short lead (at most 50 ms, a
+///   tenth of the target) leaves the queue within 90 to 100 % of the target.
 /// * **Lost audio.** Bluetooth packet loss removes audio instead of delaying
-///   it. [`GapDetector`] spots the hole from arrival times and the buffer
-///   fills it, in place, with the mirrored continuation of the audio before
-///   it, faded to silence over 30 ms and crossfaded into the audio after it
-///   over 10 ms. The cushion stays at its level and the timeline stays whole.
+///   it. [`GapDetector`] spots a hole from arrival times, from a single lost
+///   packet (10 ms and up) to a long one, and confirms it after 80 ms, once
+///   it is clear the audio is lost, not late. The buffer then fills the hole
+///   retroactively, at the recorded position (the audio after it has not
+///   played yet), with the mirrored continuation of the audio before it,
+///   faded to silence over 30 ms and crossfaded into the audio after it over
+///   10 ms. The cushion keeps its level and the timeline stays whole. Audio
+///   that was merely late is not touched. With a cushion shorter than about
+///   150 ms the position may have played by the time the hole is confirmed:
+///   it is then counted but not concealed.
 /// * **Zero runs.** A run of at least 2 ms of exact digital zeros right after
 ///   audible signal (a loss filled with zeros) is treated the same way.
 ///   Vinyl surface noise is never exactly zero, and silence that follows
@@ -69,15 +86,15 @@ const LEAD_MS: u32 = 100;
 /// * **Underruns.** When the consumer wants more than the buffer holds, it gets
 ///   what there is followed by the same concealment, exactly the requested
 ///   length. Concealment then continues (silence after the fade) until the
-///   buffer holds half its target again, to avoid flapping, and resumes with
-///   a 10 ms crossfade.
+///   buffer holds its whole target again, so the cushion is restored (and
+///   playback does not flap), and resumes with a 10 ms crossfade.
 /// * **Clock drift.** The Bluetooth source and this machine disagree on the
 ///   length of a second by tens of ppm. When the fill exceeds the target by
 ///   100 ms, 20 to 60 ms are dropped from the front, crossfaded over 10 ms; when
-///   it falls below a quarter of the target, 20 ms of mirrored audio are
-///   inserted, crossfaded the same way. At most once per second of playback,
-///   so a clock that is off by 100 ppm corrects itself every 3 minutes or so.
-///   Data that arrives late in a burst is trimmed the same way.
+///   it falls a quarter of the target (at least three chunks) below it, 20 ms of
+///   mirrored audio are inserted, crossfaded the same way. At most once per
+///   second of playback, so a clock that is off by 100 ppm corrects itself every
+///   3 minutes or so.
 ///
 /// The target is exactly the configured size and stays so: nothing here sizes
 /// the buffer from what it observes. The drift correction above is clock-drift
@@ -101,22 +118,32 @@ pub struct JitterBuffer {
     drop_min: usize,
     drop_max: usize,
     stretch_len: usize,
+    low_hold: usize,
     correction_spacing: usize,
     lead: Duration,
 
     fifo: VecDeque<i16>,
     consumer: bool,
     read: ReadState,
+    /// The consumer attached and the cushion is not complete yet: the silence
+    /// it gets meanwhile is not concealment of anything lost.
+    starting: bool,
     /// The last audio handed to the consumer, to continue it on underrun.
     tail: Vec<i16>,
     /// Frames played since the last clock-drift correction.
     since_correction: usize,
+    /// Frames played with the fill below the low watermark, without a break.
+    /// Drift keeps the fill low; a hole in the arrivals only dips it for a
+    /// moment (until it is confirmed and concealed).
+    low_for: usize,
 
     gaps: GapDetector,
+    /// Frames received through `push_at`, and where the capture last overran.
+    received: u64,
+    xrun_at: Option<u64>,
     /// A concealed stretch is being crossfaded into the audio being pushed.
     pending: Option<Blend>,
     zero: ZeroRun,
-    xrun_pending: bool,
     counters: Counters,
 }
 
@@ -158,8 +185,8 @@ impl JitterBuffer {
             channels: usize::from(channels.max(1)),
             sample_rate,
             target,
-            resume: (target / 2).max(crossfade),
-            low: target / 4,
+            resume: target,
+            low: target.saturating_sub((target / 4).max(3 * PLAYOUT_CHUNK_FRAMES)),
             high,
             capacity: (target * 2).max(high + frames(HIGH_MARGIN_MS)),
             fade_out: frames(FADE_OUT_MS).max(2),
@@ -169,21 +196,26 @@ impl JitterBuffer {
             drop_min: frames(DROP_MIN_MS).max(crossfade),
             drop_max: frames(DROP_MAX_MS).max(crossfade),
             stretch_len: frames(STRETCH_MS).max(1),
+            low_hold: frames(LOW_HOLD_MS),
             correction_spacing: frames(CORRECTION_SPACING_MS),
-            lead: Duration::from_millis(u64::from(LEAD_MS.min(jitter / 4))),
+            lead: Duration::from_millis(u64::from(LEAD_MS.min(jitter / 10))),
             fifo: VecDeque::new(),
             consumer: false,
             read: ReadState::Playing,
+            starting: false,
             tail: Vec::new(),
             since_correction: 0,
+            low_for: 0,
             gaps: GapDetector::new(
                 sample_rate,
-                Duration::from_millis(GAP_THRESHOLD_MS),
+                Duration::from_millis(GAP_SUSPECT_MS),
+                Duration::from_millis(GAP_WINDOW_MS),
                 Duration::from_millis(GAP_LIMIT_MS),
             ),
             pending: None,
             zero: ZeroRun::Idle,
-            xrun_pending: false,
+            received: 0,
+            xrun_at: None,
             counters: Counters::default(),
         }
     }
@@ -228,13 +260,16 @@ impl JitterBuffer {
     pub fn start_playout(&mut self) {
         self.consumer = true;
         self.read = ReadState::Concealing(self.silence());
+        self.starting = true;
         self.tail.clear();
         self.since_correction = 0;
+        self.low_for = 0;
     }
 
     /// The consumer went away: the buffer only keeps the most recent `target`.
     pub fn stop_playout(&mut self) {
         self.consumer = false;
+        self.starting = false;
         self.read = ReadState::Playing;
         self.tail.clear();
     }
@@ -242,7 +277,7 @@ impl JitterBuffer {
     /// The capture device overran and was recovered.
     pub fn note_xrun(&mut self) {
         self.counters.xruns += 1;
-        self.xrun_pending = true;
+        self.xrun_at = Some(self.received);
     }
 
     /// Takes the counters accumulated since the last call and starts anew.
@@ -255,7 +290,8 @@ impl JitterBuffer {
 
     /// Pushes audio that arrived at `now` (any monotonic epoch), with
     /// `backlog` more frames already waiting in the capture device. A hole in
-    /// the arrival times is concealed first.
+    /// the arrival times is concealed once it is confirmed, which takes a few
+    /// more pushes (see [`GapDetector`]).
     pub fn push_at(&mut self, now: Duration, samples: &[i16], backlog: usize) {
         let frames = samples.len() / self.channels;
         if frames == 0 {
@@ -263,11 +299,11 @@ impl JitterBuffer {
         }
         match self.gaps.observe(now, frames, backlog) {
             GapVerdict::OnTime => {}
-            GapVerdict::Gap(missing) => self.conceal_gap(missing),
+            GapVerdict::Hole { behind, frames } => self.conceal_hole(behind, frames),
             GapVerdict::Restart => self.splice(),
         }
         self.push(samples);
-        self.xrun_pending = false;
+        self.received += frames as u64;
     }
 
     /// Pushes audio without looking at arrival times.
@@ -322,25 +358,54 @@ impl JitterBuffer {
         self.enforce_bounds();
     }
 
-    /// Fills a hole of `missing` frames in the timeline.
-    fn conceal_gap(&mut self, missing: usize) {
+    /// Fills a confirmed hole of `missing` frames, `behind` frames before the
+    /// end of the audio received so far, with concealment: the audio that
+    /// followed it is moved back, crossfaded in.
+    fn conceal_hole(&mut self, behind: usize, missing: usize) {
         if self.consumer && matches!(self.read, ReadState::Concealing(_)) {
             // The output stage already bridged this hole, and counted it.
             return;
         }
-        if !self.xrun_pending {
+        let position = self.received.saturating_sub(behind as u64);
+        if !self
+            .xrun_at
+            .is_some_and(|at| at.abs_diff(position) <= XRUN_TOLERANCE)
+        {
+            // A capture overrun leaves a hole; it is one loss, counted once.
             self.counters.gaps += 1;
         }
-        if let ZeroRun::Concealing(mut conceal) = std::mem::replace(&mut self.zero, ZeroRun::Idle) {
-            // The hole extends a concealed run of zeros.
-            self.fill_from(&mut conceal, missing);
-            self.zero = ZeroRun::Concealing(conceal);
+
+        // Zeros held back are not queued yet: they come after the hole.
+        let held = match self.zero {
+            ZeroRun::Counting(held) => held,
+            _ => 0,
+        };
+        let queued = self.fill_frames();
+        let after = behind.saturating_sub(held);
+        if after > queued {
+            // Already played: too late to bridge it.
             return;
         }
-        self.release_held_zeros();
-        let mut conceal = Concealment::new(&self.history(), self.channels, Some(self.fade_out));
-        self.fill_from(&mut conceal, missing);
-        self.pending = Some(Blend { conceal, pos: 0 });
+        let at = queued - after;
+        let channels = self.channels;
+        let mut conceal = Concealment::new(&self.history_before(at), channels, Some(self.fade_out));
+        let mut hidden = vec![0_i16; missing * channels];
+        conceal.fill(&mut hidden);
+        let mut rest: Vec<i16> = self.fifo.drain(at * channels..).collect();
+        let blended = self.crossfade.min(queued - at);
+        conceal.blend_into(&mut rest[..blended * channels], 0, self.crossfade);
+        self.fifo.extend(hidden);
+        self.fifo.extend(rest);
+        if blended < self.crossfade {
+            // The hole is at the very end: the rest of the crossfade is
+            // applied to the audio still to come.
+            self.pending = Some(Blend {
+                conceal,
+                pos: blended,
+            });
+        }
+        self.counters.concealments += 1;
+        self.counters.concealed_frames += missing as u64;
     }
 
     /// The stream restarted after a long stall: joins the audio before and
@@ -433,12 +498,19 @@ impl JitterBuffer {
     /// Last `history_len` frames of the timeline, oldest first: the queue's
     /// tail, completed with what was already played if the queue is shorter.
     fn history(&self) -> Vec<i16> {
+        self.history_before(self.fill_frames())
+    }
+
+    /// Like [`history`](Self::history), for the point `at` frames into the
+    /// queue.
+    fn history_before(&self, at: usize) -> Vec<i16> {
         let wanted = self.history_len * self.channels;
-        let queued = self.fifo.len().min(wanted);
+        let end = at * self.channels;
+        let queued = end.min(wanted);
         let played = self.tail.len().min(wanted - queued);
         let mut history = Vec::with_capacity(queued + played);
         history.extend_from_slice(&self.tail[self.tail.len() - played..]);
-        history.extend(self.fifo.range(self.fifo.len() - queued..));
+        history.extend(self.fifo.range(end - queued..end));
         history
     }
 
@@ -493,7 +565,7 @@ impl JitterBuffer {
         }
         self.resume_if_ready();
         if matches!(self.read, ReadState::Playing) && self.consumer {
-            self.correct_drift();
+            self.correct_drift(frames);
         }
 
         let fill = self.fill_frames();
@@ -516,7 +588,9 @@ impl JitterBuffer {
             ReadState::Concealing(mut conceal) if allow_conceal => {
                 conceal.fill(out);
                 self.remember(out);
-                self.counters.concealed_frames += frames as u64;
+                if !self.starting {
+                    self.counters.concealed_frames += frames as u64;
+                }
                 self.read = ReadState::Concealing(conceal);
             }
             state => {
@@ -560,6 +634,7 @@ impl JitterBuffer {
         else {
             return;
         };
+        self.starting = false;
         self.blend_front(&mut conceal, 0);
     }
 
@@ -579,17 +654,22 @@ impl JitterBuffer {
 
     /// Keeps the fill inside its band against clock drift, at most once per
     /// `CORRECTION_SPACING_MS` of playback.
-    fn correct_drift(&mut self) {
+    fn correct_drift(&mut self, played: usize) {
+        let fill = self.fill_frames();
+        if fill < self.low {
+            self.low_for += played;
+        } else {
+            self.low_for = 0;
+        }
         if self.since_correction < self.correction_spacing {
             return;
         }
-        let fill = self.fill_frames();
         if fill > self.high {
             let drop = (fill - self.high + self.drop_min).clamp(self.drop_min, self.drop_max);
             self.drop_front(drop);
             self.counters.drift_drops += 1;
             self.since_correction = 0;
-        } else if fill < self.low && fill >= self.crossfade && self.tail.len() >= 4 {
+        } else if self.low_for >= self.low_hold && fill >= self.crossfade && self.tail.len() >= 4 {
             let mut conceal = Concealment::new(&self.tail, self.channels, None);
             self.blend_front(&mut conceal, self.stretch_len);
             self.counters.drift_stretches += 1;

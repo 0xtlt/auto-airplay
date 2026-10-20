@@ -87,6 +87,15 @@ fn new_buffer(jitter_ms: u32) -> JitterBuffer {
     JitterBuffer::new(RATE, CH as u8, jitter_ms)
 }
 
+fn detector() -> GapDetector {
+    GapDetector::new(
+        RATE,
+        Duration::from_millis(10),
+        Duration::from_millis(80),
+        Duration::from_secs(2),
+    )
+}
+
 fn at(ms: f64) -> Duration {
     Duration::from_secs_f64(ms / 1000.0)
 }
@@ -208,17 +217,18 @@ fn an_underrun_shorter_than_the_fade_resumes_with_a_crossfade() {
 }
 
 #[test]
-fn concealment_waits_for_the_resume_threshold() {
+fn concealment_waits_for_the_whole_cushion_to_be_back() {
     let mut buffer = new_buffer(400);
     buffer.start_playout();
     buffer.push(&source(0, frames(400)));
     let mut out = pull_all(&mut buffer, frames(400));
     out.extend(pull_all(&mut buffer, frames(10)));
     let resume = buffer.resume_frames();
-    assert_eq!(resume, frames(200));
+    assert_eq!(resume, buffer.target_frames(), "the whole cushion");
+    assert_eq!(resume, frames(400));
 
-    // Just below half the target: still concealing, and a pull that would
-    // need real audio is refused.
+    // Just short of the target: still concealing, and a pull that would need
+    // real audio is refused.
     buffer.push(&source(frames(2_000), resume - 1));
     let mut chunk = vec![0_i16; frames(10) * CH];
     assert!(!buffer.pull(&mut chunk, false), "below the threshold");
@@ -229,13 +239,27 @@ fn concealment_waits_for_the_resume_threshold() {
         "audio is kept, not consumed"
     );
 
-    // At the threshold, real audio resumes, with a crossfade.
+    // At the target, real audio resumes, with a crossfade.
     buffer.push(&source(frames(2_000) + resume - 1, 1));
     assert!(buffer.pull(&mut chunk, false));
     out.extend_from_slice(&chunk);
     assert_continuous(&out);
     assert_eq!(buffer.fill_frames(), resume - frames(10));
     assert_eq!(buffer.take_stats().underruns, 1, "no flapping");
+}
+
+#[test]
+fn a_cold_start_waits_for_the_whole_cushion() {
+    let mut buffer = new_buffer(400);
+    buffer.push(&source(0, frames(250)));
+    buffer.start_playout();
+    let mut chunk = vec![0_i16; frames(10) * CH];
+
+    // Not enough queued: real audio only, so nothing goes out yet.
+    assert!(!buffer.pull(&mut chunk, false));
+    buffer.push(&source(frames(250), frames(150)));
+    assert!(buffer.pull(&mut chunk, false), "the full 400 ms is queued");
+    assert_eq!(buffer.take_stats().losses, 0);
 }
 
 #[test]
@@ -262,10 +286,10 @@ fn a_second_underrun_straight_after_resuming_is_continuous() {
     buffer.start_playout();
     buffer.push(&source(0, frames(50)));
     let mut out = pull_all(&mut buffer, frames(60));
-    // Enough to resume (25 ms), consumed immediately, over and over.
+    // Enough to resume (the whole 50 ms), consumed immediately, over and over.
     for round in 0..8 {
-        buffer.push(&source(frames(1_000 * (round + 1)), frames(26)));
-        out.extend(pull_all(&mut buffer, frames(30)));
+        buffer.push(&source(frames(1_000 * (round + 1)), frames(51)));
+        out.extend(pull_all(&mut buffer, frames(60)));
     }
 
     assert_continuous(&out);
@@ -283,6 +307,8 @@ struct Pipeline {
     out: Vec<i16>,
     now_ms: f64,
     pushed_frames: usize,
+    /// The fill (ms of the source clock, frames) every 100 ms.
+    fills: Vec<(f64, usize)>,
 }
 
 impl Pipeline {
@@ -307,6 +333,7 @@ impl Pipeline {
             out: Vec::new(),
             now_ms,
             pushed_frames,
+            fills: Vec::new(),
         }
     }
 
@@ -325,8 +352,13 @@ impl Pipeline {
         let chunk_len = self.buffer.chunk_frames();
         let mut chunk = vec![0_i16; chunk_len * CH];
 
+        let mut step = 0_u32;
         while self.now_ms < end {
             self.now_ms += 1.0;
+            step += 1;
+            if step.is_multiple_of(100) {
+                self.fills.push((self.now_ms, self.buffer.fill_frames()));
+            }
             while next < pending.len() && pending[next].0 <= self.now_ms {
                 let (time, block) = pending[next];
                 self.buffer
@@ -375,7 +407,7 @@ fn a_170_ms_hole_is_concealed_in_place() {
     let played = pipeline.out.len() / CH;
     assert!(
         (accounted as i64 - (played + queued) as i64).abs() <= 400,
-        "pushed {} + concealed {concealed} vs played {played} + queued {queued}",
+        "pushed {} + concealed {concealed} vs played {played} + queued {queued}: {stats}",
         pipeline.pushed_frames,
     );
     // The cushion survives the loss.
@@ -404,7 +436,6 @@ fn the_hole_is_bridged_by_a_fade_and_a_crossfade() {
         position += PERIOD;
         clock += block_ms();
     }
-    buffer.start_playout();
     let all = drain(&mut buffer);
 
     assert_continuous(&all);
@@ -434,20 +465,41 @@ fn late_burst(jitter_ms: u32, prefill_ms: u32, late_blocks: usize, seconds: usiz
 }
 
 #[test]
-fn audio_that_is_merely_late_costs_no_click() {
+fn audio_that_is_merely_late_is_left_alone() {
     let mut pipeline = late_burst(400, 400, 8, 30);
 
     assert_continuous(&pipeline.out);
     let stats = pipeline.buffer.take_stats();
-    assert_eq!((stats.gaps, stats.underruns), (1, 0), "{stats}");
+    assert_eq!(
+        (stats.gaps, stats.underruns, stats.concealed_ms),
+        (0, 0, 0),
+        "{stats}"
+    );
     assert!(stats.buffer_fill_ms <= 500, "within the band: {stats}");
 }
 
 #[test]
-fn a_surplus_from_late_audio_is_trimmed_click_free() {
-    // 400 ms late with a 1 s cushion: the concealed hole *and* the audio that
-    // follows both end up queued, 400 ms above the nominal fill.
-    let mut pipeline = late_burst(1_000, 900, 19, 60);
+fn a_slow_catch_up_is_taken_for_a_hole_and_the_surplus_is_trimmed() {
+    // 300 ms late, then caught up at twice the speed: the suspicion outlasts
+    // its window before the audio is back, so the hole is concealed, and the
+    // audio that then arrives is a surplus, trimmed without a click.
+    let mut pipeline = Pipeline::attached(1_000, 900);
+    let first = pipeline.pushed_frames / PERIOD;
+    // Delivery stalls for 14 blocks (298 ms), then the backlog goes out at
+    // twice real time, in order, new blocks queueing behind it.
+    let mut arrival = Vec::new();
+    let mut previous = 0.0;
+    for block in 0..6_000_usize {
+        let nominal = block as f64 * block_ms();
+        let time = match block.checked_sub(first + 40) {
+            None => nominal,
+            Some(0) => nominal + 14.0 * block_ms(),
+            Some(_) => nominal.max(previous + block_ms() / 2.0),
+        };
+        arrival.push(time);
+        previous = time;
+    }
+    pipeline.run(60, first, |block| Some(arrival[block]));
 
     assert_continuous(&pipeline.out);
     let stats = pipeline.buffer.take_stats();
@@ -462,6 +514,117 @@ fn a_surplus_from_late_audio_is_trimmed_click_free() {
     );
 }
 
+/// Feeds the detector blocks `from..to` of a source whose block `k` reaches
+/// it at `arrival(k)` ms, `None` if lost; returns every verdict that is not
+/// `OnTime`, with the block it came with.
+fn verdicts(
+    detector: &mut GapDetector,
+    from: usize,
+    to: usize,
+    arrival: impl Fn(usize) -> Option<f64>,
+) -> Vec<(usize, GapVerdict)> {
+    let mut arrivals: Vec<(f64, usize)> = (from..to)
+        .filter_map(|block| arrival(block).map(|time| (time, block)))
+        .collect();
+    arrivals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    arrivals
+        .into_iter()
+        .filter_map(|(time, block)| {
+            let verdict = detector.observe(at(time), PERIOD, 0);
+            (verdict != GapVerdict::OnTime).then_some((block, verdict))
+        })
+        .collect()
+}
+
+fn on_time(block: usize) -> Option<f64> {
+    Some(block as f64 * block_ms())
+}
+
+#[test]
+fn a_hole_is_confirmed_after_the_window_with_its_length_and_position() {
+    let mut detector = detector();
+    // Eight blocks (170 ms) never arrive.
+    let found = verdicts(&mut detector, 0, 200, |block| {
+        (!(100..108).contains(&block))
+            .then(|| on_time(block))
+            .flatten()
+    });
+
+    // Block 108 is the first after the hole; the suspicion holds for 80 ms and
+    // is confirmed with block 112, four blocks after the hole.
+    assert_eq!(found.len(), 1, "{found:?}");
+    let (block, GapVerdict::Hole { behind, frames }) = found[0] else {
+        panic!("expected a hole, got {found:?}");
+    };
+    assert_eq!(block, 112);
+    assert_eq!(behind, 4 * PERIOD);
+    // The baseline creeps up by the drift allowance (1 ms per second) meanwhile.
+    assert!(frames.abs_diff(8 * PERIOD) <= 16, "{frames}");
+}
+
+#[test]
+fn a_single_lost_packet_of_21_ms_is_confirmed() {
+    let mut detector = detector();
+    let found = verdicts(&mut detector, 0, 200, |block| {
+        (block != 100).then(|| on_time(block)).flatten()
+    });
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    let GapVerdict::Hole { behind, frames } = found[0].1 else {
+        panic!("expected a hole, got {found:?}");
+    };
+    assert!(frames.abs_diff(PERIOD) <= 16, "{frames}");
+    assert_eq!(behind, 4 * PERIOD);
+}
+
+#[test]
+fn two_losses_in_quick_succession_are_two_holes() {
+    let mut detector = detector();
+    let found = verdicts(&mut detector, 0, 300, |block| {
+        (block != 100 && block != 102)
+            .then(|| on_time(block))
+            .flatten()
+    });
+
+    let total: usize = found
+        .iter()
+        .map(|(_, verdict)| match verdict {
+            GapVerdict::Hole { frames, .. } => *frames,
+            other => panic!("unexpected {other:?}"),
+        })
+        .sum();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(total.abs_diff(2 * PERIOD) <= 32, "{total}");
+}
+
+#[test]
+fn a_late_packet_is_not_a_hole() {
+    // Blocks arrive 21, 30 or 45 ms late, one at a time; the next one is on time.
+    for late in [21.0, 30.0, 45.0] {
+        let mut detector = detector();
+        let found = verdicts(&mut detector, 0, 400, |block| {
+            Some(block as f64 * block_ms() + if block % 50 == 25 { late } else { 0.0 })
+        });
+
+        assert!(found.is_empty(), "{late} ms late: {found:?}");
+    }
+}
+
+#[test]
+fn audio_that_is_late_and_then_catches_up_in_a_burst_is_not_a_hole() {
+    let mut detector = detector();
+    // Blocks 100..108 are held back 170 ms and arrive together.
+    let found = verdicts(&mut detector, 0, 400, |block| {
+        Some(if (100..108).contains(&block) {
+            108.0 * block_ms()
+        } else {
+            block as f64 * block_ms()
+        })
+    });
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
 #[test]
 fn normal_arrival_jitter_is_not_a_gap() {
     let mut state = 12_345_u32;
@@ -469,10 +632,10 @@ fn normal_arrival_jitter_is_not_a_gap() {
         state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         f64::from(state >> 8) / f64::from(1_u32 << 24)
     };
-    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
-    for block in 0..60_000 / 21 {
-        // Up to 15 ms late, in no particular order.
-        let time = block as f64 * block_ms() + 15.0 * jitter();
+    let mut detector = detector();
+    // Up to 9 ms late, in no particular order, for ten minutes.
+    for block in 0..10 * 60_000 / 21 {
+        let time = block as f64 * block_ms() + 9.0 * jitter();
         assert_eq!(
             detector.observe(at(time), PERIOD, 0),
             GapVerdict::OnTime,
@@ -482,10 +645,30 @@ fn normal_arrival_jitter_is_not_a_gap() {
 }
 
 #[test]
+fn large_arrival_jitter_that_does_not_last_is_not_a_hole() {
+    let mut state = 99_u32;
+    let mut jitter = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(state >> 8) / f64::from(1_u32 << 24)
+    };
+    let mut detector = detector();
+    // Up to 14 ms: now and then over the suspicion threshold, but never for
+    // long enough to be confirmed.
+    let mut confirmed = 0;
+    for block in 0..60_000 / 21 {
+        let time = block as f64 * block_ms() + 14.0 * jitter();
+        if detector.observe(at(time), PERIOD, 0) != GapVerdict::OnTime {
+            confirmed += 1;
+        }
+    }
+    assert!(confirmed <= 1, "{confirmed} false holes in a minute");
+}
+
+#[test]
 fn bursty_packet_delivery_is_not_a_gap() {
     // A2DP delivers a few ms of audio per packet, every ~20 ms: the capture
     // device returns what is there, in uneven pieces.
-    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    let mut detector = detector();
     let mut delivered = 0;
     for tick in 0..30_000 {
         let time = f64::from(tick) * 2.0;
@@ -505,8 +688,7 @@ fn bursty_packet_delivery_is_not_a_gap() {
 #[test]
 fn slow_clock_drift_is_not_a_gap() {
     for ppm in [-300.0_f64, -100.0, -20.0, 20.0, 100.0, 300.0] {
-        let mut detector =
-            GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+        let mut detector = detector();
         // The source's second is `1 + ppm/1e6` of ours.
         let scale = 1.0 + ppm / 1e6;
         for block in 0..60 * 48_000 / PERIOD {
@@ -521,31 +703,8 @@ fn slow_clock_drift_is_not_a_gap() {
 }
 
 #[test]
-fn a_hole_is_reported_with_its_length() {
-    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
-    for block in 0..100 {
-        assert_eq!(
-            detector.observe(at(block as f64 * block_ms()), PERIOD, 0),
-            GapVerdict::OnTime
-        );
-    }
-    let verdict = detector.observe(at(108.0 * block_ms()), PERIOD, 0);
-
-    // The baseline creeps up by the drift allowance (1 ms per second) meanwhile.
-    let GapVerdict::Gap(missing) = verdict else {
-        panic!("expected a gap, got {verdict:?}");
-    };
-    assert!(missing.abs_diff(8 * PERIOD) <= 16, "{missing}");
-    // The hole is filled: the next block is on time again.
-    assert_eq!(
-        detector.observe(at(109.0 * block_ms()), PERIOD, 0),
-        GapVerdict::OnTime
-    );
-}
-
-#[test]
 fn frames_waiting_in_the_capture_device_are_late_not_lost() {
-    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    let mut detector = detector();
     for block in 0..100 {
         detector.observe(at(block as f64 * block_ms()), PERIOD, 0);
     }
@@ -559,7 +718,7 @@ fn frames_waiting_in_the_capture_device_are_late_not_lost() {
 
 #[test]
 fn a_long_stall_is_a_restart_not_a_loss() {
-    let mut detector = GapDetector::new(RATE, Duration::from_millis(40), Duration::from_secs(2));
+    let mut detector = detector();
     for block in 0..100 {
         detector.observe(at(block as f64 * block_ms()), PERIOD, 0);
     }
@@ -590,7 +749,6 @@ fn a_restart_is_spliced_without_a_click_or_a_loss() {
         position += PERIOD;
         clock += block_ms();
     }
-    buffer.start_playout();
     let all = drain(&mut buffer);
 
     assert_continuous(&all);
@@ -642,7 +800,11 @@ fn an_xrun_and_the_hole_it_leaves_are_one_loss() {
     }
     buffer.note_xrun();
     clock += 100.0;
-    buffer.push_at(at(clock), &source(40 * PERIOD, PERIOD), 0);
+    // The hole is confirmed a few blocks later.
+    for block in 40..60 {
+        buffer.push_at(at(clock), &source(block * PERIOD, PERIOD), 0);
+        clock += block_ms();
+    }
 
     let stats = buffer.take_stats();
     assert_eq!(
@@ -829,16 +991,19 @@ fn a_two_second_buffer_survives_ten_minutes_of_streaming_without_growing() {
     buffer.push(&source(0, frames(2_000)));
     buffer.start_playout();
     let mut position = frames(2_000);
-    let mut peak = 0;
+    let (mut peak, mut lowest) = (0, usize::MAX);
     let mut out = vec![0_i16; frames(10) * CH];
     for _ in 0..600 * 100 {
         buffer.push(&source(position, frames(10)));
         position += frames(10);
         assert!(buffer.pull(&mut out, true));
         peak = peak.max(buffer.fill_frames());
+        lowest = lowest.min(buffer.fill_frames());
     }
 
     assert!(peak <= 2 * buffer.target_frames(), "peak {} ms", ms(peak));
+    // And it does not run down either: three quarters of the target, at least.
+    assert!(lowest >= frames(1_500), "lowest {} ms", ms(lowest));
     assert_eq!(buffer.take_stats().losses, 0);
 }
 
@@ -984,8 +1149,8 @@ fn an_outage_longer_than_the_cushion_is_concealed_and_recovers() {
 fn stats_count_every_kind_of_loss_and_reset_each_minute() {
     let mut buffer = new_buffer(400);
     buffer.start_playout();
-    buffer.push(&source(0, frames(300)));
-    let mut out = pull_all(&mut buffer, frames(300) + frames(25));
+    buffer.push(&source(0, frames(400)));
+    let mut out = pull_all(&mut buffer, frames(400) + frames(25));
     buffer.note_xrun();
     buffer.note_xrun();
     let mut zeros = source(frames(1_000), frames(100));
@@ -1256,4 +1421,189 @@ fn small_cushions_work_with_whole_chunks() {
         );
         assert_continuous(&pipeline.out);
     }
+}
+
+// ----- single lost packets -----
+
+/// A mono tone on both channels, for a low frequency whose natural slope is small.
+fn tone(start: usize, count: usize, hz: f32) -> Vec<i16> {
+    let mut samples = Vec::with_capacity(count * CH);
+    for frame in start..start + count {
+        let phase = std::f32::consts::TAU * hz * frame as f32 / RATE as f32;
+        let value = (phase.sin() * AMPLITUDE) as i16;
+        samples.extend([value; CH]);
+    }
+    samples
+}
+
+#[test]
+fn a_single_lost_packet_is_concealed_without_a_click() {
+    // One lost 1024-frame block (21.3 ms) from a 173 Hz sine: spliced as it
+    // is, the step is 48,000 counts against a natural maximum of 670.
+    let hz = 173.0;
+    let natural = natural_step(hz);
+    let mut buffer = new_buffer(400);
+    let mut clock = 0.0;
+    let mut position = 0;
+    for block in 0..120 {
+        if block == 40 {
+            position += PERIOD;
+            clock += block_ms();
+        }
+        buffer.push_at(at(clock), &tone(position, PERIOD, hz), 0);
+        position += PERIOD;
+        clock += block_ms();
+    }
+    let out = drain(&mut buffer);
+
+    for channel in 0..CH {
+        let step = max_step(&out, channel);
+        assert!(step <= STEP_MARGIN * natural, "step {step} vs {natural}");
+    }
+    let stats = buffer.take_stats();
+    assert_eq!(
+        (stats.gaps, stats.losses, stats.concealed),
+        (1, 1, 1),
+        "{stats}"
+    );
+    assert!((19..=22).contains(&stats.concealed_ms), "{stats}");
+}
+
+#[test]
+fn without_concealment_the_lost_packet_would_click() {
+    // The control of the test above: the bare splice.
+    let hz = 173.0;
+    let mut spliced = tone(0, 40 * PERIOD, hz);
+    spliced.extend(tone(41 * PERIOD, 40 * PERIOD, hz));
+
+    assert!(max_step(&spliced, 0) > 20.0 * natural_step(hz));
+}
+
+#[test]
+fn single_lost_packets_through_the_playout_are_concealed() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    let lost = [first + 40, first + 140, first + 300];
+    pipeline.run(20, first, |block| {
+        (!lost.contains(&block)).then(|| block as f64 * block_ms())
+    });
+
+    assert_continuous(&pipeline.out);
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!((stats.gaps, stats.underruns), (3, 0), "{stats}");
+    assert_every_chunk_resamples(&pipeline.out, CH);
+}
+
+#[test]
+fn ordinary_arrival_jitter_conceals_nothing() {
+    let mut state = 4_242_u32;
+    let mut jitter = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(state >> 8) / f64::from(1_u32 << 24)
+    };
+    let noise: Vec<f64> = (0..4_000).map(|_| 9.0 * jitter()).collect();
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    pipeline.run(60, first, |block| {
+        Some(block as f64 * block_ms() + noise[block % noise.len()])
+    });
+
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!(
+        (stats.gaps, stats.concealed_ms, stats.drift_corrections),
+        (0, 0, 0),
+        "{stats}"
+    );
+    assert_continuous(&pipeline.out);
+}
+
+#[test]
+fn a_hole_that_already_played_is_counted_but_not_concealed() {
+    // With a 50 ms cushion the audio after a hole is played before the hole
+    // is confirmed (80 ms): nothing can be bridged any more.
+    let mut pipeline = Pipeline::attached(50, 50);
+    let first = pipeline.pushed_frames / PERIOD;
+    pipeline.run(10, first, |block| {
+        (block != first + 100).then(|| block as f64 * block_ms())
+    });
+
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!(stats.gaps, 1, "{stats}");
+    assert_eq!(stats.concealed_ms, 0, "{stats}");
+    assert_every_chunk_resamples(&pipeline.out, CH);
+}
+
+// ----- the cushion -----
+
+/// The fill stays between three quarters of the target and the high watermark
+/// once the cushion is built, with nothing to correct.
+#[track_caller]
+fn assert_cushion_held(pipeline: &Pipeline, jitter_ms: u32, after_ms: f64) {
+    let low = frames(jitter_ms) * 3 / 4;
+    let high = frames(jitter_ms) + frames(100);
+    let settled: Vec<usize> = pipeline
+        .fills
+        .iter()
+        .filter(|(time, _)| *time >= after_ms)
+        .map(|&(_, fill)| fill)
+        .collect();
+    assert!(settled.len() > 100);
+    let (min, max) = (
+        *settled.iter().min().unwrap(),
+        *settled.iter().max().unwrap(),
+    );
+    assert!(
+        min >= low && max <= high,
+        "{jitter_ms} ms: fill {} to {} ms, allowed {} to {} ms",
+        ms(min),
+        ms(max),
+        ms(low),
+        ms(high)
+    );
+}
+
+#[test]
+fn a_cold_start_builds_the_whole_cushion_and_keeps_it() {
+    for jitter in [400, 2_000] {
+        // Attached with only half the cushion queued.
+        let mut pipeline = Pipeline::attached(jitter, jitter / 2);
+        let first = pipeline.pushed_frames / PERIOD;
+        pipeline.run(120, first, |block| Some(block as f64 * block_ms()));
+
+        assert_cushion_held(&pipeline, jitter, f64::from(jitter) + 3_000.0);
+        let stats = pipeline.buffer.take_stats();
+        assert_eq!(
+            (stats.underruns, stats.gaps, stats.drift_corrections),
+            (0, 0, 0),
+            "{jitter} ms: {stats}"
+        );
+        assert_continuous(&pipeline.out);
+    }
+}
+
+#[test]
+fn an_attached_full_cushion_keeps_its_level() {
+    for jitter in [400, 2_000] {
+        let mut pipeline = Pipeline::attached(jitter, jitter);
+        let first = pipeline.pushed_frames / PERIOD;
+        pipeline.run(120, first, |block| Some(block as f64 * block_ms()));
+
+        assert_cushion_held(&pipeline, jitter, 3_000.0);
+        assert_eq!(pipeline.buffer.take_stats().losses, 0);
+    }
+}
+
+#[test]
+fn after_an_outage_the_cushion_is_back_at_the_target() {
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    // 1.5 s without audio: longer than the cushion.
+    let lost = first + 100..first + 170;
+    pipeline.run(60, first, |block| {
+        (!lost.contains(&block)).then(|| block as f64 * block_ms())
+    });
+
+    assert_eq!(pipeline.buffer.take_stats().underruns, 1);
+    assert_continuous(&pipeline.out);
+    assert_cushion_held(&pipeline, 400, 15_000.0);
 }

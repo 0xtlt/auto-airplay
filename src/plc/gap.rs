@@ -10,13 +10,27 @@ const DRIFT_ALLOWANCE: f64 = 0.001;
 /// What the arrival of a block of frames says about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapVerdict {
-    /// The block arrived when expected.
+    /// Nothing to report. (A late block may be under suspicion, see
+    /// [`GapDetector`]; it is reported later, or never.)
     OnTime,
-    /// This many frames went missing right before the block.
-    Gap(usize),
+    /// Audio went missing: `frames` of it, at the point that is `behind`
+    /// frames before the block that just arrived (that block not counted).
+    Hole { behind: usize, frames: usize },
     /// The stream paused for longer than any packet loss would explain; it
     /// restarted, so the block is not preceded by a known hole.
     Restart,
+}
+
+/// A block arrived late; lost, or just late?
+#[derive(Debug, Clone, Copy)]
+struct Suspect {
+    /// Frames received before the block that raised the suspicion: where the
+    /// missing audio would be.
+    received_at: f64,
+    since: Duration,
+    samples: u32,
+    /// Lowest excess seen since: what is surely missing.
+    min_excess: f64,
 }
 
 /// Compares the frames received with the time that passed.
@@ -28,39 +42,49 @@ pub enum GapVerdict {
 ///
 /// The detector keeps `deficit = elapsed - received` (in frames) and a
 /// baseline: the lowest deficit seen, creeping up slowly (see
-/// [`DRIFT_ALLOWANCE`]). The baseline absorbs the constant latency, the
-/// burstiness of A2DP packets and the clock drift. A deficit that rises
-/// `threshold` above the baseline is a hole of that many frames; the caller
-/// fills it with concealment, which counts as received. Data that was only
-/// late, not lost, shows up afterwards as a deficit *below* the baseline: the
-/// baseline drops, and the surplus is trimmed by the jitter buffer.
+/// [`DRIFT_ALLOWANCE`]). The baseline absorbs the constant latency and the
+/// clock drift. The deficit is only sampled right after data arrived, which
+/// removes the sawtooth of burst delivery.
 ///
-/// Only call [`observe`](Self::observe) right after data arrived: sampling the
-/// deficit at those instants removes the sawtooth of burst arrival.
+/// A deficit `suspect` above the baseline is only a suspicion, because a block
+/// that is merely late looks the same at that instant. What tells them apart
+/// is what follows. Late audio is followed by a catch-up and the deficit falls
+/// back to the baseline; lost audio leaves the deficit raised for good. So the
+/// suspicion is confirmed only if every arrival during `window` (and at least
+/// three) is still `suspect` above the baseline, and the hole is the lowest
+/// excess seen. The caller conceals it retroactively, at the recorded
+/// position, while the audio after it is still in the cushion. This is what
+/// lets the threshold be as small as a single lost A2DP packet (about 20 ms)
+/// without false alarms from ordinary arrival jitter.
 #[derive(Debug, Clone)]
 pub struct GapDetector {
     rate: f64,
-    threshold: f64,
+    suspect: f64,
+    window: Duration,
     max_gap: f64,
     origin: Option<Duration>,
     last: Duration,
     received: f64,
     baseline: f64,
+    pending: Option<Suspect>,
 }
 
 impl GapDetector {
-    /// `threshold` is the smallest hole reported, `max_gap` the longest one
-    /// treated as loss; anything longer is a [`GapVerdict::Restart`].
-    pub fn new(sample_rate: u32, threshold: Duration, max_gap: Duration) -> Self {
+    /// `suspect` is the smallest hole reported, `window` how long a suspicion
+    /// must hold, `max_gap` the longest hole treated as loss; anything longer
+    /// is a [`GapVerdict::Restart`].
+    pub fn new(sample_rate: u32, suspect: Duration, window: Duration, max_gap: Duration) -> Self {
         let rate = f64::from(sample_rate);
         Self {
             rate,
-            threshold: threshold.as_secs_f64() * rate,
+            suspect: suspect.as_secs_f64() * rate,
+            window,
             max_gap: max_gap.as_secs_f64() * rate,
             origin: None,
             last: Duration::ZERO,
             received: 0.0,
             baseline: 0.0,
+            pending: None,
         }
     }
 
@@ -68,6 +92,7 @@ impl GapDetector {
     /// epoch). `backlog` is the number of frames already waiting in the
     /// capture device: they are late, not lost, and count as received.
     pub fn observe(&mut self, now: Duration, frames: usize, backlog: usize) -> GapVerdict {
+        let before = self.received;
         self.received += frames as f64;
         let held = self.received + backlog as f64;
         let Some(origin) = self.origin else {
@@ -80,19 +105,67 @@ impl GapDetector {
         let deficit = now.saturating_sub(origin).as_secs_f64() * self.rate - held;
         let elapsed = now.saturating_sub(self.last).as_secs_f64();
         self.last = now;
-        let baseline = self.baseline + DRIFT_ALLOWANCE * self.rate * elapsed;
+        // The baseline stays put while a suspicion is being checked.
+        let creep = if self.pending.is_some() {
+            0.0
+        } else {
+            DRIFT_ALLOWANCE * self.rate * elapsed
+        };
+        let baseline = self.baseline + creep;
         let excess = deficit - baseline;
 
-        if excess <= self.threshold {
-            self.baseline = baseline.min(deficit);
-            GapVerdict::OnTime
-        } else if excess > self.max_gap {
+        if excess > self.max_gap {
+            self.pending = None;
             self.baseline = deficit;
-            GapVerdict::Restart
-        } else {
-            self.baseline = baseline;
-            self.received += excess;
-            GapVerdict::Gap(excess.round() as usize)
+            return GapVerdict::Restart;
+        }
+        let Some(mut suspect) = self.pending.take() else {
+            if excess >= self.suspect {
+                self.baseline = baseline;
+                self.pending = Some(Suspect {
+                    received_at: before,
+                    since: now,
+                    samples: 1,
+                    min_excess: excess,
+                });
+            } else {
+                self.baseline = baseline.min(deficit);
+            }
+            return GapVerdict::OnTime;
+        };
+
+        if excess < self.suspect {
+            // Caught up: it was late, not lost.
+            self.baseline = baseline.min(deficit);
+            return GapVerdict::OnTime;
+        }
+        suspect.samples += 1;
+        if excess - suspect.min_excess >= self.suspect {
+            // A second loss on top of the first: settle the first now.
+            let hole = self.settle(suspect, before);
+            self.pending = Some(Suspect {
+                received_at: before,
+                since: now,
+                samples: 1,
+                min_excess: excess - suspect.min_excess,
+            });
+            return hole;
+        }
+        suspect.min_excess = suspect.min_excess.min(excess);
+        if now.saturating_sub(suspect.since) >= self.window && suspect.samples >= 3 {
+            return self.settle(suspect, before);
+        }
+        self.pending = Some(suspect);
+        GapVerdict::OnTime
+    }
+
+    /// Confirms a suspicion: the hole is filled by the caller, so it counts as
+    /// received, which raises the baseline by its length.
+    fn settle(&mut self, suspect: Suspect, before: f64) -> GapVerdict {
+        self.baseline += suspect.min_excess;
+        GapVerdict::Hole {
+            behind: (before - suspect.received_at).round() as usize,
+            frames: suspect.min_excess.round() as usize,
         }
     }
 }

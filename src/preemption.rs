@@ -43,6 +43,46 @@ pub fn next_consecutive(previous: u32, streamed: Duration, reset_after: Duration
     }
 }
 
+/// How a session ended, as far as the consecutive preemption count cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    /// Released on silence: the source stopped on purpose.
+    SilenceRelease,
+    /// The attempt to connect to the speaker failed.
+    AcquireFailed,
+    /// The connection was lost for a reason other than a preemption.
+    Lost,
+    /// Another source took the speaker over.
+    Preempted,
+}
+
+/// The consecutive preemption count for the next process.
+///
+/// | exit kind        | next count                                          |
+/// |------------------|-----------------------------------------------------|
+/// | `SilenceRelease` | 0                                                   |
+/// | `AcquireFailed`  | `previous`, unchanged (the gate must still apply)   |
+/// | `Lost`           | 0 if `streamed >= reset_after`, else `previous`     |
+/// | `Preempted`      | [`next_consecutive`]                                |
+///
+/// Failed attempts and short lost sessions say nothing about whether the other
+/// source is gone, so they keep the gate; only a stable session or a clean
+/// release forgives earlier preemptions.
+pub fn count_after(
+    exit_kind: ExitKind,
+    previous: u32,
+    streamed: Duration,
+    reset_after: Duration,
+) -> u32 {
+    match exit_kind {
+        ExitKind::SilenceRelease => 0,
+        ExitKind::AcquireFailed => previous.min(MAX_TRACKED),
+        ExitKind::Lost if streamed >= reset_after => 0,
+        ExitKind::Lost => previous.min(MAX_TRACKED),
+        ExitKind::Preempted => next_consecutive(previous, streamed, reset_after),
+    }
+}
+
 /// Value of [`PREEMPTIONS_ENV`] for the next process; `None` means the
 /// variable must be removed (no preemption state).
 pub fn encode_preemptions(consecutive: u32) -> Option<String> {
@@ -160,6 +200,56 @@ mod tests {
         assert_eq!(
             next_consecutive(u32::MAX, secs(1), reset_after),
             MAX_TRACKED
+        );
+    }
+
+    #[test]
+    fn count_after_covers_every_exit_kind() {
+        let reset_after = secs(600);
+        let count = |kind, previous, streamed| count_after(kind, previous, streamed, reset_after);
+
+        // Silence release always starts clean.
+        assert_eq!(count(ExitKind::SilenceRelease, 4, secs(1)), 0);
+        assert_eq!(count(ExitKind::SilenceRelease, 4, secs(3_600)), 0);
+        assert_eq!(count(ExitKind::SilenceRelease, 0, secs(1)), 0);
+
+        // A failed attempt to connect keeps the count, never increments it.
+        assert_eq!(count(ExitKind::AcquireFailed, 0, Duration::ZERO), 0);
+        assert_eq!(count(ExitKind::AcquireFailed, 3, Duration::ZERO), 3);
+        assert_eq!(
+            count(ExitKind::AcquireFailed, u32::MAX, secs(1)),
+            MAX_TRACKED
+        );
+
+        // A short lost session keeps it; a stable one forgives it.
+        assert_eq!(count(ExitKind::Lost, 0, secs(5)), 0);
+        assert_eq!(count(ExitKind::Lost, 3, secs(5)), 3);
+        assert_eq!(count(ExitKind::Lost, 3, secs(599)), 3);
+        assert_eq!(count(ExitKind::Lost, 3, secs(600)), 0);
+        assert_eq!(count(ExitKind::Lost, 3, secs(3_600)), 0);
+
+        // A preemption increments, or restarts at 1 after a stable session.
+        assert_eq!(count(ExitKind::Preempted, 0, secs(5)), 1);
+        assert_eq!(count(ExitKind::Preempted, 3, secs(5)), 4);
+        assert_eq!(count(ExitKind::Preempted, 3, secs(600)), 1);
+    }
+
+    #[test]
+    fn preempted_then_failed_attempts_keep_the_gate() {
+        let reset_after = secs(600);
+        let mut count = count_after(ExitKind::Preempted, 0, secs(60), reset_after);
+        assert_eq!(count, 1);
+        // Gate opens, the connect fails, twice, then a short session is lost.
+        for kind in [ExitKind::AcquireFailed, ExitKind::AcquireFailed] {
+            count = count_after(kind, count, Duration::ZERO, reset_after);
+            assert_eq!(count, 1);
+        }
+        count = count_after(ExitKind::Lost, count, secs(30), reset_after);
+        assert_eq!(count, 1);
+        // Only a clean release forgives it.
+        assert_eq!(
+            count_after(ExitKind::SilenceRelease, count, secs(30), reset_after),
+            0
         );
     }
 

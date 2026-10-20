@@ -132,8 +132,10 @@ impl SilenceMonitor {
                     }
                     None => true,
                 };
-                if self.idle.is_zero() {
-                    return gate_open.then_some(Action::Acquire);
+                // Only without a gate does a disabled idle release acquire
+                // right away; a gate still needs confirmed sound once open.
+                if self.idle.is_zero() && self.gate.is_none() {
+                    return Some(Action::Acquire);
                 }
                 if level_dbfs < self.sound_threshold_dbfs {
                     self.sound_window = None;
@@ -700,21 +702,47 @@ mod tests {
     }
 
     #[test]
-    fn gate_applies_even_when_idle_release_is_disabled() {
+    fn gated_zero_idle_monitor_does_not_acquire_on_silence() {
+        let start = Instant::now();
+        let mut monitor = SilenceMonitor::new(THRESHOLD, SOUND_THRESHOLD, Duration::ZERO, CONFIRM)
+            .with_gate(PreemptionGate::new(QUIET, start));
+
+        assert_eq!(feed(&mut monitor, start, vec![SOUND; 100]), None);
+        assert_eq!(monitor.observe(SILENT, start + secs(100)), None);
+        // The gate opens here, but digital silence is not sound.
+        assert_eq!(monitor.observe(SILENT, start + secs(105)), None);
+        assert!(monitor.gate_quiet_reached());
+        assert_eq!(
+            feed(&mut monitor, start + secs(106), vec![SILENT; 400]),
+            None
+        );
+    }
+
+    #[test]
+    fn gated_zero_idle_monitor_acquires_on_confirmed_sound_after_the_gate_opens() {
         let start = Instant::now();
         let mut monitor = SilenceMonitor::new(THRESHOLD, SOUND_THRESHOLD, Duration::ZERO, CONFIRM)
             .with_gate(PreemptionGate::new(QUIET, start));
 
         assert_eq!(feed(&mut monitor, start, vec![SOUND; 100]), None);
         assert_eq!(
-            monitor.observe(SILENT, start + secs(100)),
-            None,
-            "starts counting silence only now"
+            feed(&mut monitor, start + secs(100), vec![SILENT; 21]),
+            None
         );
+        assert!(monitor.gate_quiet_reached());
+
+        let sound_start = start + secs(106);
         assert_eq!(
-            monitor.observe(SILENT, start + secs(105)),
-            Some(Action::Acquire)
+            feed(&mut monitor, sound_start, vec![SOUND; 20]),
+            Some((CONFIRM, Action::Acquire))
         );
+    }
+
+    #[test]
+    fn ungated_zero_idle_monitor_still_acquires_right_away() {
+        let start = Instant::now();
+        let mut monitor = SilenceMonitor::new(THRESHOLD, SOUND_THRESHOLD, Duration::ZERO, CONFIRM);
+        assert_eq!(monitor.observe(SILENT, start), Some(Action::Acquire));
     }
 
     #[test]

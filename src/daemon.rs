@@ -24,8 +24,8 @@ use crate::config::ConfigStore;
 use crate::config::{AppConfig, OutputProtocol};
 #[cfg(target_os = "linux")]
 use crate::preemption::{
-    PREEMPTIONS_ENV, PreemptionGate, backoff_delay, decode_preemptions, encode_preemptions,
-    is_preemption_kind, next_consecutive,
+    ExitKind, PREEMPTIONS_ENV, PreemptionGate, backoff_delay, count_after, decode_preemptions,
+    encode_preemptions, is_preemption_kind,
 };
 #[cfg(target_os = "linux")]
 use crate::shutdown::ShutdownFlag;
@@ -252,7 +252,13 @@ async fn run_session(
                                 release_output(active, &sink).await;
                             }
                             monitor.mark_released(now);
-                            break Ok(signals.recycle(0));
+                            let next = count_after(
+                                ExitKind::SilenceRelease,
+                                preemptions,
+                                Duration::ZERO,
+                                backoff_max,
+                            );
+                            break Ok(signals.recycle(next));
                         }
                         Some(Action::Acquire) => {
                             let (min_dbfs, max_dbfs) = monitor.sound_levels().unzip();
@@ -279,7 +285,15 @@ async fn run_session(
                                         "cannot acquire AirPlay output"
                                     );
                                     retry_delay = Some(reconnect_delay);
-                                    break Ok(signals.recycle(0));
+                                    // A failed attempt says nothing about the other
+                                    // source: the gate must apply again.
+                                    let next = count_after(
+                                        ExitKind::AcquireFailed,
+                                        preemptions,
+                                        Duration::ZERO,
+                                        backoff_max,
+                                    );
+                                    break Ok(signals.recycle(next));
                                 }
                                 Acquisition::Interrupted(exit) => break exit,
                             }
@@ -333,11 +347,16 @@ async fn run_session(
             if let Some(active) = client.take() {
                 release_output(active, &sink).await;
             }
+            let streamed = stream_started.map_or(Duration::ZERO, |at| now.duration_since(at));
             if is_preemption_kind(error_kind) {
-                // The receiver closed the session: someone else took the
-                // speaker. Not an error, and `auto_reconnect` does not apply.
-                let streamed = stream_started.map_or(Duration::ZERO, |at| now.duration_since(at));
-                let consecutive = next_consecutive(preemptions, streamed, backoff_max);
+                // The receiver closed the session: someone else most likely
+                // took the speaker. This is a conservative heuristic: EOF or a
+                // reset can also come from a HomePod reboot or a network
+                // failure. A takeover that is only seen as a feedback timeout
+                // goes through the normal reconnect path below (known gap).
+                // Not an error, and `auto_reconnect` does not apply.
+                let consecutive =
+                    count_after(ExitKind::Preempted, preemptions, streamed, backoff_max);
                 let backoff = backoff_delay(backoff_base, backoff_max, consecutive);
                 tracing::warn!(
                     error = format!("{error:#}"),
@@ -359,7 +378,9 @@ async fn run_session(
                 "AirPlay output lost; reconnecting once sound is present"
             );
             retry_delay = Some(reconnect_delay);
-            break Ok(signals.recycle(0));
+            // Keep the gate unless the session was stable for long enough.
+            let next = count_after(ExitKind::Lost, preemptions, streamed, backoff_max);
+            break Ok(signals.recycle(next));
         }
     };
 

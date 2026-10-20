@@ -90,12 +90,7 @@ fn new_buffer(jitter_ms: u32) -> JitterBuffer {
 }
 
 fn detector() -> GapDetector {
-    GapDetector::new(
-        RATE,
-        Duration::from_millis(10),
-        Duration::from_millis(80),
-        Duration::from_secs(2),
-    )
+    GapDetector::standard(RATE)
 }
 
 fn at(ms: f64) -> Duration {
@@ -1838,4 +1833,192 @@ fn the_minimum_cushion_outlasts_the_hole_confirmation() {
         MIN_JITTER_BUFFER_MS
     );
     assert_eq!(MIN_JITTER_BUFFER_MS, 200);
+}
+
+// ----- round 4 -----
+
+/// An outage that dries the output up (blocks 70-99 never arrive), then
+/// `recovered` frames of audio, then a loss of 1024 frames, then the stream
+/// carries on. 173 Hz tone, 400 ms cushion, attached at 1 s, paced output.
+/// `xrun` reports a capture overrun at the end of the outage.
+fn outage_then_loss(recovered: usize, xrun: bool) -> (Vec<i16>, JitterBuffer) {
+    let hz = 173.0;
+    let hole_start = 70 * PERIOD;
+    let recovery = 100 * PERIOD;
+    let second = recovery + recovered;
+    let mut events: Vec<(f64, usize, usize)> = Vec::new();
+    let mut start = 0;
+    while start < RATE as usize * 7 {
+        if start == hole_start {
+            start = recovery;
+            continue;
+        }
+        if start == second {
+            start += PERIOD;
+            continue;
+        }
+        let limit = if start < hole_start {
+            hole_start
+        } else if start < second {
+            second
+        } else {
+            usize::MAX
+        };
+        let end = (start + PERIOD).min(limit);
+        events.push((end as f64 * 1000.0 / f64::from(RATE), start, end - start));
+        start = end;
+    }
+
+    let mut buffer = new_buffer(400);
+    let mut pacer = buffer.pacer();
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
+    let mut out = Vec::new();
+    let (mut next, mut marked) = (0, false);
+    for tick in 0..6_800 {
+        let now = f64::from(tick);
+        while next < events.len() && events[next].0 <= now {
+            let (time, start, count) = events[next];
+            if xrun && !marked && start >= recovery {
+                buffer.note_xrun();
+                marked = true;
+            }
+            buffer.push_at(at(time), &tone(start, count, hz), 0);
+            next += 1;
+        }
+        if tick == 1_000 {
+            buffer.start_playout();
+        }
+        if tick >= 1_000 {
+            while buffer.pull_chunk(&mut pacer, at(now), &mut chunk) {
+                pacer.sent(PLAYOUT_CHUNK_FRAMES);
+                out.extend_from_slice(&chunk);
+            }
+        }
+    }
+    (out, buffer)
+}
+
+#[test]
+fn a_mirror_during_a_refill_is_built_from_one_signal() {
+    // 128 frames arrive after the outage, then 1024 are lost: the output is
+    // still faded silence, the queue holds a few ms of real audio. Mirroring
+    // those 128 frames together with the output's silence is a 6,334 count
+    // step (natural maximum 657).
+    let (out, mut buffer) = outage_then_loss(128, false);
+
+    assert_tone_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!(
+        (stats.underruns, stats.gaps, stats.losses),
+        (1, 1, 2),
+        "{stats}"
+    );
+}
+
+#[test]
+fn a_loss_right_after_the_recovery_is_its_own_loss_to_the_frame() {
+    // However little arrives between the outage and the next loss, the next
+    // loss is a loss of its own, found, concealed and counted. (63, 64 and 65
+    // frames were where a tolerance window used to decide.)
+    for recovered in [1, 2, 32, 63, 64, 65, 128, 1_024, 2_048, 3_072, 4_096] {
+        let (out, mut buffer) = outage_then_loss(recovered, false);
+
+        assert_tone_continuous(&out);
+        let stats = buffer.take_stats();
+        assert_eq!(
+            (stats.underruns, stats.gaps, stats.losses),
+            (1, 1, 2),
+            "{recovered} frames: {stats}"
+        );
+        assert!(stats.concealed >= 2, "{recovered} frames: {stats}");
+    }
+}
+
+#[test]
+fn a_loss_right_after_an_overrun_is_its_own_loss_to_the_frame() {
+    for recovered in [1, 2, 63, 64, 65, 1_024, 2_048] {
+        let (out, mut buffer) = outage_then_loss(recovered, true);
+
+        assert_tone_continuous(&out);
+        let stats = buffer.take_stats();
+        assert_eq!(
+            (stats.xruns, stats.underruns, stats.gaps),
+            (1, 1, 1),
+            "{recovered} frames: {stats}"
+        );
+    }
+}
+
+#[test]
+fn a_loss_straight_after_the_outage_with_nothing_between_is_one_loss() {
+    // Nothing at all arrives between the outage and the next loss: the two
+    // holes are one, and the underrun already counted it.
+    let (out, mut buffer) = outage_then_loss(0, false);
+
+    assert_tone_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!((stats.underruns, stats.gaps), (1, 0), "{stats}");
+}
+
+#[test]
+fn persistent_lateness_just_above_10_ms_is_not_a_hole() {
+    // Field data (a silent turntable on the Pi): arrivals about 10.5 ms late
+    // for longer than the 80 ms window were taken for lost packets, four a
+    // minute. A lost packet is about 19 ms.
+    for late in [10.0, 10.5, 12.0, 14.0] {
+        let mut detector = detector();
+        let found = verdicts(&mut detector, 0, 600, |block| {
+            Some(
+                block as f64 * block_ms()
+                    + if (100..140).contains(&(block % 150)) {
+                        late
+                    } else {
+                        0.0
+                    },
+            )
+        });
+        assert!(found.is_empty(), "{late} ms late: {found:?}");
+    }
+}
+
+#[test]
+fn a_flickering_10_to_12_ms_lateness_through_the_buffer_conceals_nothing() {
+    let mut state = 77_u32;
+    let mut noise = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(state >> 8) / f64::from(1_u32 << 24)
+    };
+    let lateness: Vec<f64> = (0..8_000).map(|_| 10.0 + 2.0 * noise()).collect();
+    let mut pipeline = Pipeline::attached(400, 400);
+    let first = pipeline.pushed_frames / PERIOD;
+    pipeline.run(120, first, |block| {
+        // Late by 10 to 12 ms, all the time.
+        Some(block as f64 * block_ms() + lateness[block % lateness.len()])
+    });
+
+    let stats = pipeline.buffer.take_stats();
+    assert_eq!((stats.gaps, stats.concealed_ms), (0, 0), "{stats}");
+}
+
+#[test]
+fn a_19_ms_packet_is_still_confirmed_as_a_loss() {
+    // SBC at 48 kHz: a packet is about 19 ms (912 frames).
+    let packet = 912;
+    let mut detector = detector();
+    let mut found = Vec::new();
+    for index in 0..200_usize {
+        if index == 100 {
+            continue;
+        }
+        let time = index as f64 * ms(packet);
+        let verdict = detector.observe(at(time), packet, 0);
+        if verdict != GapVerdict::OnTime {
+            found.push(verdict);
+        }
+    }
+    assert_eq!(found.len(), 1, "{found:?}");
+    let GapVerdict::Hole { frames, .. } = found[0] else {
+        panic!("{found:?}");
+    };
+    assert!(frames.abs_diff(packet) <= 16, "{frames}");
 }

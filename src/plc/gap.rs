@@ -7,6 +7,18 @@ use std::time::Duration;
 /// in practice) without mistaking the slow drift for loss.
 const DRIFT_ALLOWANCE: f64 = 0.001;
 
+/// A late arrival this far past the baseline raises the suspicion of a hole.
+/// One lost A2DP packet (SBC, 48 kHz) is about 19 ms, so it must be below
+/// that; field data from a Pi with a silent turntable showed false holes of
+/// about 10.5 ms, arrival lateness that persisted for the whole 80 ms window,
+/// so it must be above that. 15 ms leaves about 4 ms on either side.
+pub const GAP_SUSPECT_MS: u64 = 15;
+/// A suspicion must hold this long (over at least three arrivals) to be
+/// confirmed. The audio after the hole waits in the cushion meanwhile.
+pub const GAP_WINDOW_MS: u64 = 80;
+/// Longer stalls are a restarted stream, not packet loss.
+pub const GAP_LIMIT_MS: u64 = 2_000;
+
 /// What the arrival of a block of frames says about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapVerdict {
@@ -74,6 +86,16 @@ pub struct GapDetector {
 }
 
 impl GapDetector {
+    /// The detector as the jitter buffer runs it.
+    pub fn standard(sample_rate: u32) -> Self {
+        Self::new(
+            sample_rate,
+            Duration::from_millis(GAP_SUSPECT_MS),
+            Duration::from_millis(GAP_WINDOW_MS),
+            Duration::from_millis(GAP_LIMIT_MS),
+        )
+    }
+
     /// `suspect` is the smallest hole reported, `window` how long a suspicion
     /// must hold, `max_gap` the longest hole treated as loss; anything longer
     /// is a [`GapVerdict::Restart`].

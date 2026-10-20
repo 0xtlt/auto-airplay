@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use super::conceal::{Concealment, ramp, to_i16};
-use super::gap::{GapDetector, GapVerdict};
+use super::gap::{GAP_WINDOW_MS, GapDetector, GapVerdict};
 use super::pace::{Due, Pacer};
 use super::stats::{Counters, StatsSnapshot};
 
@@ -23,18 +23,6 @@ const FADE_OUT_MS: u32 = 30;
 const CROSSFADE_MS: u32 = 10;
 /// The mirrored continuation is built from this much recent audio.
 const HISTORY_MS: u32 = 20;
-/// A late arrival this far past the baseline raises the suspicion of a hole;
-/// below the 20 ms of one lost A2DP packet, above the arrival jitter.
-const GAP_SUSPECT_MS: u64 = 10;
-/// A suspicion must hold this long (over at least three arrivals) to be
-/// confirmed. The audio after the hole waits in the cushion meanwhile.
-const GAP_WINDOW_MS: u64 = 80;
-/// Longer stalls are a restarted stream, not packet loss.
-const GAP_LIMIT_MS: u64 = 2_000;
-/// A capture overrun, or an underrun, and the hole behind it are one loss when
-/// they sit at the same place in the audio received (give or take rounding).
-/// Anything received after that place is a loss of its own.
-const HOLE_TOLERANCE: u64 = 64;
 /// Digital zeros shorter than this are ordinary signal.
 const ZERO_RUN_MS: u32 = 2;
 /// Zeros only count as lost audio when the signal right before them reached
@@ -94,7 +82,7 @@ const LEAD_MS: u32 = 50;
 ///   tenth of the target) leaves the queue within 90 to 100 % of the target.
 /// * **Lost audio.** Bluetooth packet loss removes audio instead of delaying
 ///   it. [`GapDetector`] spots a hole from arrival times, from a single lost
-///   packet (10 ms and up) to a long one, and confirms it after 80 ms, once
+///   packet (15 ms and up) to a long one, and confirms it after 80 ms, once
 ///   it is clear the audio is lost, not late. The buffer then fills the hole
 ///   retroactively, at the recorded position (the audio after it has not
 ///   played yet), with the mirrored continuation of the audio before it,
@@ -235,12 +223,7 @@ impl JitterBuffer {
             tail: Vec::new(),
             since_correction: 0,
             low_for: 0,
-            gaps: GapDetector::new(
-                sample_rate,
-                Duration::from_millis(GAP_SUSPECT_MS),
-                Duration::from_millis(GAP_WINDOW_MS),
-                Duration::from_millis(GAP_LIMIT_MS),
-            ),
+            gaps: GapDetector::standard(sample_rate),
             pending: None,
             zero: ZeroRun::Idle,
             received: 0,
@@ -401,20 +384,14 @@ impl JitterBuffer {
     /// followed it is moved back, crossfaded in.
     fn conceal_hole(&mut self, behind: usize, missing: usize) {
         let position = self.received.saturating_sub(behind as u64);
-        if self
-            .underrun_at
-            .is_some_and(|at| at.abs_diff(position) <= HOLE_TOLERANCE)
-        {
+        if self.underrun_at == Some(position) {
             // The output ran dry exactly where the audio stopped: the output
             // stage bridged this hole, and counted it. (A hole anywhere else,
             // even right after, is in audio that is queued while the cushion
             // rebuilds, and is concealed as usual.)
             return;
         }
-        if !self
-            .xrun_at
-            .is_some_and(|at| at.abs_diff(position) <= HOLE_TOLERANCE)
-        {
+        if self.xrun_at != Some(position) {
             // A capture overrun leaves a hole; it is one loss, counted once.
             self.counters.gaps += 1;
         }
@@ -547,11 +524,21 @@ impl JitterBuffer {
 
     /// Like [`history`](Self::history), for the point `at` frames into the
     /// queue.
+    ///
+    /// A mirror must be built from one stretch of one signal. What was played
+    /// continues into the queue only while real audio is being played: while
+    /// the output is concealment (the cushion filling, or refilling after an
+    /// outage) it is unrelated to the queue and is left out, so the history
+    /// may be shorter than asked for (see `MIN_MIRROR_FRAMES`).
     fn history_before(&self, at: usize) -> Vec<i16> {
         let wanted = self.history_len * self.channels;
         let end = at * self.channels;
         let queued = end.min(wanted);
-        let played = self.tail.len().min(wanted - queued);
+        let played = if matches!(self.read, ReadState::Playing) {
+            self.tail.len().min(wanted - queued)
+        } else {
+            0
+        };
         let mut history = Vec::with_capacity(queued + played);
         history.extend_from_slice(&self.tail[self.tail.len() - played..]);
         history.extend(self.fifo.range(end - queued..end));

@@ -10,11 +10,16 @@ use std::f32::consts::PI;
 /// a step the real signal already took, so there is no jump and no new
 /// high-frequency content. An optional raised-cosine fade takes it to silence.
 /// Every channel is continued on its own.
+/// Histories shorter than this are not mirrored (a few ms of signal looped
+/// back and forth is a buzz): the last real sample is held, and faded, instead.
+pub(crate) const MIN_MIRROR_FRAMES: usize = 96;
+
 pub(crate) struct Concealment {
     /// Interleaved history, oldest frame first.
     history: Vec<i16>,
     channels: usize,
-    /// Frames of history. Fewer than two leaves nothing to mirror: silence.
+    /// Frames of history: none is silence, fewer than `MIN_MIRROR_FRAMES`
+    /// holds the last sample.
     frames: usize,
     /// Length of the fade to silence, `None` for a continuation that never fades.
     fade_frames: Option<usize>,
@@ -56,14 +61,19 @@ impl Concealment {
     }
 
     fn value(&self, t: usize, channel: usize) -> f32 {
-        if self.frames < 2 {
+        if self.frames == 0 {
             return 0.0;
         }
         let gain = self.gain(t);
         if gain == 0.0 {
             return 0.0;
         }
-        gain * f32::from(self.history[self.source_frame(t) * self.channels + channel])
+        let frame = if self.frames < MIN_MIRROR_FRAMES {
+            self.frames - 1
+        } else {
+            self.source_frame(t)
+        };
+        gain * f32::from(self.history[frame * self.channels + channel])
     }
 
     /// Writes the next `out.len() / channels` frames of the continuation.

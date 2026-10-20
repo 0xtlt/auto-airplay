@@ -124,10 +124,10 @@ A2DP over a noisy radio link drops packets, and a dropped packet is audio that n
 Once a minute, while capturing, the daemon logs the health of the Bluetooth input, even when everything is zero:
 
 ```text
-bt_input stats: losses_per_min=2 concealed_per_min=2 concealed_ms=340 buffer_fill_ms=312 underruns=0 zero_runs=0 xruns=0 gaps=2 drift_corrections=0
+bt_input stats: losses_per_min=2 concealed_per_min=2 concealed_ms=340 buffer_fill_ms=312 underruns=0 zero_runs=0 xruns=0 gaps=2 drift_corrections=0 reads=2812
 ```
 
-`losses_per_min` counts the audio lost on the way in (`underruns`, `zero_runs`, capture `xruns` and arrival `gaps`), `concealed_per_min` the times concealment replaced audio, `concealed_ms` how much, `buffer_fill_ms` the current level, and `drift_corrections` the clock-drift trims. Find it with `journalctl -u "auto-airplay@$USER.service" | grep bt_input`. Many losses per minute mean a weak Bluetooth link: move the Pi's adapter and the turntable closer, or away from Wi-Fi and USB 3 devices.
+`losses_per_min` counts the audio lost on the way in (`underruns`, `zero_runs`, capture `xruns` and arrival `gaps`), `concealed_per_min` the times concealment replaced audio, `concealed_ms` how much, `buffer_fill_ms` the current level, `drift_corrections` the clock-drift trims, and `reads` the reads of the capture device that delivered audio (0 means nothing came in). Find it with `journalctl -u "auto-airplay@$USER.service" | grep bt_input`. Many losses per minute mean a weak Bluetooth link: move the Pi's adapter and the turntable closer, or away from Wi-Fi and USB 3 devices.
 
 `audio.latency_ms` was never used and is deprecated. It is still accepted but ignored, the daemon warns about it at startup, and any command that rewrites the configuration drops it. Use `audio.jitter_buffer_ms` instead.
 

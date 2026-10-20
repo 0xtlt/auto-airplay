@@ -141,3 +141,43 @@ fn cli_defaults_to_airplay2_for_live_streaming() {
     let raw = std::fs::read_to_string(config).unwrap();
     assert!(raw.contains("protocol = \"air_play2\""));
 }
+
+#[test]
+fn cli_config_show_json_warns_on_stderr_about_the_obsolete_volume() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    std::fs::write(&config, "[audio]\nvolume = 0.5\nchannels = 2\n").unwrap();
+
+    let assert = Command::cargo_bin("auto-airplay")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "config",
+            "show",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: obsolete configuration field `audio.volume` ignored",
+        ));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["audio"].get("volume").is_none(), "{stdout}");
+    assert_eq!(json["audio"]["channels"], 2);
+}
+
+#[test]
+fn cli_stays_quiet_without_obsolete_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+
+    Command::cargo_bin("auto-airplay")
+        .unwrap()
+        .args(["--config", config.to_str().unwrap(), "config", "show"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("warning").not());
+}

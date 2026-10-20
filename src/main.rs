@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use auto_airplay::config::{ConfigStore, InputKind, OutputProtocol};
+use auto_airplay::config::{AppConfig, ConfigStore, InputKind, OutputProtocol};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -173,7 +173,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Config(args) => match args.command {
             ConfigCommand::Show { json } => {
-                let config = store.load_or_create()?;
+                let config = load_or_create_config(&store)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&config)?);
                 } else {
@@ -184,7 +184,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Input(args) => match args.command {
             InputCommand::SetBluetooth { address, name } => {
                 let address = normalize_bluetooth_address(&address)?;
-                let mut config = store.load_or_create()?;
+                let mut config = load_or_create_config(&store)?;
                 config.input.kind = InputKind::Bluetooth;
                 config.input.bluetooth_address = Some(address.clone());
                 config.input.alsa_device = None;
@@ -198,7 +198,7 @@ async fn run(cli: Cli) -> Result<()> {
             InputCommand::Pair { address, name } => {
                 let address = normalize_bluetooth_address(&address)?;
                 auto_airplay::platform::pair_bluetooth_input(&address).await?;
-                let mut config = store.load_or_create()?;
+                let mut config = load_or_create_config(&store)?;
                 config.input.kind = InputKind::Bluetooth;
                 config.input.bluetooth_address = Some(address.clone());
                 config.input.alsa_device = None;
@@ -210,7 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
             InputCommand::SetAlsa { device, name } => {
-                let mut config = store.load_or_create()?;
+                let mut config = load_or_create_config(&store)?;
                 config.input.kind = InputKind::Alsa;
                 config.input.alsa_device = Some(device.clone());
                 config.input.bluetooth_address = None;
@@ -222,7 +222,7 @@ async fn run(cli: Cli) -> Result<()> {
                 auto_airplay::platform::list_bluetooth_inputs(seconds).await?;
             }
             InputCommand::Probe => {
-                let config = store.load().context("configure an input first")?;
+                let config = load_config(&store).context("configure an input first")?;
                 let format =
                     auto_airplay::platform::probe_input(&config.input, &config.audio).await?;
                 println!(
@@ -233,7 +233,7 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Command::Output(args) => match args.command {
             OutputCommand::Set { selector, protocol } => {
-                let mut config = store.load_or_create()?;
+                let mut config = load_or_create_config(&store)?;
                 config.output.selector = Some(selector.clone());
                 config.output.protocol = protocol.into();
                 store.save(&config)?;
@@ -258,7 +258,7 @@ async fn run(cli: Cli) -> Result<()> {
                 frequency,
                 duration,
             } => {
-                let config = store.load_or_create()?;
+                let config = load_or_create_config(&store)?;
                 let selector = target
                     .as_deref()
                     .or(config.output.selector.as_deref())
@@ -281,6 +281,28 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Obsolete keys are reported on stderr so `config show --json` stays valid.
+/// Not done in `ConfigStore::load`, which the daemon polls every 2 seconds.
+fn warn_obsolete_fields(config: &AppConfig) {
+    for field in config.obsolete_fields() {
+        eprintln!(
+            "warning: obsolete configuration field `{field}` ignored: auto-airplay never changes the speaker volume"
+        );
+    }
+}
+
+fn load_config(store: &ConfigStore) -> Result<AppConfig> {
+    let config = store.load()?;
+    warn_obsolete_fields(&config);
+    Ok(config)
+}
+
+fn load_or_create_config(store: &ConfigStore) -> Result<AppConfig> {
+    let config = store.load_or_create()?;
+    warn_obsolete_fields(&config);
+    Ok(config)
 }
 
 fn normalize_bluetooth_address(address: &str) -> Result<String> {

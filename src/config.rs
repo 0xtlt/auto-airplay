@@ -119,7 +119,7 @@ pub enum OutputProtocol {
     AirPlay2,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
     /// Obsolete: auto-airplay never changes the speaker volume. Older
@@ -133,6 +133,24 @@ pub struct AudioConfig {
     /// RMS level (dBFS) below which the input counts as silent. Used together
     /// with `runtime.idle_silence_seconds` to release the AirPlay output.
     pub silence_threshold_dbfs: f32,
+}
+
+/// Equality ignores the obsolete `volume` field, so adding, removing or editing
+/// it never looks like a configuration change (which would restart playback).
+impl PartialEq for AudioConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            legacy_volume: _,
+            preferred_sample_rate,
+            channels,
+            latency_ms,
+            silence_threshold_dbfs,
+        } = self;
+        *preferred_sample_rate == other.preferred_sample_rate
+            && *channels == other.channels
+            && *latency_ms == other.latency_ms
+            && *silence_threshold_dbfs == other.silence_threshold_dbfs
+    }
 }
 
 impl Default for AudioConfig {

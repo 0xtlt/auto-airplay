@@ -159,3 +159,49 @@ fn unknown_audio_fields_are_still_rejected() {
 
     assert!(ConfigStore::new(path).load().is_err());
 }
+
+fn audio_from(toml: &str) -> auto_airplay::config::AudioConfig {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, toml).unwrap();
+    ConfigStore::new(path).load().unwrap().audio
+}
+
+#[test]
+fn comparison_ignores_the_obsolete_volume_field_entirely() {
+    let without = audio_from("[audio]\nlatency_ms = 321\n");
+    let with = audio_from("[audio]\nvolume = 0.5\nlatency_ms = 321\n");
+    let changed = audio_from("[audio]\nvolume = 0.9\nlatency_ms = 321\n");
+
+    assert_eq!(without, with, "adding the field");
+    assert_eq!(with, without, "removing the field");
+    assert_eq!(with, changed, "changing the field");
+
+    let whole = |audio| AppConfig {
+        audio,
+        ..AppConfig::default()
+    };
+    assert_eq!(whole(with), whole(without));
+}
+
+#[test]
+fn comparison_still_detects_real_audio_changes() {
+    let base = audio_from("[audio]\nvolume = 0.5\nlatency_ms = 321\n");
+
+    assert_ne!(
+        base,
+        audio_from("[audio]\nvolume = 0.5\nlatency_ms = 322\n")
+    );
+    assert_ne!(
+        base,
+        audio_from("[audio]\nlatency_ms = 321\nchannels = 1\n")
+    );
+    assert_ne!(
+        base,
+        audio_from("[audio]\nlatency_ms = 321\npreferred_sample_rate = 44100\n")
+    );
+    assert_ne!(
+        base,
+        audio_from("[audio]\nlatency_ms = 321\nsilence_threshold_dbfs = -50.0\n")
+    );
+}

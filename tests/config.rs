@@ -119,7 +119,11 @@ fn configuration_without_legacy_volume_reports_no_obsolete_fields() {
 fn saving_a_legacy_configuration_drops_the_volume_key() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
-    std::fs::write(&path, "[audio]\nvolume = 0.5\nlatency_ms = 321\n").unwrap();
+    std::fs::write(
+        &path,
+        "[audio]\nvolume = 0.5\nlatency_ms = 321\njitter_buffer_ms = 750\n",
+    )
+    .unwrap();
     let store = ConfigStore::new(path.clone());
 
     let config = store.load().unwrap();
@@ -127,7 +131,8 @@ fn saving_a_legacy_configuration_drops_the_volume_key() {
 
     let raw = std::fs::read_to_string(path).unwrap();
     assert!(!raw.contains("volume"), "{raw}");
-    assert!(raw.contains("latency_ms = 321"));
+    assert!(!raw.contains("latency_ms"), "{raw}");
+    assert!(raw.contains("jitter_buffer_ms = 750"), "{raw}");
     assert!(store.load().unwrap().obsolete_fields().is_empty());
 }
 
@@ -169,9 +174,9 @@ fn audio_from(toml: &str) -> auto_airplay::config::AudioConfig {
 
 #[test]
 fn comparison_ignores_the_obsolete_volume_field_entirely() {
-    let without = audio_from("[audio]\nlatency_ms = 321\n");
-    let with = audio_from("[audio]\nvolume = 0.5\nlatency_ms = 321\n");
-    let changed = audio_from("[audio]\nvolume = 0.9\nlatency_ms = 321\n");
+    let without = audio_from("[audio]\njitter_buffer_ms = 321\n");
+    let with = audio_from("[audio]\nvolume = 0.5\njitter_buffer_ms = 321\n");
+    let changed = audio_from("[audio]\nvolume = 0.9\njitter_buffer_ms = 321\n");
 
     assert_eq!(without, with, "adding the field");
     assert_eq!(with, without, "removing the field");
@@ -186,23 +191,23 @@ fn comparison_ignores_the_obsolete_volume_field_entirely() {
 
 #[test]
 fn comparison_still_detects_real_audio_changes() {
-    let base = audio_from("[audio]\nvolume = 0.5\nlatency_ms = 321\n");
+    let base = audio_from("[audio]\nvolume = 0.5\njitter_buffer_ms = 321\n");
 
     assert_ne!(
         base,
-        audio_from("[audio]\nvolume = 0.5\nlatency_ms = 322\n")
+        audio_from("[audio]\nvolume = 0.5\njitter_buffer_ms = 322\n")
     );
     assert_ne!(
         base,
-        audio_from("[audio]\nlatency_ms = 321\nchannels = 1\n")
+        audio_from("[audio]\njitter_buffer_ms = 321\nchannels = 1\n")
     );
     assert_ne!(
         base,
-        audio_from("[audio]\nlatency_ms = 321\npreferred_sample_rate = 44100\n")
+        audio_from("[audio]\njitter_buffer_ms = 321\npreferred_sample_rate = 44100\n")
     );
     assert_ne!(
         base,
-        audio_from("[audio]\nlatency_ms = 321\nsilence_threshold_dbfs = -50.0\n")
+        audio_from("[audio]\njitter_buffer_ms = 321\nsilence_threshold_dbfs = -50.0\n")
     );
 }
 
@@ -373,4 +378,101 @@ fn changing_a_preemption_key_counts_as_a_configuration_change() {
         edit(&mut changed);
         assert_ne!(base, changed);
     }
+}
+
+#[test]
+fn legacy_latency_ms_is_accepted_ignored_reported_and_dropped_on_save() {
+    for value in ["500", "0", "99999", "\"soon\"", "[1, 2]"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, format!("[audio]\nlatency_ms = {value}\n")).unwrap();
+        let store = ConfigStore::new(path.clone());
+
+        let config = store.load().unwrap();
+
+        assert_eq!(config.obsolete_fields(), ["audio.latency_ms"], "{value}");
+        assert_eq!(config.audio.jitter_buffer_ms, 400, "{value}");
+        assert!(config.validate_detection().is_ok(), "{value}");
+        assert_eq!(config, AppConfig::default());
+
+        store.save(&config).unwrap();
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(!raw.contains("latency_ms"), "{raw}");
+        assert!(store.load().unwrap().obsolete_fields().is_empty());
+    }
+}
+
+#[test]
+fn both_obsolete_fields_are_reported_together() {
+    let config = config_from("[audio]\nvolume = 0.5\nlatency_ms = 500\n");
+
+    assert_eq!(
+        config.obsolete_fields(),
+        ["audio.volume", "audio.latency_ms"]
+    );
+    assert!(
+        auto_airplay::config::obsolete_field_hint("audio.latency_ms")
+            .contains("audio.jitter_buffer_ms")
+    );
+}
+
+#[test]
+fn editing_the_obsolete_latency_does_not_change_the_configuration() {
+    let before = audio_from("[audio]\nlatency_ms = 500\n");
+
+    assert_eq!(before, audio_from("[audio]\nlatency_ms = 900\n"));
+    assert_eq!(before, audio_from("[audio]\n"));
+}
+
+#[test]
+fn jitter_buffer_defaults_to_400_ms_and_is_written_by_default() {
+    assert_eq!(AppConfig::default().audio.jitter_buffer_ms, 400);
+    assert_eq!(audio_from("[audio]\nchannels = 2\n").jitter_buffer_ms, 400);
+    let raw = toml::to_string_pretty(&AppConfig::default()).unwrap();
+    assert!(raw.contains("jitter_buffer_ms = 400"), "{raw}");
+    assert!(!raw.contains("latency_ms"), "{raw}");
+}
+
+#[test]
+fn jitter_buffer_can_be_configured_up_to_two_seconds_and_more() {
+    for value in [50, 400, 2_000, 5_000, 10_000] {
+        let config = config_from(&format!("[audio]\njitter_buffer_ms = {value}\n"));
+
+        assert_eq!(config.audio.jitter_buffer_ms, value);
+        assert!(config.validate_detection().is_ok(), "{value}");
+    }
+}
+
+#[test]
+fn jitter_buffer_bounds_are_validated() {
+    for value in [0, 49, 10_001, 100_000] {
+        let config = config_from(&format!("[audio]\njitter_buffer_ms = {value}\n"));
+
+        let message = config.validate_detection().unwrap_err();
+        assert!(
+            message.contains("jitter_buffer_ms must be between 50 and 10000"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn jitter_buffer_survives_a_save_and_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(directory.path().join("config.toml"));
+    let mut config = AppConfig::default();
+    config.audio.jitter_buffer_ms = 2_000;
+
+    store.save(&config).unwrap();
+
+    assert_eq!(store.load().unwrap().audio.jitter_buffer_ms, 2_000);
+}
+
+#[test]
+fn changing_the_jitter_buffer_is_a_configuration_change() {
+    let base = audio_from("[audio]\njitter_buffer_ms = 400\n");
+
+    assert_eq!(base, audio_from("[audio]\njitter_buffer_ms = 400\n"));
+    assert_ne!(base, audio_from("[audio]\njitter_buffer_ms = 401\n"));
+    assert_ne!(base, audio_from("[audio]\njitter_buffer_ms = 2000\n"));
 }

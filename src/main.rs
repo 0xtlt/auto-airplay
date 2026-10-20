@@ -288,7 +288,8 @@ async fn run(cli: Cli) -> Result<()> {
 fn warn_obsolete_fields(config: &AppConfig) {
     for field in config.obsolete_fields() {
         eprintln!(
-            "warning: obsolete configuration field `{field}` ignored: auto-airplay never changes the speaker volume"
+            "warning: obsolete configuration field `{field}` ignored: {}",
+            auto_airplay::config::obsolete_field_hint(field)
         );
     }
 }

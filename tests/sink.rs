@@ -192,3 +192,39 @@ fn attaching_detaching_and_capturing_at_once_never_deadlock() {
         assert!(blocks > 100, "capture pushed only {blocks} blocks");
     });
 }
+
+#[test]
+fn the_level_is_metered_before_anything_that_can_wait() {
+    // The capture thread meters a read before it queries the device for the
+    // backlog and before it takes the buffer lock: a query that never returns,
+    // or a lock that is never released, cannot hide that audio arrives.
+    let sink = AudioSink::new();
+    let buffer = shared(400);
+    sink.install(Arc::clone(&buffer));
+    let held = buffer.lock().unwrap(); // someone sits on the buffer for good
+
+    let (done, finished) = mpsc::channel();
+    let probe = Arc::clone(&sink);
+    thread::spawn(move || {
+        probe.observe(&block(3));
+        let _ = done.send(probe.take_peak_level());
+    });
+    let level = finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("metering waited for the buffer");
+
+    assert!(level > 0.05, "{level}");
+    drop(held);
+}
+
+#[test]
+fn failed_device_queries_are_counted() {
+    let mut buffer = JitterBuffer::new(RATE, CH as u8, 400);
+    buffer.note_avail_error();
+    buffer.note_avail_error();
+
+    let stats = buffer.take_stats();
+    assert_eq!(stats.avail_errors, 2);
+    assert!(stats.to_string().ends_with("avail_errors=2"), "{stats}");
+    assert_eq!(buffer.take_stats().avail_errors, 0);
+}

@@ -208,6 +208,15 @@ impl AudioSink {
         samples: &[i16],
         backlog: usize,
     ) {
+        self.observe(samples);
+        self.enqueue(buffer, now, samples, backlog);
+    }
+
+    /// The first half of [`deliver`](Self::deliver): the audio has arrived.
+    /// Logs the first arrival and meters the raw audio, before anything that
+    /// could wait (the device query for the backlog, the buffer lock), so that
+    /// neither can hide that reads arrive.
+    pub fn observe(&self, samples: &[i16]) {
         if !self.receiving.swap(true, Ordering::AcqRel) {
             tracing::info!(
                 frames = samples.len(),
@@ -215,6 +224,16 @@ impl AudioSink {
             );
         }
         self.measure(samples);
+    }
+
+    /// The second half of [`deliver`](Self::deliver): queues the audio.
+    pub fn enqueue(
+        &self,
+        buffer: &Mutex<JitterBuffer>,
+        now: Duration,
+        samples: &[i16],
+        backlog: usize,
+    ) {
         lock(buffer).push_at(now, samples, backlog);
     }
 

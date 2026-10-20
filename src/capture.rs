@@ -97,12 +97,18 @@ fn capture_loop(
     let samples_per_period = input.period_frames * channels;
     let epoch = Instant::now();
     let deliver = |samples: &[i16]| {
+        // Metering and the first-audio log come first: nothing below may hide
+        // that audio arrives.
+        sink.observe(samples);
         // Frames already waiting in the device are late, not lost.
-        let backlog = input
-            .pcm
-            .avail_update()
-            .map_or(0, |frames| frames.max(0) as usize);
-        sink.deliver(&buffer, epoch.elapsed(), samples, backlog);
+        let backlog = match input.pcm.avail_update() {
+            Ok(frames) => frames.max(0) as usize,
+            Err(_) => {
+                lock(&buffer).note_avail_error();
+                0
+            }
+        };
+        sink.enqueue(&buffer, epoch.elapsed(), samples, backlog);
     };
 
     match input.encoding {

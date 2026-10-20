@@ -115,6 +115,9 @@ pub struct AudioConfig {
     pub preferred_sample_rate: Option<u32>,
     pub channels: u8,
     pub latency_ms: u32,
+    /// RMS level (dBFS) below which the input counts as silent. Used together
+    /// with `runtime.idle_silence_seconds` to release the AirPlay output.
+    pub silence_threshold_dbfs: f32,
 }
 
 impl Default for AudioConfig {
@@ -124,6 +127,7 @@ impl Default for AudioConfig {
             preferred_sample_rate: None,
             channels: 2,
             latency_ms: 500,
+            silence_threshold_dbfs: -40.0,
         }
     }
 }

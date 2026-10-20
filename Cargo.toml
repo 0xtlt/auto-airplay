@@ -27,6 +27,9 @@ airplay-client = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev =
 airplay-core = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-audio = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
 bluer = { version = "0.17", features = ["bluetoothd"] }

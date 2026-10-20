@@ -80,6 +80,45 @@ journalctl -u "auto-airplay@$USER.service" -f
 
 Configuration changes are detected while the daemon is running. The systemd service restarts the process automatically, providing a clean audio session with no inherited protocol workers.
 
+## Configuration
+
+The configuration lives in `/etc/auto-airplay/config.toml` and is normally written by the CLI. The keys that control when the speaker is held are:
+
+```toml
+[audio]
+# RMS level (dBFS) below which the input counts as silent.
+silence_threshold_dbfs = -40.0
+
+[runtime]
+# Release the speaker after this many seconds of continuous silence (0 disables).
+idle_silence_seconds = 30
+# Wait this long before retrying after a failed connection.
+reconnect_delay_seconds = 3
+
+[output]
+# Reconnect (instead of exiting) when the speaker connection is lost.
+auto_reconnect = true
+```
+
+## Releasing the speaker on silence
+
+An AirPlay speaker can only play one source at a time, so `auto-airplay` does not hold it while the input is silent:
+
+- The daemon starts without connecting to the speaker. Audio is captured continuously, but the AirPlay session is only opened once sound is detected. Restarting the Pi while someone else is playing on the speaker does not interrupt them.
+- After about 1 second of sustained sound, the bridge discovers the speaker, connects, and starts streaming. A single needle pop or static click is ignored. Because discovery and connection take time, the start of the audio after the input resumes is not played: typically 1 to 6 seconds with the default `output.discovery_timeout_seconds = 4`, longer with a longer discovery timeout, a slow connection, or after a failed attempt (`runtime.reconnect_delay_seconds`).
+- After `runtime.idle_silence_seconds` (default 30) of continuous silence, the bridge stops streaming and closes the AirPlay session cleanly, so iPhones, Apple TVs, and other sources can use the speaker right away. Sound resets the countdown, so quiet passages and the gaps between tracks do not release it unless they last that long.
+- Stopping or restarting the service (SIGTERM or ctrl-c) and configuration changes also close the AirPlay session cleanly.
+- `runtime.idle_silence_seconds = 0` disables this behavior: the bridge connects at startup and holds the speaker for as long as it runs.
+
+`audio.silence_threshold_dbfs` (default `-40.0`) sets the RMS level, in dBFS, that separates sound from silence. The default sits above the idle noise floor of a Bluetooth turntable such as the AT-LP60-BT, which stays above `-50` while powered on with no record playing. Check the logs to see when the speaker is acquired and released, then tune it:
+
+- If the speaker is never released because turntable hum or noise stays above the threshold, raise the value toward `-35`.
+- If quiet passages are cut or the speaker is released during soft music, lower the value toward `-50` or `-60`.
+
+If the connection to the speaker fails or is lost, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
+
+Each AirPlay session runs in its own process: after the speaker is released, or after a failed or lost connection, `auto-airplay` replaces itself with a fresh copy of the same command (the PID stays the same). This keeps per-connection resources of the AirPlay library from accumulating over days of use. On these internal restarts the Bluetooth AVRCP Play command is not sent again, so a source that was stopped on purpose stays stopped.
+
 ## CLI
 
 ```text

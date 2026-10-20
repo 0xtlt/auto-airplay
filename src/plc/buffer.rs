@@ -23,6 +23,20 @@ const FADE_OUT_MS: u32 = 30;
 const CROSSFADE_MS: u32 = 10;
 /// The mirrored continuation is built from this much recent audio.
 const HISTORY_MS: u32 = 20;
+/// A junction step this many times the signal's largest per-frame move around
+/// it is a splice (see `guard_junction`); 1.5 is also the most a step across a
+/// crossfade of two unrelated stretches of a signal can exceed its own slope.
+const SPLICE_FACTOR: f32 = 1.5;
+/// Steps up to this size (about -48 dBFS) are never smoothed.
+const SPLICE_FLOOR: i32 = 128;
+/// How far each side of a junction sets the signal's own movement.
+const SPLICE_REF_MS: u32 = 2;
+/// The crossfade that smooths a splice.
+const SPLICE_FADE_MS: u32 = 5;
+/// A splice is left this long for the timing check to find the hole and
+/// conceal it properly (it needs 80 ms plus an arrival) before the waveform
+/// check smooths it.
+const SPLICE_WAIT_MS: u32 = 120;
 /// Digital zeros shorter than this are ordinary signal.
 const ZERO_RUN_MS: u32 = 2;
 /// Zeros only count as lost audio when the signal right before them reached
@@ -127,6 +141,9 @@ pub struct JitterBuffer {
     crossfade: usize,
     history_len: usize,
     zero_run_min: usize,
+    splice_ref: usize,
+    splice_fade: usize,
+    splice_wait: usize,
     drop_min: usize,
     drop_max: usize,
     stretch_len: usize,
@@ -158,6 +175,8 @@ pub struct JitterBuffer {
     underrun_at: Option<u64>,
     /// A concealed stretch is being crossfaded into the audio being pushed.
     pending: Option<Blend>,
+    /// Junctions that did not join, waiting for the timing check.
+    junctions: Vec<Junction>,
     zero: ZeroRun,
     counters: Counters,
 }
@@ -167,6 +186,15 @@ enum ReadState {
     /// Output is concealment; real audio resumes once the buffer is back at
     /// the resume level.
     Concealing(Concealment),
+}
+
+/// A block junction that does not join (see `JitterBuffer::mark_junction`).
+struct Junction {
+    /// Frames received before the block: where the junction is, in the audio
+    /// received.
+    received_at: u64,
+    /// Concealment inserted after the junction since.
+    inserted: usize,
 }
 
 struct Blend {
@@ -210,6 +238,10 @@ impl JitterBuffer {
             crossfade,
             history_len,
             zero_run_min: frames(ZERO_RUN_MS).max(1),
+            splice_ref: frames(SPLICE_REF_MS).max(2),
+            splice_fade: frames(SPLICE_FADE_MS).max(2),
+            splice_wait: frames(SPLICE_WAIT_MS),
+            junctions: Vec::new(),
             drop_min: frames(DROP_MIN_MS).max(crossfade),
             drop_max: frames(DROP_MAX_MS).max(crossfade),
             stretch_len: frames(STRETCH_MS).max(1),
@@ -324,13 +356,13 @@ impl JitterBuffer {
             GapVerdict::Restart => self.splice(),
         }
         self.push(samples);
-        self.received += frames as u64;
     }
 
     /// Pushes audio without looking at arrival times.
     pub fn push(&mut self, samples: &[i16]) {
         let channels = self.channels;
         let frames = samples.len() / channels;
+        let junction = self.fill_frames();
         let mut at = 0;
         while at < frames {
             match std::mem::replace(&mut self.zero, ZeroRun::Idle) {
@@ -376,7 +408,151 @@ impl JitterBuffer {
                 }
             }
         }
+        self.mark_junction(junction, self.received);
+        self.received += frames as u64;
+        self.settle_junctions(0);
         self.enforce_bounds();
+    }
+
+    /// The safety net under all the timing heuristics: a block that does not
+    /// join the audio before it is smoothed in, whatever the reason (a hole
+    /// that was not found, a stream that jumped).
+    ///
+    /// The step across the junction between the queue and the audio just
+    /// pushed (`junction` frames in) is compared with how much the signal
+    /// moves per frame around it, over `SPLICE_REF_MS` on each side. A step
+    /// that is more than `SPLICE_FACTOR` times the largest of those moves (and
+    /// above `SPLICE_FLOOR`, so near-silence is left alone) is a splice. Only
+    /// block junctions are looked at, so transients in the signal are never
+    /// touched; a false trigger costs a 5 ms crossfade.
+    fn junction_is_splice(&self, junction: usize) -> bool {
+        let channels = self.channels;
+        let queued = self.fill_frames();
+        if queued <= junction + 1 {
+            return false;
+        }
+        // The frame before the junction: the queue's, or else the last played.
+        let before: Vec<i32> = if junction > 0 {
+            (0..channels)
+                .map(|c| i32::from(self.fifo[(junction - 1) * channels + c]))
+                .collect()
+        } else if matches!(self.read, ReadState::Playing) && self.tail.len() >= channels {
+            self.tail[self.tail.len() - channels..]
+                .iter()
+                .map(|&sample| i32::from(sample))
+                .collect()
+        } else {
+            return false;
+        };
+        let step: Vec<i32> = (0..channels)
+            .map(|c| (i32::from(self.fifo[junction * channels + c]) - before[c]).abs())
+            .collect();
+        if step.iter().all(|&s| s <= SPLICE_FLOOR) {
+            return false;
+        }
+
+        let history = self.history_before(junction);
+        let have = history.len() / channels;
+        if have < 2 {
+            return false;
+        }
+        let reference = self.splice_ref;
+        for c in 0..channels {
+            let mut largest = 0;
+            for frame in have.saturating_sub(reference)..have - 1 {
+                let a = i32::from(history[frame * channels + c]);
+                let b = i32::from(history[(frame + 1) * channels + c]);
+                largest = largest.max((b - a).abs());
+            }
+            let after = (queued - junction).min(reference + 1);
+            for frame in 0..after - 1 {
+                let a = i32::from(self.fifo[(junction + frame) * channels + c]);
+                let b = i32::from(self.fifo[(junction + frame + 1) * channels + c]);
+                largest = largest.max((b - a).abs());
+            }
+            if step[c] > SPLICE_FLOOR && step[c] as f32 > SPLICE_FACTOR * largest as f32 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Crossfades the first `SPLICE_FADE_MS` of the audio after `junction`
+    /// from the mirrored continuation of the audio before it. No time is
+    /// inserted and nothing is counted as lost.
+    fn smooth_junction(&mut self, junction: usize) {
+        let channels = self.channels;
+        let queued = self.fill_frames();
+        let history = self.history_before(junction);
+        let mut conceal = Concealment::new(&history, channels, None);
+        let blended = self.splice_fade.min(queued - junction);
+        let range = junction * channels..(junction + blended) * channels;
+        let mut seg: Vec<i16> = self.fifo.range(range.clone()).copied().collect();
+        conceal.blend_into(&mut seg, 0, self.splice_fade);
+        for (slot, value) in self.fifo.range_mut(range).zip(seg) {
+            *slot = value;
+        }
+        if blended < self.splice_fade {
+            self.pending = Some(Blend {
+                conceal,
+                pos: blended,
+            });
+        }
+        self.counters.splices += 1;
+    }
+
+    /// Looks at the junction of the block just pushed (`junction` frames in).
+    /// A splice is not smoothed at once: the timing check may still find a
+    /// hole there and conceal it properly, which takes `SPLICE_WAIT_MS`. The
+    /// junction is marked, and dealt with by [`settle_junctions`](Self::settle_junctions)
+    /// when that time is up, or when the playout is about to reach it.
+    fn mark_junction(&mut self, junction: usize, received_at: u64) {
+        if self.junction_is_splice(junction) {
+            self.junctions.push(Junction {
+                received_at,
+                inserted: 0,
+            });
+        }
+    }
+
+    /// Where a marked junction is in the queue now, if it still is.
+    fn junction_index(&self, mark: &Junction) -> Option<usize> {
+        self.junction_index_of(mark, self.fill_frames())
+    }
+
+    fn junction_index_of(&self, mark: &Junction, queued: usize) -> Option<usize> {
+        let held = match self.zero {
+            ZeroRun::Counting(held) => held,
+            _ => 0,
+        };
+        let since = (self.received - mark.received_at) as usize;
+        let after = (since + mark.inserted).saturating_sub(held);
+        (after <= queued).then(|| queued - after)
+    }
+
+    /// Smooths the marked junctions that are due: older than `SPLICE_WAIT_MS`,
+    /// or within `ahead` frames of the front of the queue (about to play). A
+    /// junction that has played, or that the timing check dealt with in the
+    /// meantime, is forgotten.
+    fn settle_junctions(&mut self, ahead: usize) {
+        if self.junctions.is_empty() {
+            return;
+        }
+        let queued = self.fill_frames();
+        let marks = std::mem::take(&mut self.junctions);
+        for mark in marks {
+            let Some(junction) = self.junction_index_of(&mark, queued) else {
+                continue; // played or trimmed away
+            };
+            let since = (self.received - mark.received_at) as usize;
+            let due =
+                since >= self.splice_wait || (ahead > 0 && junction < ahead + self.splice_fade);
+            if !due {
+                self.junctions.push(mark);
+            } else if self.junction_is_splice(junction) {
+                self.smooth_junction(junction);
+            }
+        }
     }
 
     /// Fills a confirmed hole of `missing` frames, `behind` frames before the
@@ -427,6 +603,17 @@ impl JitterBuffer {
         }
         self.counters.concealments += 1;
         self.counters.concealed_frames += missing as u64;
+        // The timing check dealt with the junction at this hole; the ones
+        // before it now have the concealment between them and the tail.
+        self.junctions.retain_mut(|mark| {
+            if mark.received_at.abs_diff(position) <= 16 {
+                return false;
+            }
+            if mark.received_at < position {
+                mark.inserted += missing;
+            }
+            true
+        });
     }
 
     /// The stream restarted after a long stall: joins the audio before and
@@ -531,10 +718,21 @@ impl JitterBuffer {
     /// outage) it is unrelated to the queue and is left out, so the history
     /// may be shorter than asked for (see `MIN_MIRROR_FRAMES`).
     fn history_before(&self, at: usize) -> Vec<i16> {
-        let wanted = self.history_len * self.channels;
+        let mut wanted = self.history_len * self.channels;
         let end = at * self.channels;
+        // Nor across a junction that does not join yet (see `mark_junction`):
+        // the history starts after the last one.
+        let after_junction = self
+            .junctions
+            .iter()
+            .filter_map(|mark| self.junction_index(mark))
+            .filter(|&index| index < at)
+            .max();
+        if let Some(index) = after_junction {
+            wanted = wanted.min((at - index) * self.channels);
+        }
         let queued = end.min(wanted);
-        let played = if matches!(self.read, ReadState::Playing) {
+        let played = if after_junction.is_none() && matches!(self.read, ReadState::Playing) {
             self.tail.len().min(wanted - queued)
         } else {
             0
@@ -594,6 +792,10 @@ impl JitterBuffer {
         if frames == 0 {
             return true;
         }
+        // Junctions the playout is about to reach are smoothed now. (While
+        // concealing, nothing of the queue is played.)
+        let playing = matches!(self.read, ReadState::Playing) || self.fill_frames() >= self.resume;
+        self.settle_junctions(if playing { frames } else { 0 });
         self.resume_if_ready();
         if matches!(self.read, ReadState::Playing) && self.consumer {
             self.correct_drift(frames);

@@ -44,7 +44,11 @@ assert_cmd = "2.0"
 predicates = "3.1"
 tokio = { version = "1.47", features = ["io-util"] }
 
-# The tests run the real AirPlay resampler over minutes of audio.
+# The tests push minutes of audio through the jitter buffer and the real AirPlay
+# resampler; they run with optimisations (debug assertions stay on).
+[profile.test]
+opt-level = 2
+
 [profile.dev.package.rubato]
 opt-level = 3
 

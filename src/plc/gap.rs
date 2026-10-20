@@ -98,6 +98,9 @@ pub struct GapDetector {
     /// a second hole while the first is being checked is a second suspicion,
     /// settled on its own window.
     pending: Vec<Suspect>,
+    /// The stacked gate also applies to new suspicions until then: a burst of
+    /// losses and jitter does not end the moment one of its suspicions settles.
+    burst_until: Option<Duration>,
 }
 
 impl GapDetector {
@@ -127,6 +130,7 @@ impl GapDetector {
             received: 0.0,
             baseline: 0.0,
             pending: Vec::new(),
+            burst_until: None,
         }
     }
 
@@ -183,11 +187,9 @@ impl GapDetector {
                 return GapVerdict::OnTime;
             }
         }
-        let gate = if self.pending.is_empty() {
-            self.suspect
-        } else {
-            self.stacked
-        };
+        let in_burst =
+            !self.pending.is_empty() || self.burst_until.is_some_and(|until| now < until);
+        let gate = if in_burst { self.stacked } else { self.suspect };
         if excess - floor >= gate {
             self.pending.push(Suspect {
                 received_at: before,
@@ -207,6 +209,11 @@ impl GapDetector {
         let oldest = self.pending[0];
         if now.saturating_sub(oldest.since) >= self.window && oldest.samples >= 3 {
             self.pending.remove(0);
+            if oldest.gate == self.stacked {
+                // Jitter that was taken for a hole must not hide the next real
+                // one: stay in burst mode for a while.
+                self.burst_until = Some(now + 2 * self.window);
+            }
             return self.settle(oldest, before);
         }
         GapVerdict::OnTime

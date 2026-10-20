@@ -225,6 +225,6 @@ fn failed_device_queries_are_counted() {
 
     let stats = buffer.take_stats();
     assert_eq!(stats.avail_errors, 2);
-    assert!(stats.to_string().ends_with("avail_errors=2"), "{stats}");
+    assert!(stats.to_string().contains("avail_errors=2"), "{stats}");
     assert_eq!(buffer.take_stats().avail_errors, 0);
 }

@@ -22,6 +22,8 @@ pub(crate) struct Counters {
     pub reads: u64,
     /// Failed queries for the frames waiting in the capture device.
     pub avail_errors: u64,
+    /// Block junctions that did not join and were smoothed in place.
+    pub splices: u64,
 }
 
 /// A report on the input: counts since the previous report (taken once a
@@ -46,6 +48,9 @@ pub struct StatsSnapshot {
     pub reads: u64,
     /// Failed queries for the frames waiting in the capture device.
     pub avail_errors: u64,
+    /// Block junctions that did not join and were smoothed in place: a loss
+    /// the timing did not reveal, caught by the waveform.
+    pub splices: u64,
 }
 
 impl StatsSnapshot {
@@ -63,6 +68,7 @@ impl StatsSnapshot {
             drift_corrections: counters.drift_drops + counters.drift_stretches,
             reads: counters.reads,
             avail_errors: counters.avail_errors,
+            splices: counters.splices,
         }
     }
 }
@@ -73,7 +79,7 @@ impl fmt::Display for StatsSnapshot {
         write!(
             f,
             "bt_input stats: losses_per_min={} concealed_per_min={} concealed_ms={} buffer_fill_ms={} \
-             underruns={} zero_runs={} xruns={} gaps={} drift_corrections={} reads={} avail_errors={}",
+             underruns={} zero_runs={} xruns={} gaps={} drift_corrections={} reads={} avail_errors={} splices={}",
             self.losses,
             self.concealed,
             self.concealed_ms,
@@ -85,6 +91,7 @@ impl fmt::Display for StatsSnapshot {
             self.drift_corrections,
             self.reads,
             self.avail_errors,
+            self.splices,
         )
     }
 }

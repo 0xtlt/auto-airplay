@@ -1229,7 +1229,7 @@ fn the_stats_line_has_the_greppable_shape() {
     assert_eq!(
         line,
         "bt_input stats: losses_per_min=0 concealed_per_min=0 concealed_ms=0 buffer_fill_ms=250 \
-         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0 reads=0 avail_errors=0"
+         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0 reads=0 avail_errors=0 splices=0"
     );
 }
 
@@ -2108,4 +2108,211 @@ fn lateness_on_top_of_a_real_loss_costs_at_most_a_small_hole() {
         (block != 100).then_some(block as f64 * block_ms() + late)
     });
     assert_eq!(found.len(), 1, "{found:?}");
+}
+
+// ----- round 6: the safety net and the burst context -----
+
+/// 173 Hz at 29,000, phase +1 rad: the reviewer's replay of a spurious hole
+/// masking a real one. Blocks 70-99 are lost, 100 is punctual, 101-106 are
+/// `late_ms` late, `loss` is lost, delivery is punctual from the next.
+fn replay_round6(cushion_ms: u32, late_ms: f64, loss: usize) -> (Vec<i16>, JitterBuffer) {
+    let tone = |start: usize, count: usize| -> Vec<i16> {
+        (start..start + count)
+            .flat_map(|frame| {
+                let angle = std::f64::consts::TAU * 173.0 * frame as f64 / f64::from(RATE) + 1.0;
+                let value = (29_000.0 * angle.sin()) as i16;
+                [value, value]
+            })
+            .collect()
+    };
+    let mut events = Vec::new();
+    for block in 0..330_usize {
+        if (70..100).contains(&block) || block == loss {
+            continue;
+        }
+        let late = if (101..107).contains(&block) {
+            late_ms
+        } else {
+            0.0
+        };
+        events.push(((block + 1) as f64 * block_ms() + late, block * PERIOD));
+    }
+    let mut buffer = new_buffer(cushion_ms);
+    let mut pacer = buffer.pacer();
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
+    let mut out = Vec::new();
+    let mut next = 0;
+    for tick in 0..6_800 {
+        let now = f64::from(tick);
+        while next < events.len() && events[next].0 <= now {
+            let (time, start) = events[next];
+            buffer.push_at(at(time), &tone(start, PERIOD), 0);
+            next += 1;
+        }
+        if tick == 1_000 {
+            buffer.start_playout();
+        }
+        if tick >= 1_000 {
+            while buffer.pull_chunk(&mut pacer, at(now), &mut chunk) {
+                pacer.sent(PLAYOUT_CHUNK_FRAMES);
+                out.extend_from_slice(&chunk);
+            }
+        }
+    }
+    (out, buffer)
+}
+
+#[test]
+fn a_spurious_hole_does_not_hide_the_next_real_loss() {
+    // 6 blocks 6 to 14 ms late are taken for a (small) hole once the first
+    // suspicion settles; the real lost packet after them must still be found.
+    for cushion in [200, 400, 2_000] {
+        for late in [0.0, 6.0, 7.0, 9.0, 10.0, 12.0, 14.0] {
+            let (out, mut buffer) = replay_round6(cushion, late, 107);
+
+            assert_tone_continuous(&out);
+            let stats = buffer.take_stats();
+            assert_eq!(
+                stats.splices, 0,
+                "the timing check, not the safety net, finds it: cushion {cushion} ms, {late} ms late: {stats}"
+            );
+        }
+    }
+}
+
+/// Pushes `blocks` (each `PERIOD` frames of the 173 Hz tone) with the given
+/// source blocks missing, without any arrival times: nothing but the waveform
+/// can tell.
+fn blind_stream(missing: &[usize], blocks: usize) -> (Vec<i16>, JitterBuffer) {
+    let mut buffer = new_buffer(2_000);
+    for block in 0..blocks {
+        if !missing.contains(&block) {
+            buffer.push(&tone(block * PERIOD, PERIOD, 173.0));
+        }
+    }
+    let out = drain(&mut buffer);
+    (out, buffer)
+}
+
+#[test]
+fn a_hole_nothing_found_is_smoothed_by_the_safety_net() {
+    // No timing, so no detector: the splice guard alone.
+    let (out, mut buffer) = blind_stream(&[20], 60);
+
+    assert_tone_continuous(&out);
+    let stats = buffer.take_stats();
+    assert_eq!((stats.splices, stats.losses), (1, 0), "{stats}");
+    assert_eq!(
+        out.len() / CH,
+        59 * PERIOD / PLAYOUT_CHUNK_FRAMES * PLAYOUT_CHUNK_FRAMES
+    );
+}
+
+#[test]
+fn several_missed_holes_are_all_smoothed() {
+    let (out, mut buffer) = blind_stream(&[10, 11, 25, 40, 41, 42], 80);
+
+    assert_tone_continuous(&out);
+    assert_eq!(buffer.take_stats().splices, 3);
+}
+
+#[test]
+fn a_clean_stream_is_never_spliced() {
+    // Music-like audio (a sine and noise), 30 s in 1024-frame blocks.
+    let mut buffer = new_buffer(2_000);
+    let mut noise = 12_345_u32;
+    for block in 0..30 * RATE as usize / PERIOD {
+        let samples: Vec<i16> = (0..PERIOD * CH)
+            .map(|n| {
+                noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let frame = block * PERIOD + n / CH;
+                let wave = (frame as f32 * 0.07).sin() * 9_000.0;
+                wave as i16 + ((noise >> 20) as i16 - 2_048)
+            })
+            .collect();
+        buffer.push(&samples);
+        drain(&mut buffer);
+    }
+
+    assert_eq!(buffer.take_stats().splices, 0);
+}
+
+#[test]
+fn a_transient_at_a_block_boundary_is_left_alone() {
+    // Silence, then at exactly a block boundary a loud noise burst: the
+    // signal moves a lot around the junction, so the step is not anomalous.
+    let mut buffer = new_buffer(2_000);
+    buffer.push(&vec![0_i16; PERIOD * CH * 4]);
+    let mut noise = 99_u32;
+    let burst: Vec<i16> = (0..PERIOD * CH)
+        .map(|_| {
+            noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (noise >> 16) as i16 / 2
+        })
+        .collect();
+    buffer.push(&burst);
+    let out = drain(&mut buffer);
+
+    assert_eq!(buffer.take_stats().splices, 0);
+    assert_eq!(out[PERIOD * CH * 4..PERIOD * CH * 4 + 64], burst[..64]);
+}
+
+#[test]
+fn small_steps_are_never_smoothed() {
+    // A step of 100 counts (about -50 dBFS) between blocks of near-silence.
+    let mut buffer = new_buffer(2_000);
+    buffer.push(&vec![0_i16; PERIOD * CH]);
+    buffer.push(&vec![100_i16; PERIOD * CH]);
+
+    assert_eq!(buffer.take_stats().splices, 0);
+}
+
+#[test]
+fn a_splice_in_a_tiny_block_is_smoothed_across_pushes() {
+    // The block after the junction is shorter than the 5 ms crossfade: the
+    // rest of the fade carries on into the blocks that follow.
+    let hz = 173.0;
+    let mut buffer = new_buffer(2_000);
+    buffer.push(&tone(0, 4 * PERIOD, hz));
+    // 30 ms are missing, then the audio carries on in small pushes.
+    let mut position = 4 * PERIOD + frames(30);
+    for _ in 0..12 {
+        buffer.push(&tone(position, 64, hz));
+        position += 64;
+    }
+    buffer.push(&tone(position, 4 * PERIOD, hz));
+    let out = drain(&mut buffer);
+
+    assert_tone_continuous(&out);
+    assert_eq!(buffer.take_stats().splices, 1);
+}
+
+#[test]
+fn a_splice_the_playout_is_about_to_reach_is_smoothed_in_time() {
+    // The consumer is playing; the new block follows a hole that nothing
+    // reveals and joins right at the front of the queue.
+    let hz = 173.0;
+    let mut buffer = new_buffer(MIN_JITTER_BUFFER_MS);
+    buffer.push(&tone(0, frames(MIN_JITTER_BUFFER_MS), hz));
+    buffer.start_playout();
+    let mut out = Vec::new();
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
+    let mut position = frames(MIN_JITTER_BUFFER_MS) + 7 * PERIOD;
+    for round in 0..40 {
+        assert!(buffer.pull(&mut chunk, true));
+        out.extend_from_slice(&chunk);
+        if round == 3 {
+            // Everything queued is played out, then audio arrives that does
+            // not follow what was played.
+            while buffer.fill_frames() >= PLAYOUT_CHUNK_FRAMES {
+                assert!(buffer.pull(&mut chunk, false));
+                out.extend_from_slice(&chunk);
+            }
+        }
+        buffer.push(&tone(position, PLAYOUT_CHUNK_FRAMES, hz));
+        position += PLAYOUT_CHUNK_FRAMES + if round == 5 { 3 * PERIOD } else { 0 };
+    }
+
+    assert_tone_continuous(&out);
+    assert!(buffer.take_stats().splices >= 1);
 }

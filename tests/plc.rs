@@ -1842,6 +1842,17 @@ fn the_minimum_cushion_outlasts_the_hole_confirmation() {
 /// carries on. 173 Hz tone, 400 ms cushion, attached at 1 s, paced output.
 /// `xrun` reports a capture overrun at the end of the outage.
 fn outage_then_loss(recovered: usize, xrun: bool) -> (Vec<i16>, JitterBuffer) {
+    outage_then_loss_with(400, recovered, xrun, 0.0)
+}
+
+/// [`outage_then_loss`] for any cushion, with the first two blocks after the
+/// outage arriving `recovery_jitter_ms` late.
+fn outage_then_loss_with(
+    cushion_ms: u32,
+    recovered: usize,
+    xrun: bool,
+    recovery_jitter_ms: f64,
+) -> (Vec<i16>, JitterBuffer) {
     let hz = 173.0;
     let hole_start = 70 * PERIOD;
     let recovery = 100 * PERIOD;
@@ -1865,11 +1876,20 @@ fn outage_then_loss(recovered: usize, xrun: bool) -> (Vec<i16>, JitterBuffer) {
             usize::MAX
         };
         let end = (start + PERIOD).min(limit);
-        events.push((end as f64 * 1000.0 / f64::from(RATE), start, end - start));
+        let late = if start == recovery || start == recovery + PERIOD {
+            recovery_jitter_ms
+        } else {
+            0.0
+        };
+        events.push((
+            end as f64 * 1000.0 / f64::from(RATE) + late,
+            start,
+            end - start,
+        ));
         start = end;
     }
 
-    let mut buffer = new_buffer(400);
+    let mut buffer = new_buffer(cushion_ms);
     let mut pacer = buffer.pacer();
     let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
     let mut out = Vec::new();
@@ -2021,4 +2041,71 @@ fn a_19_ms_packet_is_still_confirmed_as_a_loss() {
         panic!("{found:?}");
     };
     assert!(frames.abs_diff(packet) <= 16, "{frames}");
+}
+
+// ----- round 5 -----
+
+#[test]
+fn a_lost_packet_is_found_behind_the_jitter_of_the_recovery() {
+    // Blocks 70-99 are lost, two recovery blocks arrive late by some jitter,
+    // the next 1024-frame block (a whole packet) is lost, delivery is punctual
+    // again. The jitter of the recovery inflates the lowest excess of the first
+    // suspicion, so the second hole shows up smaller than it is: 12 ms after
+    // 9 ms of jitter, 7 ms after 14 ms.
+    for cushion in [200, 400, 2_000] {
+        for jitter in [0.0, 5.0, 9.0, 14.0] {
+            let (out, mut buffer) = outage_then_loss_with(cushion, 2_048, false, jitter);
+
+            assert_tone_continuous(&out);
+            let stats = buffer.take_stats();
+            // Two losses. A cushion that is still filling when the outage hits
+            // (2 s: not complete at 1.5 s) never underruns, so it finds both
+            // holes at the capture side; the others run dry on the first.
+            assert_eq!(
+                stats.losses, 2,
+                "cushion {cushion} ms, jitter {jitter} ms: {stats}"
+            );
+            assert_eq!(
+                stats.underruns,
+                u64::from(cushion < 2_000),
+                "cushion {cushion} ms, jitter {jitter} ms: {stats}"
+            );
+            assert!(stats.concealed >= 2, "{cushion}/{jitter}: {stats}");
+        }
+    }
+}
+
+#[test]
+fn the_lowest_level_still_needs_the_full_gate() {
+    // Stacked suspicions have a lower gate, but only on top of a suspicion
+    // that is already open: persistent 10 to 14 ms lateness on its own, with
+    // no loss anywhere near, is still no hole.
+    let mut detector = detector();
+    let found = verdicts(&mut detector, 0, 900, |block| {
+        Some(
+            block as f64 * block_ms()
+                + if block % 100 >= 20 && block % 100 < 60 {
+                    12.0
+                } else {
+                    0.0
+                },
+        )
+    });
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn lateness_on_top_of_a_real_loss_costs_at_most_a_small_hole() {
+    // A real loss, and while it is checked a stretch of 7 ms lateness (below
+    // the stacked gate): the loss is found at its own size, nothing more.
+    let mut detector = detector();
+    let found = verdicts(&mut detector, 0, 400, |block| {
+        let late = if (101..110).contains(&block) {
+            7.0
+        } else {
+            0.0
+        };
+        (block != 100).then_some(block as f64 * block_ms() + late)
+    });
+    assert_eq!(found.len(), 1, "{found:?}");
 }

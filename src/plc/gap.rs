@@ -13,6 +13,14 @@ const DRIFT_ALLOWANCE: f64 = 0.001;
 /// about 10.5 ms, arrival lateness that persisted for the whole 80 ms window,
 /// so it must be above that. 15 ms leaves about 4 ms on either side.
 pub const GAP_SUSPECT_MS: u64 = 15;
+/// A suspicion stacked on one that is already open only needs to rise this far
+/// above the one below it. The lowest excess seen in the suspicion below
+/// includes the arrival jitter of the audio right after that hole, so a second
+/// lost packet looks that much smaller (a 21 ms packet after arrivals 9 ms late
+/// is 12 ms); a hole that follows another within the window is a burst loss,
+/// the common case, and the stacked suspicion still has to hold for the whole
+/// window.
+pub const GAP_STACKED_MS: u64 = 5;
 /// A suspicion must hold this long (over at least three arrivals) to be
 /// confirmed. The audio after the hole waits in the cushion meanwhile.
 pub const GAP_WINDOW_MS: u64 = 80;
@@ -44,6 +52,10 @@ struct Suspect {
     /// Lowest excess seen since the suspicion (measured from the baseline, so
     /// it includes the holes suspected before this one).
     min_excess: f64,
+    /// How far above the suspicion below (or the baseline) an arrival must stay
+    /// for this one to hold: decided when it was raised, and kept when the one
+    /// below it is settled.
+    gate: f64,
 }
 
 /// Compares the frames received with the time that passed.
@@ -66,13 +78,16 @@ struct Suspect {
 /// suspicion is confirmed only if every arrival during `window` (and at least
 /// three) is still `suspect` above the baseline, and the hole is the lowest
 /// excess seen. The caller conceals it retroactively, at the recorded
-/// position, while the audio after it is still in the cushion. This is what
+/// position, while the audio after it is still in the cushion. A suspicion
+/// raised while another is open (a burst loss) only has to rise
+/// [`GAP_STACKED_MS`] above the one below it, see there. This is what
 /// lets the threshold be as small as a single lost A2DP packet (about 20 ms)
 /// without false alarms from ordinary arrival jitter.
 #[derive(Debug, Clone)]
 pub struct GapDetector {
     rate: f64,
     suspect: f64,
+    stacked: f64,
     window: Duration,
     max_gap: f64,
     origin: Option<Duration>,
@@ -104,6 +119,7 @@ impl GapDetector {
         Self {
             rate,
             suspect: suspect.as_secs_f64() * rate,
+            stacked: Duration::from_millis(GAP_STACKED_MS).as_secs_f64() * rate,
             window,
             max_gap: max_gap.as_secs_f64() * rate,
             origin: None,
@@ -151,7 +167,7 @@ impl GapDetector {
         let mut floor = 0.0;
         let mut holding = 0;
         for suspect in &mut self.pending {
-            if excess - floor < self.suspect {
+            if excess - floor < suspect.gate {
                 break;
             }
             suspect.samples += 1;
@@ -167,12 +183,18 @@ impl GapDetector {
                 return GapVerdict::OnTime;
             }
         }
-        if excess - floor >= self.suspect {
+        let gate = if self.pending.is_empty() {
+            self.suspect
+        } else {
+            self.stacked
+        };
+        if excess - floor >= gate {
             self.pending.push(Suspect {
                 received_at: before,
                 since: now,
                 samples: 1,
                 min_excess: excess,
+                gate,
             });
         }
         if self.pending.is_empty() {

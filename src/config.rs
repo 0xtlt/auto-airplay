@@ -36,6 +36,79 @@ pub struct AppConfig {
     pub runtime: RuntimeConfig,
 }
 
+impl AppConfig {
+    /// Configuration keys that are still accepted but no longer have any effect.
+    pub fn obsolete_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.audio.legacy_volume.is_some() {
+            fields.push("audio.volume");
+        }
+        fields
+    }
+
+    /// Checks the settings that drive sound detection and preemption handling. The daemon refuses to
+    /// start with a configuration that fails this check.
+    pub fn validate_detection(&self) -> Result<(), String> {
+        let silence = self.audio.silence_threshold_dbfs;
+        if !is_valid_dbfs(silence) {
+            return Err("audio silence_threshold_dbfs must be between -120.0 and 0.0".into());
+        }
+        if let Some(sound) = self.audio.sound_threshold_dbfs {
+            if !is_valid_dbfs(sound) {
+                return Err("audio sound_threshold_dbfs must be between -120.0 and 0.0".into());
+            }
+            if sound < silence {
+                return Err(format!(
+                    "audio sound_threshold_dbfs ({sound}) must not be below silence_threshold_dbfs ({silence})"
+                ));
+            }
+        }
+        if !SOUND_CONFIRM_MS_RANGE.contains(&self.runtime.sound_confirm_ms) {
+            return Err(format!(
+                "runtime sound_confirm_ms must be between {} and {}",
+                SOUND_CONFIRM_MS_RANGE.start(),
+                SOUND_CONFIRM_MS_RANGE.end()
+            ));
+        }
+        let runtime = &self.runtime;
+        if !PREEMPTED_SILENCE_SECONDS_RANGE.contains(&runtime.preempted_silence_seconds) {
+            return Err(format!(
+                "runtime preempted_silence_seconds must be between {} and {}",
+                PREEMPTED_SILENCE_SECONDS_RANGE.start(),
+                PREEMPTED_SILENCE_SECONDS_RANGE.end()
+            ));
+        }
+        if runtime.preemption_backoff_seconds < 1 {
+            return Err("runtime preemption_backoff_seconds must be at least 1".into());
+        }
+        if runtime.preemption_backoff_max_seconds < runtime.preemption_backoff_seconds {
+            return Err(
+                "runtime preemption_backoff_max_seconds must not be below preemption_backoff_seconds"
+                    .into(),
+            );
+        }
+        if runtime.preemption_backoff_max_seconds > MAX_PREEMPTION_BACKOFF_SECONDS {
+            return Err(format!(
+                "runtime preemption_backoff_max_seconds must be at most {MAX_PREEMPTION_BACKOFF_SECONDS}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_valid_dbfs(value: f32) -> bool {
+    value.is_finite() && (-120.0..=0.0).contains(&value)
+}
+
+/// Accepted values of `runtime.preempted_silence_seconds`.
+pub const PREEMPTED_SILENCE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 1..=3_600;
+
+/// Upper bound of `runtime.preemption_backoff_max_seconds` (one day).
+pub const MAX_PREEMPTION_BACKOFF_SECONDS: u64 = 86_400;
+
+/// Accepted values of `runtime.sound_confirm_ms`.
+pub const SOUND_CONFIRM_MS_RANGE: std::ops::RangeInclusive<u64> = 250..=60_000;
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -108,26 +181,67 @@ pub enum OutputProtocol {
     AirPlay2,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
-    pub volume: f32,
+    /// Obsolete: auto-airplay never changes the speaker volume. Older
+    /// configurations may still carry `audio.volume`; any value is accepted,
+    /// ignored, and never written back.
+    #[serde(default, rename = "volume", skip_serializing)]
+    pub legacy_volume: Option<serde::de::IgnoredAny>,
     pub preferred_sample_rate: Option<u32>,
     pub channels: u8,
     pub latency_ms: u32,
     /// RMS level (dBFS) below which the input counts as silent. Used together
     /// with `runtime.idle_silence_seconds` to release the AirPlay output.
     pub silence_threshold_dbfs: f32,
+    /// RMS level (dBFS) the input must reach, and keep for
+    /// `runtime.sound_confirm_ms`, before the AirPlay output is acquired.
+    /// Defaults to `silence_threshold_dbfs + 6.0` (capped at 0.0). Must not be
+    /// below `silence_threshold_dbfs`: the gap between the two ignores noise.
+    pub sound_threshold_dbfs: Option<f32>,
+}
+
+impl AudioConfig {
+    /// The level that counts as the start of sound, with the default applied.
+    pub fn effective_sound_threshold_dbfs(&self) -> f32 {
+        self.sound_threshold_dbfs
+            .unwrap_or_else(|| (self.silence_threshold_dbfs + DEFAULT_SOUND_MARGIN_DB).min(0.0))
+    }
+}
+
+/// Distance above `silence_threshold_dbfs` of the default sound threshold.
+const DEFAULT_SOUND_MARGIN_DB: f32 = 6.0;
+
+/// Equality ignores the obsolete `volume` field, so adding, removing or editing
+/// it never looks like a configuration change (which would restart playback).
+impl PartialEq for AudioConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            legacy_volume: _,
+            preferred_sample_rate,
+            channels,
+            latency_ms,
+            silence_threshold_dbfs,
+            sound_threshold_dbfs,
+        } = self;
+        *preferred_sample_rate == other.preferred_sample_rate
+            && *channels == other.channels
+            && *latency_ms == other.latency_ms
+            && *silence_threshold_dbfs == other.silence_threshold_dbfs
+            && *sound_threshold_dbfs == other.sound_threshold_dbfs
+    }
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            volume: 0.35,
+            legacy_volume: None,
             preferred_sample_rate: None,
             channels: 2,
             latency_ms: 500,
             silence_threshold_dbfs: -40.0,
+            sound_threshold_dbfs: None,
         }
     }
 }
@@ -137,6 +251,16 @@ impl Default for AudioConfig {
 pub struct RuntimeConfig {
     pub reconnect_delay_seconds: u64,
     pub idle_silence_seconds: u64,
+    /// How long the input must stay at or above the sound threshold, without a
+    /// single dip below it, before the AirPlay output is acquired.
+    pub sound_confirm_ms: u64,
+    /// After another AirPlay source takes over the speaker, the input must be
+    /// silent for this long (seconds) before new sound may re-acquire it.
+    pub preempted_silence_seconds: u64,
+    /// Pause (seconds) before re-acquiring after a preemption; doubles for
+    /// every consecutive one, up to `preemption_backoff_max_seconds`.
+    pub preemption_backoff_seconds: u64,
+    pub preemption_backoff_max_seconds: u64,
     pub log_level: String,
 }
 
@@ -145,6 +269,10 @@ impl Default for RuntimeConfig {
         Self {
             reconnect_delay_seconds: 3,
             idle_silence_seconds: 30,
+            sound_confirm_ms: 2_000,
+            preempted_silence_seconds: 5,
+            preemption_backoff_seconds: 30,
+            preemption_backoff_max_seconds: 600,
             log_level: "info".into(),
         }
     }

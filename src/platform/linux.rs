@@ -300,6 +300,11 @@ pub async fn doctor(store: &ConfigStore) -> Result<()> {
         .load()
         .context("configuration is missing or invalid")?;
     println!("[ok] config: {}", store.path().display());
+    for field in config.obsolete_fields() {
+        println!(
+            "[warn] config: `{field}` is obsolete and ignored; auto-airplay never changes the speaker volume"
+        );
+    }
 
     let session = bluer::Session::new()
         .await

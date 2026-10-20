@@ -23,7 +23,7 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-airplay-client = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+airplay-client = { path = "vendor/airplay-client" }
 airplay-core = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-audio = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 
@@ -38,8 +38,10 @@ libc = "0.2"
 zbus = { version = "5.11", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+airplay-crypto = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 assert_cmd = "2.0"
 predicates = "3.1"
+tokio = { version = "1.47", features = ["io-util"] }
 
 [profile.release]
 codegen-units = 1

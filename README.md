@@ -54,10 +54,9 @@ auto-airplay input list
 auto-airplay input pair AA:BB:CC:DD:EE:FF --name "My turntable"
 auto-airplay output list
 auto-airplay output set "Living Room" --protocol airplay2
-auto-airplay volume 35
 ```
 
-Test the output before starting the bridge:
+Test the output before starting the bridge (the tone plays at the speaker's current volume):
 
 ```bash
 auto-airplay output test
@@ -88,10 +87,21 @@ The configuration lives in `/etc/auto-airplay/config.toml` and is normally writt
 [audio]
 # RMS level (dBFS) below which the input counts as silent.
 silence_threshold_dbfs = -40.0
+# RMS level (dBFS) the input must reach, and keep, before the speaker is acquired.
+# Default: silence_threshold_dbfs + 6.0 (-34.0 with the default threshold).
+# sound_threshold_dbfs = -34.0
 
 [runtime]
 # Release the speaker after this many seconds of continuous silence (0 disables).
 idle_silence_seconds = 30
+# The input must stay at or above the sound threshold this long (250 to 60000 ms).
+sound_confirm_ms = 2000
+# After another AirPlay source takes the speaker: silence required before new sound
+# may re-acquire it (1 to 3600 s), then the backoff before reconnecting, doubling for
+# each consecutive takeover up to the maximum.
+preempted_silence_seconds = 5
+preemption_backoff_seconds = 30
+preemption_backoff_max_seconds = 600
 # Wait this long before retrying after a failed connection.
 reconnect_delay_seconds = 3
 
@@ -100,22 +110,53 @@ reconnect_delay_seconds = 3
 auto_reconnect = true
 ```
 
+## Speaker volume
+
+`auto-airplay` never changes the speaker volume: not on the first connection, not when it re-acquires the speaker after silence, not after an automatic reconnect, a process recycle, or a restart caused by a configuration change. Set the volume on the speaker, the iPhone, or the Home app and it is kept. `auto-airplay output test` also plays at the speaker's current volume.
+
+Older versions had an `audio.volume` setting and an `auto-airplay volume` command. A leftover `audio.volume` in the configuration file is still accepted but ignored, and the daemon logs a warning at startup (`doctor` reports it too). Delete the line when convenient; any command that rewrites the configuration drops it. The `volume` command was removed and fails without touching the configuration.
+
 ## Releasing the speaker on silence
 
 An AirPlay speaker can only play one source at a time, so `auto-airplay` does not hold it while the input is silent:
 
 - The daemon starts without connecting to the speaker. Audio is captured continuously, but the AirPlay session is only opened once sound is detected. Restarting the Pi while someone else is playing on the speaker does not interrupt them.
-- After about 1 second of sustained sound, the bridge discovers the speaker, connects, and starts streaming. A single needle pop or static click is ignored. Because discovery and connection take time, the start of the audio after the input resumes is not played: typically 1 to 6 seconds with the default `output.discovery_timeout_seconds = 4`, longer with a longer discovery timeout, a slow connection, or after a failed attempt (`runtime.reconnect_delay_seconds`).
+- After `runtime.sound_confirm_ms` (default 2000) of sustained sound, the bridge discovers the speaker, connects, and starts streaming. "Sustained" is strict: the level must be at or above the sound threshold (see below) on every check, about every 250 ms, for the whole window; a single check below it restarts the window. A needle pop, a static click, or idle noise therefore does not take over the speaker. Because discovery and connection take time, the start of the audio after the input resumes is not played: typically 1 to 6 seconds with the default `output.discovery_timeout_seconds = 4`, longer with a longer discovery timeout, a slow connection, or after a failed attempt (`runtime.reconnect_delay_seconds`).
 - After `runtime.idle_silence_seconds` (default 30) of continuous silence, the bridge stops streaming and closes the AirPlay session cleanly, so iPhones, Apple TVs, and other sources can use the speaker right away. Sound resets the countdown, so quiet passages and the gaps between tracks do not release it unless they last that long.
 - Stopping or restarting the service (SIGTERM or ctrl-c) and configuration changes also close the AirPlay session cleanly.
 - `runtime.idle_silence_seconds = 0` disables this behavior: the bridge connects at startup and holds the speaker for as long as it runs.
 
-`audio.silence_threshold_dbfs` (default `-40.0`) sets the RMS level, in dBFS, that separates sound from silence. The default sits above the idle noise floor of a Bluetooth turntable such as the AT-LP60-BT, which stays above `-50` while powered on with no record playing. Check the logs to see when the speaker is acquired and released, then tune it:
+Two levels, in dBFS (RMS), decide what counts as sound:
 
-- If the speaker is never released because turntable hum or noise stays above the threshold, raise the value toward `-35`.
-- If quiet passages are cut or the speaker is released during soft music, lower the value toward `-50` or `-60`.
+- `audio.silence_threshold_dbfs` (default `-40.0`): while the speaker is held, a level below this counts as silence and runs the `idle_silence_seconds` countdown.
+- `audio.sound_threshold_dbfs` (optional, default `silence_threshold_dbfs + 6`, so `-34.0` with the default): while the speaker is released, the level must reach this and stay there for the confirm window before the speaker is acquired. It must not be lower than the silence threshold.
 
-If the connection to the speaker fails or is lost, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
+The gap between the two is deliberate. The idle noise of a Bluetooth turntable such as the AT-LP60-BT stays above `-50` with no record playing and can drift above the silence threshold; with the gap it is not loud enough to acquire the speaker. Releasing is unchanged: only levels below `silence_threshold_dbfs` count as silence.
+
+When the speaker is acquired, the log line `sound detected; acquiring AirPlay output` carries `min_dbfs` and `max_dbfs` (the lowest and highest level during the confirm window), `sound_threshold_dbfs`, and `confirm_ms`. Use them to tune:
+
+- If the speaker is acquired with nothing playing, `min_dbfs` shows how close the noise is to the threshold. Raise `sound_threshold_dbfs` above `max_dbfs` of those false starts, or lengthen `runtime.sound_confirm_ms`.
+- If real music is not picked up, or starts late, `min_dbfs` of a normal start shows the quietest moment of the first seconds. Lower `sound_threshold_dbfs` (never below `silence_threshold_dbfs`) or shorten the window.
+- If the speaker is never released because hum or noise stays above `silence_threshold_dbfs`, raise it toward `-35`; raise `sound_threshold_dbfs` with it, since it cannot be lower.
+- If quiet passages are cut or the speaker is released during soft music, lower `silence_threshold_dbfs` toward `-50` or `-60`.
+
+### When another source takes over the speaker
+
+If an Apple TV, an iPhone, or another source starts playing on the speaker while the bridge streams, the speaker closes the bridge's session. The bridge recognizes this (the receiver closed the connection: `error_kind` `eof` or `reset-or-broken-pipe` in the logs) and does not fight for the speaker. It logs a warning, `AirPlay output taken by another source; waiting for silence then new sound before reconnecting`, with `consecutive_preemptions`, `backoff_seconds`, `error_kind`, and `since_stream_start_ms`, and then restarts into a waiting state. This is not an error: it happens whatever `output.auto_reconnect` is set to, and the process does not exit.
+
+This classification is a conservative heuristic. An end of stream or a connection reset can also come from a HomePod reboot or a network failure; the bridge then waits for silence and new sound before reconnecting, even with `output.auto_reconnect = true`. A takeover whose close is only seen as a feedback timeout goes through the normal reconnect path (a known limitation).
+
+The speaker is only taken back when all of these hold:
+
+1. The backoff has elapsed. It starts when the new process starts and is `runtime.preemption_backoff_seconds` (default 30) for the first takeover, doubling for each consecutive one (30, 60, 120, ...) up to `runtime.preemption_backoff_max_seconds` (default 600). Silence heard during the backoff counts for the next condition.
+2. The input has been continuously silent, below `audio.silence_threshold_dbfs`, for `runtime.preempted_silence_seconds` (default 5). Idle noise between the two thresholds is not silence.
+3. After that silence, new sound is confirmed as described above (sound threshold held for `runtime.sound_confirm_ms`).
+
+Sound that never stops, such as a record that is still playing or constant noise, therefore never takes the speaker back: the turntable has to go quiet first, for example when the record ends or is lifted. This also applies when `runtime.idle_silence_seconds = 0`.
+
+The count of consecutive takeovers is kept through failed attempts to connect and through connections lost for another reason, so the wait applies again after them. It starts over when the session is released on silence, and when a session streamed for at least `runtime.preemption_backoff_max_seconds` before being lost or taken over (a takeover then counts as the first one). It is handed to the next process in the `AUTO_AIRPLAY_PREEMPTIONS` environment variable, which is internal: a missing or invalid value means no takeover, and restarting the service (or changing the configuration) always starts clean. Stopping the service or changing the configuration during the wait is handled immediately.
+
+If the connection to the speaker fails or is lost for any other reason, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
 
 Each AirPlay session runs in its own process: after the speaker is released, or after a failed or lost connection, `auto-airplay` replaces itself with a fresh copy of the same command (the PID stays the same). This keeps per-connection resources of the AirPlay library from accumulating over days of use. On these internal restarts the Bluetooth AVRCP Play command is not sent again, so a source that was stopped on purpose stays stopped.
 
@@ -131,7 +172,6 @@ auto-airplay input probe
 auto-airplay output list [--seconds 4]
 auto-airplay output set <NAME|ID|IP> [--protocol airplay2]
 auto-airplay output test [--target NAME] [--frequency 880] [--duration 3]
-auto-airplay volume <0-100>
 auto-airplay doctor
 auto-airplay run
 ```
@@ -160,7 +200,7 @@ The original Pi Zero and Pi 1 are experimental because AirPlay encryption and AL
 - No cloud account.
 - No PIN, password, or audio content is written to logs.
 - Configuration writes are atomic and use mode `0600`.
-- Debug logs from protocol dependencies are disabled by default.
+- Debug logs from protocol dependencies are disabled by default. The one exception is the speaker's events channel (`events channel …` lines), which is logged at info level to diagnose dropped sessions; it records request methods and sizes, never keys or content.
 - The systemd template restricts filesystem access and grants only real-time scheduling capability.
 
 Do not commit a real configuration file. Common secret and configuration filenames are ignored by Git.
@@ -168,7 +208,7 @@ Do not commit a real configuration file. Common secret and configuration filenam
 ## Development
 
 ```bash
-cargo fmt --all -- --check
+cargo fmt --all -- --check # vendor/airplay-client is excluded via its rustfmt.toml
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
@@ -187,4 +227,4 @@ Pushing a version tag such as `v0.1.0` builds checksum-protected ARM64 and ARMv7
 
 ## License and acknowledgements
 
-GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds.
+GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`.

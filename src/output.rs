@@ -58,7 +58,6 @@ pub async fn test_output(
             let mut connection = RaopConnection::connect(device, stream_config).await?;
             connection.set_render_delay_ms(config.render_delay_ms);
             connection.setup().await?;
-            connection.set_volume(0.20).await?;
             connection.start_streaming(decoder).await?;
             tokio::time::sleep(Duration::from_secs_f32(duration + 1.0)).await;
             connection.stop().await?;
@@ -68,7 +67,6 @@ pub async fn test_output(
             let mut client = AirPlayClient::new()?;
             client.set_render_delay_ms(config.render_delay_ms);
             client.connect(&device).await?;
-            client.set_volume(0.20).await?;
             client.play_file(wave.path()).await?;
             tokio::time::sleep(Duration::from_secs_f32(duration + 1.0)).await;
             client.stop().await?;

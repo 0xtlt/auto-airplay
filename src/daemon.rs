@@ -3,6 +3,8 @@ use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -174,6 +176,9 @@ async fn run_session(
     feedback.tick().await;
 
     let mut client: Option<AirPlayClient> = None;
+    // Timestamps for the failure diagnostics.
+    let mut stream_started: Option<Instant> = None;
+    let mut last_ok_feedback: Option<Instant> = None;
     // Pause before recycling after a failure, so a missing speaker is not
     // hammered with attempts.
     let mut retry_delay: Option<Duration> = None;
@@ -208,6 +213,8 @@ async fn run_session(
                             match acquire_with_interrupts(&target, &sink, &mut changed, &mut signals).await {
                                 Acquisition::Ready(acquired) => {
                                     client = Some(*acquired);
+                                    stream_started = Some(Instant::now());
+                                    last_ok_feedback = None;
                                     sink.arm();
                                     monitor.mark_active(Instant::now());
                                     tracing::info!("streaming started");
@@ -231,7 +238,7 @@ async fn run_session(
             _ = feedback.tick(), if client.is_some() => {
                 if let Some(active) = client.as_mut() {
                     match tokio::time::timeout(FEEDBACK_TIMEOUT, active.send_feedback()).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => last_ok_feedback = Some(Instant::now()),
                         Ok(Err(error)) => failure = Some(error.into()),
                         Err(_) => failure = Some(anyhow!("AirPlay feedback timed out")),
                     }
@@ -246,6 +253,23 @@ async fn run_session(
         }
 
         if let Some(error) = failure {
+            let error_kind = classify_error(&error);
+            let now = Instant::now();
+            let since_ms = |earlier: Option<Instant>| {
+                earlier.map(|earlier| now.duration_since(earlier).as_millis() as u64)
+            };
+            let stats = client.as_ref().map(AirPlayClient::stats_snapshot);
+            tracing::warn!(
+                error = format!("{error:#}"),
+                error_kind,
+                since_stream_start_ms = since_ms(stream_started),
+                since_last_ok_feedback_ms = since_ms(last_ok_feedback),
+                packets_sent = stats.as_ref().map(|stats| stats.packets_sent),
+                underruns = stats.as_ref().map(|stats| stats.underruns),
+                rtx_requested = stats.as_ref().map(|stats| stats.rtx_requested),
+                rtx_fulfilled = stats.as_ref().map(|stats| stats.rtx_fulfilled),
+                "AirPlay session failed"
+            );
             if let Some(active) = client.take() {
                 release_output(active, &sink).await;
             }
@@ -254,6 +278,7 @@ async fn run_session(
             }
             tracing::warn!(
                 error = format!("{error:#}"),
+                error_kind,
                 retry_seconds = reconnect_delay.as_secs(),
                 "AirPlay output lost; reconnecting once sound is present"
             );
@@ -461,20 +486,80 @@ async fn start_stream(
 #[cfg(target_os = "linux")]
 async fn release_output(mut client: AirPlayClient, sink: &AudioSink) {
     sink.detach();
+    let started = Instant::now();
+    // Milliseconds `stop()` took, `u64::MAX` while it has not finished: tells
+    // which step a timed-out teardown was stuck in.
+    let stop_ms = AtomicU64::new(u64::MAX);
     let teardown = async {
+        let step = Instant::now();
         if let Err(error) = client.stop().await {
-            tracing::warn!(%error, "stopping the AirPlay stream failed");
+            tracing::warn!(
+                %error,
+                elapsed_ms = step.elapsed().as_millis() as u64,
+                "stopping the AirPlay stream failed"
+            );
         }
+        stop_ms.store(step.elapsed().as_millis() as u64, Ordering::Relaxed);
+
+        let step = Instant::now();
         if let Err(error) = client.disconnect().await {
-            tracing::warn!(%error, "disconnecting from the AirPlay output failed");
+            tracing::warn!(
+                %error,
+                elapsed_ms = step.elapsed().as_millis() as u64,
+                "disconnecting from the AirPlay output failed"
+            );
         }
+        tracing::debug!(
+            stop_ms = stop_ms.load(Ordering::Relaxed),
+            disconnect_ms = step.elapsed().as_millis() as u64,
+            "AirPlay teardown finished"
+        );
     };
     if tokio::time::timeout(TEARDOWN_TIMEOUT, teardown)
         .await
         .is_err()
     {
-        tracing::warn!("AirPlay teardown timed out");
+        let stop_done = stop_ms.load(Ordering::Relaxed);
+        tracing::warn!(
+            stuck_in = if stop_done == u64::MAX {
+                "stop"
+            } else {
+                "disconnect"
+            },
+            stop_ms = (stop_done != u64::MAX).then_some(stop_done),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "AirPlay teardown timed out"
+        );
     }
+}
+
+/// Coarse class of a session failure, for the logs: tells a receiver that
+/// closed the connection (`eof`, `reset-or-broken-pipe`) from our own timeouts.
+#[cfg(target_os = "linux")]
+fn classify_error(error: &anyhow::Error) -> &'static str {
+    use std::io::ErrorKind;
+
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                ErrorKind::UnexpectedEof => return "eof",
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe => return "reset-or-broken-pipe",
+                ErrorKind::TimedOut => return "timeout",
+                _ => {}
+            }
+        }
+        match cause.downcast_ref::<airplay_core::error::Error>() {
+            Some(airplay_core::error::Error::Timeout) => return "timeout",
+            Some(airplay_core::error::Error::Crypto(_)) => return "crypto",
+            _ => {}
+        }
+    }
+    if format!("{error:#}").contains("timed out") {
+        return "timeout";
+    }
+    "other"
 }
 
 #[cfg(target_os = "linux")]
@@ -510,5 +595,54 @@ async fn wait_for_config_change(store: &ConfigStore, current: &AppConfig) -> Res
         if &next != current {
             return Ok(next);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::{Error as IoError, ErrorKind};
+
+    use super::classify_error;
+
+    fn io(kind: ErrorKind) -> anyhow::Error {
+        airplay_core::error::Error::from(IoError::new(kind, "x")).into()
+    }
+
+    #[test]
+    fn classifies_receiver_closing_the_connection() {
+        assert_eq!(classify_error(&io(ErrorKind::UnexpectedEof)), "eof");
+        assert_eq!(
+            classify_error(&io(ErrorKind::ConnectionReset)),
+            "reset-or-broken-pipe"
+        );
+        assert_eq!(
+            classify_error(&io(ErrorKind::BrokenPipe)),
+            "reset-or-broken-pipe"
+        );
+    }
+
+    #[test]
+    fn classifies_timeouts_crypto_and_the_rest() {
+        assert_eq!(classify_error(&io(ErrorKind::TimedOut)), "timeout");
+        assert_eq!(
+            classify_error(&airplay_core::error::Error::Timeout.into()),
+            "timeout"
+        );
+        assert_eq!(
+            classify_error(&anyhow::anyhow!("AirPlay feedback timed out")),
+            "timeout"
+        );
+        assert_eq!(classify_error(&io(ErrorKind::PermissionDenied)), "other");
+        assert_eq!(
+            classify_error(&anyhow::anyhow!("AirPlay stream stopped accepting audio")),
+            "other"
+        );
+    }
+
+    #[test]
+    fn finds_the_io_error_through_added_context() {
+        let error = anyhow::Error::from(IoError::new(ErrorKind::UnexpectedEof, "early eof"))
+            .context("feedback");
+        assert_eq!(classify_error(&error), "eof");
     }
 }

@@ -137,7 +137,7 @@ fn main() -> ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "auto_airplay=info,airplay_client=warn,airplay_audio=warn,airplay_core=warn,airplay_crypto=warn,airplay_discovery=warn,airplay_pairing=warn,airplay_rtsp=warn,airplay_timing=warn",
+                        "auto_airplay=info,airplay_client=warn,airplay_client::receiver_events=info,airplay_audio=warn,airplay_core=warn,airplay_crypto=warn,airplay_discovery=warn,airplay_pairing=warn,airplay_rtsp=warn,airplay_timing=warn",
                     )
                 }),
         )

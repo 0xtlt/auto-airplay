@@ -164,7 +164,7 @@ The original Pi Zero and Pi 1 are experimental because AirPlay encryption and AL
 - No cloud account.
 - No PIN, password, or audio content is written to logs.
 - Configuration writes are atomic and use mode `0600`.
-- Debug logs from protocol dependencies are disabled by default.
+- Debug logs from protocol dependencies are disabled by default. The one exception is the speaker's events channel (`events channel …` lines), which is logged at info level to diagnose dropped sessions; it records request methods and sizes, never keys or content.
 - The systemd template restricts filesystem access and grants only real-time scheduling capability.
 
 Do not commit a real configuration file. Common secret and configuration filenames are ignored by Git.

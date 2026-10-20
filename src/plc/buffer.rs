@@ -197,10 +197,18 @@ struct Junction {
     inserted: usize,
 }
 
+/// A crossfade from a concealment into audio that is not all there yet: the
+/// rest of it is applied to the audio that follows.
+///
+/// Everything that defines the ramp is kept with it, since the ramp may be
+/// resumed by a later push: where it stands, how long it is in all, and the
+/// concealment it fades from (which carries its own fade-out).
 struct Blend {
     conceal: Concealment,
     /// Frames of the crossfade already applied.
     pos: usize,
+    /// Frames of the crossfade in all.
+    len: usize,
 }
 
 /// State of the scan for runs of zeros in the pushed audio.
@@ -362,7 +370,13 @@ impl JitterBuffer {
     pub fn push(&mut self, samples: &[i16]) {
         let channels = self.channels;
         let frames = samples.len() / channels;
-        let junction = self.fill_frames();
+        // Zeros held back from the last push come before this block once the
+        // run is settled: the block starts after them.
+        let held = match self.zero {
+            ZeroRun::Counting(held) => held,
+            _ => 0,
+        };
+        let junction = self.fill_frames() + held;
         let mut at = 0;
         while at < frames {
             match std::mem::replace(&mut self.zero, ZeroRun::Idle) {
@@ -382,7 +396,7 @@ impl JitterBuffer {
                         self.zero = self.begin_zero_run(held);
                     } else if at < frames {
                         // The run ended short: ordinary zero crossings.
-                        self.fifo.extend(std::iter::repeat_n(0, held * channels));
+                        self.append_zeros(held);
                     } else {
                         self.zero = ZeroRun::Counting(held);
                     }
@@ -392,15 +406,18 @@ impl JitterBuffer {
                     self.fill_from(&mut conceal, end - at);
                     at = end;
                     if at < frames {
-                        self.pending = Some(Blend { conceal, pos: 0 });
+                        self.pending = Some(Blend {
+                            conceal,
+                            pos: 0,
+                            len: self.crossfade,
+                        });
                     } else {
                         self.zero = ZeroRun::Concealing(conceal);
                     }
                 }
                 ZeroRun::Passing => {
                     let end = zero_run_end(samples, channels, at);
-                    self.fifo
-                        .extend(std::iter::repeat_n(0, (end - at) * channels));
+                    self.append_zeros(end - at);
                     at = end;
                     if at >= frames {
                         self.zero = ZeroRun::Passing;
@@ -408,8 +425,11 @@ impl JitterBuffer {
                 }
             }
         }
-        self.mark_junction(junction, self.received);
+        // (Counted before the junction is looked at, so that the marks of earlier
+        // junctions, which are placed from the count, are in the right place.)
+        let received_before = self.received;
         self.received += frames as u64;
+        self.mark_junction(junction, received_before);
         self.settle_junctions(0);
         self.enforce_bounds();
     }
@@ -428,7 +448,11 @@ impl JitterBuffer {
     fn junction_is_splice(&self, junction: usize) -> bool {
         let channels = self.channels;
         let queued = self.fill_frames();
-        if queued <= junction + 1 {
+        // (One frame after the junction is enough to look at: with less audio
+        // than `SPLICE_REF_MS` after it, only the side before it sets the
+        // reference, and the junction is judged again, in full, when it is
+        // settled.)
+        if queued <= junction {
             return false;
         }
         // The frame before the junction: the queue's, or else the last played.
@@ -496,6 +520,7 @@ impl JitterBuffer {
             self.pending = Some(Blend {
                 conceal,
                 pos: blended,
+                len: self.splice_fade,
             });
         }
         self.counters.splices += 1;
@@ -507,7 +532,12 @@ impl JitterBuffer {
     /// junction is marked, and dealt with by [`settle_junctions`](Self::settle_junctions)
     /// when that time is up, or when the playout is about to reach it.
     fn mark_junction(&mut self, junction: usize, received_at: u64) {
-        if self.junction_is_splice(junction) {
+        // A block that is all digital zeros so far is held back, not queued:
+        // there is nothing to judge yet, and the junction before it is marked
+        // to be judged when it is settled.
+        let held_only = self.fill_frames() <= junction
+            && matches!(self.zero, ZeroRun::Counting(held) if held > 0);
+        if held_only || self.junction_is_splice(junction) {
             self.junctions.push(Junction {
                 received_at,
                 inserted: 0,
@@ -551,6 +581,10 @@ impl JitterBuffer {
                 self.junctions.push(mark);
             } else if self.junction_is_splice(junction) {
                 self.smooth_junction(junction);
+            } else if junction >= queued {
+                // Nothing after it is queued yet (digital zeros are held back):
+                // it cannot be judged, keep it for when they are.
+                self.junctions.push(mark);
             }
         }
     }
@@ -599,6 +633,7 @@ impl JitterBuffer {
             self.pending = Some(Blend {
                 conceal,
                 pos: blended,
+                len: self.crossfade,
             });
         }
         self.counters.concealments += 1;
@@ -626,15 +661,18 @@ impl JitterBuffer {
         let history = self.history();
         if history.len() >= 2 * self.channels {
             let conceal = Concealment::new(&history, self.channels, Some(self.fade_out));
-            self.pending = Some(Blend { conceal, pos: 0 });
+            self.pending = Some(Blend {
+                conceal,
+                pos: 0,
+                len: self.crossfade,
+            });
         }
     }
 
     fn release_held_zeros(&mut self) {
         match std::mem::replace(&mut self.zero, ZeroRun::Idle) {
             ZeroRun::Counting(held) => {
-                self.fifo
-                    .extend(std::iter::repeat_n(0, held * self.channels));
+                self.append_zeros(held);
             }
             ZeroRun::Passing => {}
             other => self.zero = other,
@@ -654,8 +692,7 @@ impl JitterBuffer {
             .max()
             .unwrap_or(0);
         if peak < ZERO_RUN_MIN_PEAK {
-            self.fifo
-                .extend(std::iter::repeat_n(0, held * self.channels));
+            self.append_zeros(held);
             return ZeroRun::Passing;
         }
         self.counters.zero_runs += 1;
@@ -679,6 +716,15 @@ impl JitterBuffer {
         }
     }
 
+    /// Appends `frames` frames of digital silence that are real signal (not
+    /// concealment): they go through the same path as any audio, so a
+    /// crossfade in progress covers them too.
+    fn append_zeros(&mut self, frames: usize) {
+        if frames > 0 {
+            self.append(&vec![0_i16; frames * self.channels]);
+        }
+    }
+
     /// Appends real audio, blending the start into a pending concealment.
     fn append(&mut self, audio: &[i16]) {
         if audio.is_empty() {
@@ -690,14 +736,12 @@ impl JitterBuffer {
         };
         let mut audio = audio.to_vec();
         let frames = audio.len() / self.channels;
-        let blended = (self.crossfade - blend.pos).min(frames);
-        blend.conceal.blend_into(
-            &mut audio[..blended * self.channels],
-            blend.pos,
-            self.crossfade,
-        );
+        let blended = (blend.len - blend.pos).min(frames);
+        blend
+            .conceal
+            .blend_into(&mut audio[..blended * self.channels], blend.pos, blend.len);
         blend.pos += blended;
-        if blend.pos < self.crossfade {
+        if blend.pos < blend.len {
             self.pending = Some(blend);
         }
         self.fifo.extend(audio);

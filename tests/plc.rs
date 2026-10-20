@@ -1479,6 +1479,19 @@ fn tone(start: usize, count: usize, hz: f32) -> Vec<i16> {
     samples
 }
 
+/// [`tone`] with a phase (radians) and amplitude 29,000, as in the reviewer's
+/// replays.
+fn tone_phase(start: usize, count: usize, hz: f32, phase: f64) -> Vec<i16> {
+    (start..start + count)
+        .flat_map(|frame| {
+            let angle =
+                std::f64::consts::TAU * f64::from(hz) * frame as f64 / f64::from(RATE) + phase;
+            let value = (29_000.0 * angle.sin()) as i16;
+            [value, value]
+        })
+        .collect()
+}
+
 #[test]
 fn a_single_lost_packet_is_concealed_without_a_click() {
     // One lost 1024-frame block (21.3 ms) from a 173 Hz sine: spliced as it
@@ -2315,4 +2328,167 @@ fn a_splice_the_playout_is_about_to_reach_is_smoothed_in_time() {
 
     assert_tone_continuous(&out);
     assert!(buffer.take_stats().splices >= 1);
+}
+
+// ----- round 7: ramps that are resumed by a later push -----
+
+/// Drains the whole queue and checks the tone has no step above its slope.
+#[track_caller]
+fn assert_drained_tone_continuous(buffer: &mut JitterBuffer, hz: f32, what: &str) {
+    let out = drain(buffer);
+    let natural = natural_step(hz);
+    for channel in 0..CH {
+        let step = max_step(&out, channel);
+        assert!(
+            step <= STEP_MARGIN * natural,
+            "{what}: step {step} vs natural {natural}"
+        );
+    }
+}
+
+/// The reviewer's setup: a queue played down to one chunk, a hole nothing
+/// reveals, a read of `first` frames after it, then more reads. The splice is
+/// smoothed when the playout reaches it, with only `first` frames of audio
+/// after it in the queue, so its fade is cut short and resumed by the next
+/// push. Returns everything played.
+fn partial_splice(hz: f32, phase: f64, first: usize, hole: usize) -> (Vec<i16>, JitterBuffer) {
+    let mut buffer = new_buffer(2_000);
+    buffer.push(&tone_phase(0, 4_096, hz, phase));
+    let mut played = vec![0_i16; (3_072 + first) * CH];
+    assert!(buffer.pull(&mut played, false));
+    let mut position = 4_096 + hole;
+    buffer.push(&tone_phase(position, first, hz, phase));
+    position += first;
+    // (A zero frame at the end of the read is held back until the next one.)
+    let mut chunk = vec![0_i16; buffer.fill_frames().min(PLAYOUT_CHUNK_FRAMES) * CH];
+    assert!(buffer.pull(&mut chunk, false));
+    played.extend_from_slice(&chunk);
+    for count in [64, 17, 300, 1_024, 1_024] {
+        buffer.push(&tone_phase(position, count, hz, phase));
+        position += count;
+    }
+    played.extend(drain(&mut buffer));
+    (played, buffer)
+}
+
+#[test]
+fn a_splice_fade_cut_short_by_a_small_read_is_resumed_at_its_own_length() {
+    // The reviewer's replay: a hole nothing reveals, then a 64-frame read
+    // (less than the 240-frame splice fade), then a normal block. The rest of
+    // the fade must carry on over the next push with the length it had; with
+    // the length of a concealment crossfade (480) the audio dropped to a
+    // different weight at once: a 2,322 count step in a 400 Hz sine.
+    let (played, mut buffer) = partial_splice(400.0, 1.0, 64, 3_016);
+
+    assert_eq!(buffer.take_stats().splices, 1);
+    let natural = natural_step(400.0);
+    for channel in 0..CH {
+        let step = max_step(&played, channel);
+        assert!(step <= STEP_MARGIN * natural, "step {step} vs {natural}");
+    }
+}
+
+#[test]
+fn a_splice_fade_is_continuous_whatever_the_reads_after_it() {
+    // Every length of the first read after the junction (from one frame to
+    // longer than the fade), every frequency and phase, a few holes: the 5 ms
+    // fade is finished over the pushes that follow.
+    let mut smoothed = 0;
+    for hz in [100.0, 400.0, 1_000.0, 2_000.0] {
+        for phase in [0.0, 1.0, 2.2] {
+            for first in [1, 16, 64, 128, 239, 240, 241, 300, 479, 480, 700] {
+                for hole in [777, 2_000, 3_016, 5_001] {
+                    let (played, mut buffer) = partial_splice(hz, phase, first, hole);
+
+                    // (Some holes happen to join well enough to need no smoothing.)
+                    smoothed += buffer.take_stats().splices;
+                    let natural = natural_step(hz);
+                    for channel in 0..CH {
+                        let step = max_step(&played, channel);
+                        assert!(
+                            step <= STEP_MARGIN * natural,
+                            "{hz} Hz, phase {phase}, first read {first}, hole {hole}: step {step} vs {natural}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(smoothed > 300, "{smoothed} splices smoothed");
+}
+
+#[test]
+fn a_concealed_zero_run_ending_in_small_reads_crossfades_over_them() {
+    // The crossfade after a concealed run of zeros is resumed by the pushes
+    // that follow: here 40-frame reads, 12 of them cover 10 ms.
+    for hz in [150.0, 700.0, 1_900.0] {
+        let mut buffer = new_buffer(2_000);
+        buffer.push(&tone(0, 4_096, hz));
+        buffer.push(&vec![0_i16; frames(20) * CH]);
+        let mut position = 4_096 + frames(20);
+        for _ in 0..20 {
+            buffer.push(&tone(position, 40, hz));
+            position += 40;
+        }
+        buffer.push(&tone(position, 2_048, hz));
+
+        assert_eq!(buffer.take_stats().zero_runs, 1);
+        assert_drained_tone_continuous(&mut buffer, hz, &format!("{hz} Hz"));
+    }
+}
+
+#[test]
+fn a_restart_spliced_in_small_reads_crossfades_over_them() {
+    // The same after a stall longer than any loss: the splice crossfade is
+    // resumed by 50-frame reads.
+    for hz in [150.0, 700.0, 1_900.0] {
+        let mut buffer = new_buffer(2_000);
+        let mut clock = 0.0;
+        let mut position = 0;
+        for _ in 0..40 {
+            buffer.push_at(at(clock), &tone(position, PERIOD, hz), 0);
+            position += PERIOD;
+            clock += block_ms();
+        }
+        clock += 5_000.0;
+        position += 3 * PERIOD + 11;
+        for _ in 0..30 {
+            buffer.push_at(at(clock), &tone(position, 50, hz), 0);
+            position += 50;
+            clock += ms(50);
+        }
+        buffer.push_at(at(clock), &tone(position, 2_048, hz), 0);
+
+        assert_drained_tone_continuous(&mut buffer, hz, &format!("{hz} Hz"));
+    }
+}
+
+#[test]
+fn a_hole_confirmed_with_short_reads_after_it_is_continuous() {
+    // Recovery in short reads (64 to 512 frames) right after a lost packet,
+    // through the whole detector: the timing check conceals it and the
+    // crossfade runs over many small pushes.
+    for first in [64, 128, 256, 512] {
+        let hz = 523.0;
+        let mut buffer = new_buffer(2_000);
+        let mut clock = 0.0;
+        let mut position = 0;
+        for _ in 0..40 {
+            buffer.push_at(at(clock), &tone(position, PERIOD, hz), 0);
+            position += PERIOD;
+            clock += block_ms();
+        }
+        position += PERIOD; // the lost packet
+        clock += block_ms();
+        while position < 80 * PERIOD {
+            for count in [first, first, 1_024 - 2 * first] {
+                buffer.push_at(at(clock), &tone(position, count, hz), 0);
+                position += count;
+            }
+            clock += block_ms();
+        }
+
+        assert_drained_tone_continuous(&mut buffer, hz, &format!("first reads of {first}"));
+        assert!(buffer.take_stats().gaps >= 1);
+    }
 }

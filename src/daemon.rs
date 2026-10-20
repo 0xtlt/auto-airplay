@@ -25,7 +25,7 @@ use crate::config::{AppConfig, OutputProtocol};
 #[cfg(target_os = "linux")]
 use crate::shutdown::ShutdownFlag;
 #[cfg(target_os = "linux")]
-use crate::silence::{Action, DEFAULT_RESUME_DURATION, SilenceMonitor, linear_to_dbfs};
+use crate::silence::{Action, SilenceMonitor, linear_to_dbfs};
 
 #[cfg(target_os = "linux")]
 pub async fn run(store: ConfigStore) -> Result<()> {
@@ -154,10 +154,13 @@ async fn run_session(
     let capture = CaptureHandle::start(input, Arc::clone(&sink))?;
 
     let idle = Duration::from_secs(config.runtime.idle_silence_seconds);
+    let sound_threshold = config.audio.effective_sound_threshold_dbfs();
+    let sound_confirm = Duration::from_millis(config.runtime.sound_confirm_ms);
     let mut monitor = SilenceMonitor::new(
         config.audio.silence_threshold_dbfs,
+        sound_threshold,
         idle,
-        DEFAULT_RESUME_DURATION,
+        sound_confirm,
     );
     let reconnect_delay = Duration::from_secs(config.runtime.reconnect_delay_seconds.max(1));
     if idle.is_zero() {
@@ -212,7 +215,14 @@ async fn run_session(
                             break Ok(signals.recycle());
                         }
                         Some(Action::Acquire) => {
-                            tracing::info!("sound detected; acquiring AirPlay output");
+                            let (min_dbfs, max_dbfs) = monitor.sound_levels().unzip();
+                            tracing::info!(
+                                min_dbfs = min_dbfs.map(round_db),
+                                max_dbfs = max_dbfs.map(round_db),
+                                sound_threshold_dbfs = round_db(sound_threshold),
+                                confirm_ms = sound_confirm.as_millis() as u64,
+                                "sound detected; acquiring AirPlay output"
+                            );
                             match acquire_with_interrupts(&target, &sink, &mut changed, &mut signals).await {
                                 Acquisition::Ready(acquired) => {
                                     client = Some(*acquired);
@@ -536,6 +546,12 @@ async fn release_output(mut client: AirPlayClient, sink: &AudioSink) {
     }
 }
 
+/// Levels are logged to a tenth of a dB.
+#[cfg(target_os = "linux")]
+fn round_db(level: f32) -> f64 {
+    (f64::from(level) * 10.0).round() / 10.0
+}
+
 /// Coarse class of a session failure, for the logs: tells a receiver that
 /// closed the connection (`eof`, `reset-or-broken-pipe`) from our own timeouts.
 #[cfg(target_os = "linux")]
@@ -582,10 +598,8 @@ fn validate_config(config: AppConfig) -> Result<AppConfig> {
     if config.output.selector.is_none() {
         bail!("no output configured");
     }
-    if !config.audio.silence_threshold_dbfs.is_finite()
-        || !(-120.0..=0.0).contains(&config.audio.silence_threshold_dbfs)
-    {
-        bail!("audio silence_threshold_dbfs must be between -120.0 and 0.0");
+    if let Err(message) = config.validate_detection() {
+        bail!(message);
     }
     Ok(config)
 }

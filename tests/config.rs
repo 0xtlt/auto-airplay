@@ -205,3 +205,97 @@ fn comparison_still_detects_real_audio_changes() {
         audio_from("[audio]\nlatency_ms = 321\nsilence_threshold_dbfs = -50.0\n")
     );
 }
+
+fn config_from(raw: &str) -> AppConfig {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, raw).unwrap();
+    ConfigStore::new(path).load().unwrap()
+}
+
+#[test]
+fn sound_detection_defaults_apply_to_configs_without_the_new_keys() {
+    // The production configuration: only the old silence key is set.
+    let config = config_from(
+        "[audio]\nsilence_threshold_dbfs = -40\n\n[runtime]\nidle_silence_seconds = 30\n",
+    );
+
+    assert_eq!(config.audio.sound_threshold_dbfs, None);
+    assert_eq!(config.audio.effective_sound_threshold_dbfs(), -34.0);
+    assert_eq!(config.runtime.sound_confirm_ms, 2_000);
+    assert!(config.validate_detection().is_ok());
+    assert_eq!(config_from(""), AppConfig::default());
+}
+
+#[test]
+fn default_sound_threshold_follows_the_silence_threshold() {
+    let mut config = AppConfig::default();
+    config.audio.silence_threshold_dbfs = -50.0;
+    assert_eq!(config.audio.effective_sound_threshold_dbfs(), -44.0);
+
+    // Never above full scale, which no level can exceed.
+    config.audio.silence_threshold_dbfs = -2.0;
+    assert_eq!(config.audio.effective_sound_threshold_dbfs(), 0.0);
+}
+
+#[test]
+fn sound_detection_keys_can_be_configured_and_survive_a_save() {
+    let config = config_from(
+        "[audio]\nsilence_threshold_dbfs = -45.0\nsound_threshold_dbfs = -30.5\n\n[runtime]\nsound_confirm_ms = 3500\n",
+    );
+    assert_eq!(config.audio.effective_sound_threshold_dbfs(), -30.5);
+    assert_eq!(config.runtime.sound_confirm_ms, 3_500);
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(directory.path().join("config.toml"));
+    store.save(&config).unwrap();
+    assert_eq!(store.load().unwrap(), config);
+}
+
+#[test]
+fn changing_the_sound_threshold_counts_as_a_configuration_change() {
+    let base = AppConfig::default();
+    let mut changed = base.clone();
+    changed.audio.sound_threshold_dbfs = Some(-34.0);
+    assert_ne!(base, changed);
+
+    let mut changed = base.clone();
+    changed.runtime.sound_confirm_ms = 3_000;
+    assert_ne!(base, changed);
+}
+
+#[test]
+fn sound_detection_validation_rejects_bad_values() {
+    let error = |edit: &dyn Fn(&mut AppConfig)| {
+        let mut config = AppConfig::default();
+        edit(&mut config);
+        config.validate_detection().unwrap_err()
+    };
+
+    assert!(error(&|c| c.audio.silence_threshold_dbfs = f32::NAN).contains("silence_threshold"));
+    assert!(error(&|c| c.audio.silence_threshold_dbfs = -121.0).contains("silence_threshold"));
+    assert!(error(&|c| c.audio.silence_threshold_dbfs = 1.0).contains("silence_threshold"));
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -121.0, 0.5] {
+        assert!(
+            error(&|c| c.audio.sound_threshold_dbfs = Some(bad)).contains("between -120.0 and 0.0")
+        );
+    }
+    // Below the silence threshold (-40 by default).
+    assert!(error(&|c| c.audio.sound_threshold_dbfs = Some(-41.0)).contains("must not be below"));
+    for bad in [0, 249, 60_001] {
+        assert!(error(&|c| c.runtime.sound_confirm_ms = bad).contains("sound_confirm_ms"));
+    }
+}
+
+#[test]
+fn sound_detection_validation_accepts_the_edges() {
+    let mut config = AppConfig::default();
+    config.audio.sound_threshold_dbfs = Some(-40.0);
+    config.runtime.sound_confirm_ms = 250;
+    assert!(config.validate_detection().is_ok());
+
+    config.audio.silence_threshold_dbfs = -120.0;
+    config.audio.sound_threshold_dbfs = Some(0.0);
+    config.runtime.sound_confirm_ms = 60_000;
+    assert!(config.validate_detection().is_ok());
+}

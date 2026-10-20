@@ -45,7 +45,41 @@ impl AppConfig {
         }
         fields
     }
+
+    /// Checks the settings that drive sound detection. The daemon refuses to
+    /// start with a configuration that fails this check.
+    pub fn validate_detection(&self) -> Result<(), String> {
+        let silence = self.audio.silence_threshold_dbfs;
+        if !is_valid_dbfs(silence) {
+            return Err("audio silence_threshold_dbfs must be between -120.0 and 0.0".into());
+        }
+        if let Some(sound) = self.audio.sound_threshold_dbfs {
+            if !is_valid_dbfs(sound) {
+                return Err("audio sound_threshold_dbfs must be between -120.0 and 0.0".into());
+            }
+            if sound < silence {
+                return Err(format!(
+                    "audio sound_threshold_dbfs ({sound}) must not be below silence_threshold_dbfs ({silence})"
+                ));
+            }
+        }
+        if !SOUND_CONFIRM_MS_RANGE.contains(&self.runtime.sound_confirm_ms) {
+            return Err(format!(
+                "runtime sound_confirm_ms must be between {} and {}",
+                SOUND_CONFIRM_MS_RANGE.start(),
+                SOUND_CONFIRM_MS_RANGE.end()
+            ));
+        }
+        Ok(())
+    }
 }
+
+fn is_valid_dbfs(value: f32) -> bool {
+    value.is_finite() && (-120.0..=0.0).contains(&value)
+}
+
+/// Accepted values of `runtime.sound_confirm_ms`.
+pub const SOUND_CONFIRM_MS_RANGE: std::ops::RangeInclusive<u64> = 250..=60_000;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -133,7 +167,23 @@ pub struct AudioConfig {
     /// RMS level (dBFS) below which the input counts as silent. Used together
     /// with `runtime.idle_silence_seconds` to release the AirPlay output.
     pub silence_threshold_dbfs: f32,
+    /// RMS level (dBFS) the input must reach, and keep for
+    /// `runtime.sound_confirm_ms`, before the AirPlay output is acquired.
+    /// Defaults to `silence_threshold_dbfs + 6.0` (capped at 0.0). Must not be
+    /// below `silence_threshold_dbfs`: the gap between the two ignores noise.
+    pub sound_threshold_dbfs: Option<f32>,
 }
+
+impl AudioConfig {
+    /// The level that counts as the start of sound, with the default applied.
+    pub fn effective_sound_threshold_dbfs(&self) -> f32 {
+        self.sound_threshold_dbfs
+            .unwrap_or_else(|| (self.silence_threshold_dbfs + DEFAULT_SOUND_MARGIN_DB).min(0.0))
+    }
+}
+
+/// Distance above `silence_threshold_dbfs` of the default sound threshold.
+const DEFAULT_SOUND_MARGIN_DB: f32 = 6.0;
 
 /// Equality ignores the obsolete `volume` field, so adding, removing or editing
 /// it never looks like a configuration change (which would restart playback).
@@ -145,11 +195,13 @@ impl PartialEq for AudioConfig {
             channels,
             latency_ms,
             silence_threshold_dbfs,
+            sound_threshold_dbfs,
         } = self;
         *preferred_sample_rate == other.preferred_sample_rate
             && *channels == other.channels
             && *latency_ms == other.latency_ms
             && *silence_threshold_dbfs == other.silence_threshold_dbfs
+            && *sound_threshold_dbfs == other.sound_threshold_dbfs
     }
 }
 
@@ -161,6 +213,7 @@ impl Default for AudioConfig {
             channels: 2,
             latency_ms: 500,
             silence_threshold_dbfs: -40.0,
+            sound_threshold_dbfs: None,
         }
     }
 }
@@ -170,6 +223,9 @@ impl Default for AudioConfig {
 pub struct RuntimeConfig {
     pub reconnect_delay_seconds: u64,
     pub idle_silence_seconds: u64,
+    /// How long the input must stay at or above the sound threshold, without a
+    /// single dip below it, before the AirPlay output is acquired.
+    pub sound_confirm_ms: u64,
     pub log_level: String,
 }
 
@@ -178,6 +234,7 @@ impl Default for RuntimeConfig {
         Self {
             reconnect_delay_seconds: 3,
             idle_silence_seconds: 30,
+            sound_confirm_ms: 2_000,
             log_level: "info".into(),
         }
     }

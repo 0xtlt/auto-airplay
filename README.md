@@ -87,10 +87,15 @@ The configuration lives in `/etc/auto-airplay/config.toml` and is normally writt
 [audio]
 # RMS level (dBFS) below which the input counts as silent.
 silence_threshold_dbfs = -40.0
+# RMS level (dBFS) the input must reach, and keep, before the speaker is acquired.
+# Default: silence_threshold_dbfs + 6.0 (-34.0 with the default threshold).
+# sound_threshold_dbfs = -34.0
 
 [runtime]
 # Release the speaker after this many seconds of continuous silence (0 disables).
 idle_silence_seconds = 30
+# The input must stay at or above the sound threshold this long (250 to 60000 ms).
+sound_confirm_ms = 2000
 # Wait this long before retrying after a failed connection.
 reconnect_delay_seconds = 3
 
@@ -110,15 +115,24 @@ Older versions had an `audio.volume` setting and an `auto-airplay volume` comman
 An AirPlay speaker can only play one source at a time, so `auto-airplay` does not hold it while the input is silent:
 
 - The daemon starts without connecting to the speaker. Audio is captured continuously, but the AirPlay session is only opened once sound is detected. Restarting the Pi while someone else is playing on the speaker does not interrupt them.
-- After about 1 second of sustained sound, the bridge discovers the speaker, connects, and starts streaming. A single needle pop or static click is ignored. Because discovery and connection take time, the start of the audio after the input resumes is not played: typically 1 to 6 seconds with the default `output.discovery_timeout_seconds = 4`, longer with a longer discovery timeout, a slow connection, or after a failed attempt (`runtime.reconnect_delay_seconds`).
+- After `runtime.sound_confirm_ms` (default 2000) of sustained sound, the bridge discovers the speaker, connects, and starts streaming. "Sustained" is strict: the level must be at or above the sound threshold (see below) on every check, about every 250 ms, for the whole window; a single check below it restarts the window. A needle pop, a static click, or idle noise therefore does not take over the speaker. Because discovery and connection take time, the start of the audio after the input resumes is not played: typically 1 to 6 seconds with the default `output.discovery_timeout_seconds = 4`, longer with a longer discovery timeout, a slow connection, or after a failed attempt (`runtime.reconnect_delay_seconds`).
 - After `runtime.idle_silence_seconds` (default 30) of continuous silence, the bridge stops streaming and closes the AirPlay session cleanly, so iPhones, Apple TVs, and other sources can use the speaker right away. Sound resets the countdown, so quiet passages and the gaps between tracks do not release it unless they last that long.
 - Stopping or restarting the service (SIGTERM or ctrl-c) and configuration changes also close the AirPlay session cleanly.
 - `runtime.idle_silence_seconds = 0` disables this behavior: the bridge connects at startup and holds the speaker for as long as it runs.
 
-`audio.silence_threshold_dbfs` (default `-40.0`) sets the RMS level, in dBFS, that separates sound from silence. The default sits above the idle noise floor of a Bluetooth turntable such as the AT-LP60-BT, which stays above `-50` while powered on with no record playing. Check the logs to see when the speaker is acquired and released, then tune it:
+Two levels, in dBFS (RMS), decide what counts as sound:
 
-- If the speaker is never released because turntable hum or noise stays above the threshold, raise the value toward `-35`.
-- If quiet passages are cut or the speaker is released during soft music, lower the value toward `-50` or `-60`.
+- `audio.silence_threshold_dbfs` (default `-40.0`): while the speaker is held, a level below this counts as silence and runs the `idle_silence_seconds` countdown.
+- `audio.sound_threshold_dbfs` (optional, default `silence_threshold_dbfs + 6`, so `-34.0` with the default): while the speaker is released, the level must reach this and stay there for the confirm window before the speaker is acquired. It must not be lower than the silence threshold.
+
+The gap between the two is deliberate. Idle noise of a Bluetooth turntable such as the AT-LP60-BT hovers around `-50` to `-38` with no record playing, so it can sit above the silence threshold without ever being loud enough to acquire the speaker. Releasing is unchanged: only levels below `silence_threshold_dbfs` count as silence.
+
+When the speaker is acquired, the log line `sound detected; acquiring AirPlay output` carries `min_dbfs` and `max_dbfs` (the lowest and highest level during the confirm window), `sound_threshold_dbfs`, and `confirm_ms`. Use them to tune:
+
+- If the speaker is acquired with nothing playing, `min_dbfs` shows how close the noise is to the threshold. Raise `sound_threshold_dbfs` above `max_dbfs` of those false starts, or lengthen `runtime.sound_confirm_ms`.
+- If real music is not picked up, or starts late, `min_dbfs` of a normal start shows the quietest moment of the first seconds. Lower `sound_threshold_dbfs` (never below `silence_threshold_dbfs`) or shorten the window.
+- If the speaker is never released because hum or noise stays above `silence_threshold_dbfs`, raise it toward `-35`; raise `sound_threshold_dbfs` with it, since it cannot be lower.
+- If quiet passages are cut or the speaker is released during soft music, lower `silence_threshold_dbfs` toward `-50` or `-60`.
 
 If the connection to the speaker fails or is lost, `runtime.reconnect_delay_seconds` (default 3, minimum 1) is the pause before the next attempt. With `output.auto_reconnect = true` (default) the bridge keeps running and reconnects as soon as sound is present. With `false`, a lost connection makes the process exit with an error so the supervisor (systemd) restarts it. A failed attempt to acquire the speaker is always retried after the delay.
 

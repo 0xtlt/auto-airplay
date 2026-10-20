@@ -29,7 +29,8 @@ struct Suspect {
     received_at: f64,
     since: Duration,
     samples: u32,
-    /// Lowest excess seen since: what is surely missing.
+    /// Lowest excess seen since the suspicion (measured from the baseline, so
+    /// it includes the holes suspected before this one).
     min_excess: f64,
 }
 
@@ -66,7 +67,10 @@ pub struct GapDetector {
     last: Duration,
     received: f64,
     baseline: f64,
-    pending: Option<Suspect>,
+    /// Open suspicions, oldest first. Each sits on top of the ones before it:
+    /// a second hole while the first is being checked is a second suspicion,
+    /// settled on its own window.
+    pending: Vec<Suspect>,
 }
 
 impl GapDetector {
@@ -84,7 +88,7 @@ impl GapDetector {
             last: Duration::ZERO,
             received: 0.0,
             baseline: 0.0,
-            pending: None,
+            pending: Vec::new(),
         }
     }
 
@@ -106,63 +110,72 @@ impl GapDetector {
         let elapsed = now.saturating_sub(self.last).as_secs_f64();
         self.last = now;
         // The baseline stays put while a suspicion is being checked.
-        let creep = if self.pending.is_some() {
-            0.0
-        } else {
+        let creep = if self.pending.is_empty() {
             DRIFT_ALLOWANCE * self.rate * elapsed
+        } else {
+            0.0
         };
         let baseline = self.baseline + creep;
         let excess = deficit - baseline;
 
         if excess > self.max_gap {
-            self.pending = None;
+            self.pending.clear();
             self.baseline = deficit;
             return GapVerdict::Restart;
         }
-        let Some(mut suspect) = self.pending.take() else {
-            if excess >= self.suspect {
-                self.baseline = baseline;
-                self.pending = Some(Suspect {
-                    received_at: before,
-                    since: now,
-                    samples: 1,
-                    min_excess: excess,
-                });
-            } else {
-                self.baseline = baseline.min(deficit);
-            }
-            return GapVerdict::OnTime;
-        };
 
-        if excess < self.suspect {
-            // Caught up: it was late, not lost.
-            self.baseline = baseline.min(deficit);
-            return GapVerdict::OnTime;
+        // Every open suspicion needs this arrival to still be `suspect` above
+        // the one below it; the first that is not, and all above it, were late.
+        let mut floor = 0.0;
+        let mut holding = 0;
+        for suspect in &mut self.pending {
+            if excess - floor < self.suspect {
+                break;
+            }
+            suspect.samples += 1;
+            suspect.min_excess = suspect.min_excess.min(excess);
+            floor = suspect.min_excess;
+            holding += 1;
         }
-        suspect.samples += 1;
-        if excess - suspect.min_excess >= self.suspect {
-            // A second loss on top of the first: settle the first now.
-            let hole = self.settle(suspect, before);
-            self.pending = Some(Suspect {
+        if holding < self.pending.len() {
+            self.pending.truncate(holding);
+            if self.pending.is_empty() {
+                // Caught up: it was late, not lost.
+                self.baseline = baseline.min(deficit);
+                return GapVerdict::OnTime;
+            }
+        }
+        if excess - floor >= self.suspect {
+            self.pending.push(Suspect {
                 received_at: before,
                 since: now,
                 samples: 1,
-                min_excess: excess - suspect.min_excess,
+                min_excess: excess,
             });
-            return hole;
         }
-        suspect.min_excess = suspect.min_excess.min(excess);
-        if now.saturating_sub(suspect.since) >= self.window && suspect.samples >= 3 {
-            return self.settle(suspect, before);
+        if self.pending.is_empty() {
+            self.baseline = baseline.min(deficit);
+            return GapVerdict::OnTime;
         }
-        self.pending = Some(suspect);
+        self.baseline = baseline;
+
+        // Only a suspicion that held for the whole window is settled.
+        let oldest = self.pending[0];
+        if now.saturating_sub(oldest.since) >= self.window && oldest.samples >= 3 {
+            self.pending.remove(0);
+            return self.settle(oldest, before);
+        }
         GapVerdict::OnTime
     }
 
     /// Confirms a suspicion: the hole is filled by the caller, so it counts as
-    /// received, which raises the baseline by its length.
+    /// received, which raises the baseline by its length (and lowers what the
+    /// suspicions above it have left to explain).
     fn settle(&mut self, suspect: Suspect, before: f64) -> GapVerdict {
         self.baseline += suspect.min_excess;
+        for rest in &mut self.pending {
+            rest.min_excess -= suspect.min_excess;
+        }
         GapVerdict::Hole {
             behind: (before - suspect.received_at).round() as usize,
             frames: suspect.min_excess.round() as usize,

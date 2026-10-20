@@ -598,6 +598,52 @@ fn two_losses_in_quick_succession_are_two_holes() {
 }
 
 #[test]
+fn delays_that_grow_and_shrink_are_not_a_hole() {
+    // In order, nothing lost: 12 ms, 24 ms, then 6 ms late. The second delay
+    // must not settle the first suspicion before its window is over.
+    let delays = [12.0, 24.0, 6.0];
+    let mut detector = detector();
+    for block in 0..120 {
+        let delay = match block {
+            100..=102 => delays[block - 100],
+            _ => 0.0,
+        };
+        let verdict = detector.observe(at(block as f64 * block_ms() + delay), PERIOD, 0);
+        assert_eq!(verdict, GapVerdict::OnTime, "block {block}");
+    }
+    // Also with the delays piling up, then catching up before the window ends.
+    let mut detector = self::detector();
+    for block in 0..200 {
+        let delay = match block {
+            100 => 12.0,
+            101 => 24.0,
+            102 => 36.0,
+            _ => 0.0,
+        };
+        assert_eq!(
+            detector.observe(at(block as f64 * block_ms() + delay), PERIOD, 0),
+            GapVerdict::OnTime,
+            "block {block}"
+        );
+    }
+}
+
+#[test]
+fn a_late_bump_on_top_of_a_real_loss_only_cancels_itself() {
+    // One packet is lost; a following block is then 15 ms late once.
+    let mut detector = detector();
+    let found = verdicts(&mut detector, 0, 300, |block| {
+        (block != 100).then(|| block as f64 * block_ms() + if block == 103 { 15.0 } else { 0.0 })
+    });
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    let GapVerdict::Hole { frames, .. } = found[0].1 else {
+        panic!("{found:?}");
+    };
+    assert!(frames.abs_diff(PERIOD) <= 16, "{frames}");
+}
+
+#[test]
 fn a_late_packet_is_not_a_hole() {
     // Blocks arrive 21, 30 or 45 ms late, one at a time; the next one is on time.
     for late in [21.0, 30.0, 45.0] {
@@ -1186,7 +1232,7 @@ fn the_stats_line_has_the_greppable_shape() {
     assert_eq!(
         line,
         "bt_input stats: losses_per_min=0 concealed_per_min=0 concealed_ms=0 buffer_fill_ms=250 \
-         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0"
+         underruns=0 zero_runs=0 xruns=0 gaps=0 drift_corrections=0 reads=0"
     );
 }
 
@@ -1439,34 +1485,96 @@ fn tone(start: usize, count: usize, hz: f32) -> Vec<i16> {
 #[test]
 fn a_single_lost_packet_is_concealed_without_a_click() {
     // One lost 1024-frame block (21.3 ms) from a 173 Hz sine: spliced as it
-    // is, the step is 48,000 counts against a natural maximum of 670.
+    // is, the step is 48,000 counts against a natural maximum of 670. The
+    // cushion is big enough to still hold the hole when it is inspected.
     let hz = 173.0;
     let natural = natural_step(hz);
-    let mut buffer = new_buffer(400);
+    let mut buffer = new_buffer(2_000);
     let mut clock = 0.0;
     let mut position = 0;
-    for block in 0..120 {
-        if block == 40 {
+    let mut pushed = 0;
+    for block in 0..80 {
+        if block == 20 {
             position += PERIOD;
             clock += block_ms();
         }
         buffer.push_at(at(clock), &tone(position, PERIOD, hz), 0);
         position += PERIOD;
+        pushed += PERIOD;
         clock += block_ms();
     }
+    assert!(
+        buffer.fill_frames() >= pushed,
+        "nothing may have left the FIFO"
+    );
+    let stats = buffer.take_stats();
     let out = drain(&mut buffer);
 
-    for channel in 0..CH {
-        let step = max_step(&out, channel);
-        assert!(step <= STEP_MARGIN * natural, "step {step} vs {natural}");
-    }
-    let stats = buffer.take_stats();
+    // The hole was found, counted and concealed in the audio that is checked.
     assert_eq!(
         (stats.gaps, stats.losses, stats.concealed),
         (1, 1, 1),
         "{stats}"
     );
     assert!((19..=22).contains(&stats.concealed_ms), "{stats}");
+    let concealed = pushed + frames(21);
+    assert!(out.len() / CH + PLAYOUT_CHUNK_FRAMES >= concealed.min(buffer_total(&out)));
+    for channel in 0..CH {
+        let step = max_step(&out, channel);
+        assert!(step <= STEP_MARGIN * natural, "step {step} vs {natural}");
+    }
+    // The audio at the hole is not the bare source any more: the sine's samples
+    // there are the concealment, faded, not the lost block's neighbours.
+    let at_hole = &out[(20 * PERIOD) * CH..(20 * PERIOD + frames(15)) * CH];
+    let source_there = tone(20 * PERIOD, frames(15), hz);
+    assert_ne!(at_hole, &source_there[..]);
+}
+
+fn buffer_total(out: &[i16]) -> usize {
+    out.len() / CH
+}
+
+#[test]
+fn a_hole_inside_the_queue_of_a_cold_start_is_concealed() {
+    // The consumer attaches while the cushion is still filling: the output is
+    // silence, and the audio queueing up behind it holds a lost packet. That
+    // hole has not been bridged by anything and must be concealed.
+    let hz = 173.0;
+    let natural = natural_step(hz);
+    let mut cold = new_buffer(400);
+    cold.start_playout();
+    let mut pacer = cold.pacer();
+    let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
+    let mut audio = Vec::new();
+    let mut next = 0;
+    for tick in 0..2_000 {
+        let now = f64::from(tick);
+        while next as f64 * block_ms() <= now {
+            if next != 5 {
+                cold.push_at(
+                    at(next as f64 * block_ms()),
+                    &tone(next * PERIOD, PERIOD, hz),
+                    0,
+                );
+            }
+            next += 1;
+        }
+        while cold.pull_chunk(&mut pacer, at(now), &mut chunk) {
+            pacer.sent(PLAYOUT_CHUNK_FRAMES);
+            audio.extend_from_slice(&chunk);
+        }
+    }
+
+    for channel in 0..CH {
+        let step = max_step(&audio, channel);
+        assert!(step <= STEP_MARGIN * natural, "step {step} vs {natural}");
+    }
+    let stats = cold.take_stats();
+    assert_eq!(
+        (stats.gaps, stats.concealed, stats.underruns),
+        (1, 1, 0),
+        "{stats}"
+    );
 }
 
 #[test]

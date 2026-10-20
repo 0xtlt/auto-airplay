@@ -31,8 +31,9 @@ const GAP_SUSPECT_MS: u64 = 10;
 const GAP_WINDOW_MS: u64 = 80;
 /// Longer stalls are a restarted stream, not packet loss.
 const GAP_LIMIT_MS: u64 = 2_000;
-/// A capture overrun and the hole it leaves are one loss when this close.
-const XRUN_TOLERANCE: u64 = 4096;
+/// A capture overrun, or an underrun, and the hole behind it are one loss when
+/// they are this close (frames received).
+const HOLE_TOLERANCE: u64 = 4096;
 /// Digital zeros shorter than this are ordinary signal.
 const ZERO_RUN_MS: u32 = 2;
 /// Zeros only count as lost audio when the signal right before them reached
@@ -141,6 +142,9 @@ pub struct JitterBuffer {
     /// Frames received through `push_at`, and where the capture last overran.
     received: u64,
     xrun_at: Option<u64>,
+    /// Frames received when the output last ran dry: the audio up to there
+    /// has been played.
+    underrun_at: Option<u64>,
     /// A concealed stretch is being crossfaded into the audio being pushed.
     pending: Option<Blend>,
     zero: ZeroRun,
@@ -216,6 +220,7 @@ impl JitterBuffer {
             zero: ZeroRun::Idle,
             received: 0,
             xrun_at: None,
+            underrun_at: None,
             counters: Counters::default(),
         }
     }
@@ -261,6 +266,7 @@ impl JitterBuffer {
         self.consumer = true;
         self.read = ReadState::Concealing(self.silence());
         self.starting = true;
+        self.underrun_at = None;
         self.tail.clear();
         self.since_correction = 0;
         self.low_for = 0;
@@ -270,6 +276,7 @@ impl JitterBuffer {
     pub fn stop_playout(&mut self) {
         self.consumer = false;
         self.starting = false;
+        self.underrun_at = None;
         self.read = ReadState::Playing;
         self.tail.clear();
     }
@@ -297,6 +304,7 @@ impl JitterBuffer {
         if frames == 0 {
             return;
         }
+        self.counters.reads += 1;
         match self.gaps.observe(now, frames, backlog) {
             GapVerdict::OnTime => {}
             GapVerdict::Hole { behind, frames } => self.conceal_hole(behind, frames),
@@ -362,14 +370,19 @@ impl JitterBuffer {
     /// end of the audio received so far, with concealment: the audio that
     /// followed it is moved back, crossfaded in.
     fn conceal_hole(&mut self, behind: usize, missing: usize) {
-        if self.consumer && matches!(self.read, ReadState::Concealing(_)) {
-            // The output stage already bridged this hole, and counted it.
+        let position = self.received.saturating_sub(behind as u64);
+        if self
+            .underrun_at
+            .is_some_and(|at| at.abs_diff(position) <= HOLE_TOLERANCE)
+        {
+            // The output ran dry where the audio stopped: the output stage
+            // bridged this hole, and counted it. (A hole elsewhere, in audio
+            // that is queued while the cushion rebuilds, is concealed as usual.)
             return;
         }
-        let position = self.received.saturating_sub(behind as u64);
         if !self
             .xrun_at
-            .is_some_and(|at| at.abs_diff(position) <= XRUN_TOLERANCE)
+            .is_some_and(|at| at.abs_diff(position) <= HOLE_TOLERANCE)
         {
             // A capture overrun leaves a hole; it is one loss, counted once.
             self.counters.gaps += 1;
@@ -581,6 +594,7 @@ impl JitterBuffer {
                 conceal.fill(hidden);
                 self.remember(hidden);
                 self.counters.underruns += 1;
+                self.underrun_at = Some(self.received);
                 self.counters.concealments += 1;
                 self.counters.concealed_frames += (frames - fill) as u64;
                 self.read = ReadState::Concealing(conceal);

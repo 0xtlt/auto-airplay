@@ -18,6 +18,8 @@ pub(crate) struct Counters {
     pub concealed_frames: u64,
     pub drift_drops: u64,
     pub drift_stretches: u64,
+    /// Reads of the capture device that delivered audio.
+    pub reads: u64,
 }
 
 /// A report on the input: counts since the previous report (taken once a
@@ -37,6 +39,9 @@ pub struct StatsSnapshot {
     pub gaps: u64,
     /// Clock-drift corrections: audio dropped or stretched to keep the fill.
     pub drift_corrections: u64,
+    /// Reads of the capture device that delivered audio: tells a silent
+    /// input from a stalled capture.
+    pub reads: u64,
 }
 
 impl StatsSnapshot {
@@ -52,6 +57,7 @@ impl StatsSnapshot {
             xruns: counters.xruns,
             gaps: counters.gaps,
             drift_corrections: counters.drift_drops + counters.drift_stretches,
+            reads: counters.reads,
         }
     }
 }
@@ -62,7 +68,7 @@ impl fmt::Display for StatsSnapshot {
         write!(
             f,
             "bt_input stats: losses_per_min={} concealed_per_min={} concealed_ms={} buffer_fill_ms={} \
-             underruns={} zero_runs={} xruns={} gaps={} drift_corrections={}",
+             underruns={} zero_runs={} xruns={} gaps={} drift_corrections={} reads={}",
             self.losses,
             self.concealed,
             self.concealed_ms,
@@ -72,6 +78,7 @@ impl fmt::Display for StatsSnapshot {
             self.xruns,
             self.gaps,
             self.drift_corrections,
+            self.reads,
         )
     }
 }

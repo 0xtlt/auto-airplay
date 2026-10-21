@@ -170,6 +170,33 @@ fn cli_config_show_json_warns_on_stderr_about_the_obsolete_volume() {
 }
 
 #[test]
+fn cli_warns_on_stderr_that_latency_ms_is_replaced_by_the_jitter_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    std::fs::write(&config, "[audio]\nlatency_ms = 500\n").unwrap();
+
+    let assert = Command::cargo_bin("auto-airplay")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "config",
+            "show",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: obsolete configuration field `audio.latency_ms` ignored: use `audio.jitter_buffer_ms` for input buffering",
+        ));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["audio"].get("latency_ms").is_none(), "{stdout}");
+    assert_eq!(json["audio"]["jitter_buffer_ms"], 400);
+}
+
+#[test]
 fn cli_stays_quiet_without_obsolete_fields() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("config.toml");

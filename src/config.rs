@@ -43,12 +43,23 @@ impl AppConfig {
         if self.audio.legacy_volume.is_some() {
             fields.push("audio.volume");
         }
+        if self.audio.legacy_latency_ms.is_some() {
+            fields.push("audio.latency_ms");
+        }
         fields
     }
 
-    /// Checks the settings that drive sound detection and preemption handling. The daemon refuses to
-    /// start with a configuration that fails this check.
+    /// Checks the settings that drive sound detection, preemption handling and
+    /// input buffering. The daemon refuses to start with a configuration that
+    /// fails this check.
     pub fn validate_detection(&self) -> Result<(), String> {
+        if !JITTER_BUFFER_MS_RANGE.contains(&self.audio.jitter_buffer_ms) {
+            return Err(format!(
+                "audio jitter_buffer_ms must be between {} and {}",
+                JITTER_BUFFER_MS_RANGE.start(),
+                JITTER_BUFFER_MS_RANGE.end()
+            ));
+        }
         let silence = self.audio.silence_threshold_dbfs;
         if !is_valid_dbfs(silence) {
             return Err("audio silence_threshold_dbfs must be between -120.0 and 0.0".into());
@@ -96,9 +107,28 @@ impl AppConfig {
     }
 }
 
+/// Why an obsolete key is ignored, and what replaces it.
+pub fn obsolete_field_hint(field: &str) -> &'static str {
+    match field {
+        "audio.volume" => "auto-airplay never changes the speaker volume",
+        "audio.latency_ms" => "use `audio.jitter_buffer_ms` for input buffering",
+        _ => "it has no effect any more",
+    }
+}
+
 fn is_valid_dbfs(value: f32) -> bool {
     value.is_finite() && (-120.0..=0.0).contains(&value)
 }
+
+/// Accepted values of `audio.jitter_buffer_ms`: from the least that still
+/// leaves room to conceal a lost packet (see
+/// [`MIN_JITTER_BUFFER_MS`](crate::plc::MIN_JITTER_BUFFER_MS)) to ten seconds,
+/// far beyond what a turntable needs.
+pub const JITTER_BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> =
+    crate::plc::MIN_JITTER_BUFFER_MS..=10_000;
+
+/// Default of `audio.jitter_buffer_ms`.
+pub const DEFAULT_JITTER_BUFFER_MS: u32 = 400;
 
 /// Accepted values of `runtime.preempted_silence_seconds`.
 pub const PREEMPTED_SILENCE_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 1..=3_600;
@@ -191,7 +221,15 @@ pub struct AudioConfig {
     pub legacy_volume: Option<serde::de::IgnoredAny>,
     pub preferred_sample_rate: Option<u32>,
     pub channels: u8,
-    pub latency_ms: u32,
+    /// Obsolete: the value was never used. Any value is accepted, ignored, and
+    /// never written back; see `jitter_buffer_ms`.
+    #[serde(default, rename = "latency_ms", skip_serializing)]
+    pub legacy_latency_ms: Option<serde::de::IgnoredAny>,
+    /// Audio (ms) queued between the Bluetooth input and AirPlay. It absorbs
+    /// delays and is where lost packets are concealed; it adds that much
+    /// latency (on top of `output.render_delay_ms`). Fixed: it never adapts.
+    /// Must be within [`JITTER_BUFFER_MS_RANGE`].
+    pub jitter_buffer_ms: u32,
     /// RMS level (dBFS) below which the input counts as silent. Used together
     /// with `runtime.idle_silence_seconds` to release the AirPlay output.
     pub silence_threshold_dbfs: f32,
@@ -213,21 +251,23 @@ impl AudioConfig {
 /// Distance above `silence_threshold_dbfs` of the default sound threshold.
 const DEFAULT_SOUND_MARGIN_DB: f32 = 6.0;
 
-/// Equality ignores the obsolete `volume` field, so adding, removing or editing
-/// it never looks like a configuration change (which would restart playback).
+/// Equality ignores the obsolete `volume` and `latency_ms` fields, so adding,
+/// removing or editing them never looks like a configuration change (which
+/// would restart playback).
 impl PartialEq for AudioConfig {
     fn eq(&self, other: &Self) -> bool {
         let Self {
             legacy_volume: _,
             preferred_sample_rate,
+            legacy_latency_ms: _,
             channels,
-            latency_ms,
+            jitter_buffer_ms,
             silence_threshold_dbfs,
             sound_threshold_dbfs,
         } = self;
         *preferred_sample_rate == other.preferred_sample_rate
             && *channels == other.channels
-            && *latency_ms == other.latency_ms
+            && *jitter_buffer_ms == other.jitter_buffer_ms
             && *silence_threshold_dbfs == other.silence_threshold_dbfs
             && *sound_threshold_dbfs == other.sound_threshold_dbfs
     }
@@ -239,7 +279,8 @@ impl Default for AudioConfig {
             legacy_volume: None,
             preferred_sample_rate: None,
             channels: 2,
-            latency_ms: 500,
+            legacy_latency_ms: None,
+            jitter_buffer_ms: DEFAULT_JITTER_BUFFER_MS,
             silence_threshold_dbfs: -40.0,
             sound_threshold_dbfs: None,
         }

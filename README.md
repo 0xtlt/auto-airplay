@@ -85,6 +85,9 @@ The configuration lives in `/etc/auto-airplay/config.toml` and is normally writt
 
 ```toml
 [audio]
+# Audio (ms) queued between the Bluetooth input and AirPlay; see "Bluetooth packet loss" below.
+# 200 to 10000, fixed: it never adapts to what it sees. Adds that much latency.
+jitter_buffer_ms = 400
 # RMS level (dBFS) below which the input counts as silent.
 silence_threshold_dbfs = -40.0
 # RMS level (dBFS) the input must reach, and keep, before the speaker is acquired.
@@ -109,6 +112,25 @@ reconnect_delay_seconds = 3
 # Reconnect (instead of exiting) when the speaker connection is lost.
 auto_reconnect = true
 ```
+
+## Bluetooth packet loss
+
+A2DP over a noisy radio link drops packets, and a dropped packet is audio that never arrives: `bluealsa` logs `Missing RTP packets`, and the capture simply continues about 20 ms (one packet) to a few hundred ms later. Played as it comes, that is a splice in the waveform (a crackle) and it starves the AirPlay sender, which resets its timing. `auto-airplay` therefore never forwards the capture as it comes. It goes through a jitter buffer that conceals the holes:
+
+- **Cushion.** Playback runs `audio.jitter_buffer_ms` (default 400, 200 to 10000) behind the capture, so delays up to that long are absorbed. The value is fixed; nothing resizes it. Playback starts once the whole cushion is queued (a short wait if less was), and after an outage longer than the cushion it resumes only when the cushion has refilled, so the level is restored. A turntable has no picture to keep in sync, so a few hundred ms to a couple of seconds are free; the AirPlay `output.render_delay_ms` (default 250) and the speaker's own buffer come on top. Larger values only cost memory (the buffer may hold twice the cushion: about 400 KB per second of `jitter_buffer_ms` at 48 kHz stereo) and a longer wait before the music follows the turntable. While no speaker is held, exactly the most recent `jitter_buffer_ms` is kept, so streaming starts at once with a full cushion.
+- **Lost audio.** A hole is found from arrival times: the capture falls behind the real-time clock by the length of the hole and stays behind, which tells it from a packet that is merely late (the capture then catches up). Even a single lost packet (about 19 ms) is found, while arrival jitter below 15 ms is ignored; a hole is confirmed 80 ms after it happened and then concealed in place, while the audio after it still waits in the cushion: the last few ms of the audio before it, played backwards from the last sample so the waveform stays continuous, fade out over 30 ms, then silence, and a 10 ms crossfade into the audio after it. The same is done for runs of exact digital zeros (2 ms or more right after audible signal), which is how some stacks fill missing frames; vinyl surface noise never is exactly zero, and silence after silence is passed through unchanged. If the buffer ever runs dry, the output is concealed the same way until the cushion has refilled. This is why the cushion is at least 200 ms: the 80 ms confirmation, the audio already handed to the speaker (up to 50 ms) and a chunk or two of timing slack must all fit inside it, or the hole would already have played when it is confirmed.
+- **Safety net.** Whatever the timing says, every junction between two blocks of captured audio is also checked against the waveform: a step far bigger than the signal's own movement around it (a loss the timing missed) is smoothed with a 5 ms crossfade from the mirrored audio before it, once the timing check has had 120 ms to conceal it properly, and in any case before it plays. Nothing is inserted and nothing is counted as lost; the `splices` figure of the stats line counts these.
+- **Clock drift.** The turntable's clock and the Pi's differ by tens of ppm. When the buffer drifts 100 ms above the target, 20 to 60 ms are dropped with a crossfade; when it stays a quarter of the target (at least 64 ms) below it for half a second, 20 ms are stretched the same way, at most once per second of playback. Nothing is clicked or skipped, and with typical drift this happens every few minutes at most.
+
+Once a minute, while capturing, the daemon logs the health of the Bluetooth input, even when everything is zero:
+
+```text
+bt_input stats: losses_per_min=2 concealed_per_min=2 concealed_ms=340 buffer_fill_ms=312 underruns=0 zero_runs=0 xruns=0 gaps=2 drift_corrections=0 reads=2812 avail_errors=0 splices=0
+```
+
+`losses_per_min` counts the audio lost on the way in (`underruns`, `zero_runs`, capture `xruns` and arrival `gaps`), `concealed_per_min` the times concealment replaced audio, `concealed_ms` how much, `buffer_fill_ms` the current level, `drift_corrections` the clock-drift trims, and `reads` the reads of the capture device that delivered audio (0 means nothing came in), `avail_errors` the failed queries for the audio waiting in the device, and `splices` the block junctions that did not join and were smoothed anyway (a loss the timing did not reveal). Find it with `journalctl -u "auto-airplay@$USER.service" | grep bt_input`. Many losses per minute mean a weak Bluetooth link: move the Pi's adapter and the turntable closer, or away from Wi-Fi and USB 3 devices.
+
+`audio.latency_ms` was never used and is deprecated. It is still accepted but ignored, the daemon warns about it at startup, and any command that rewrites the configuration drops it. Use `audio.jitter_buffer_ms` instead.
 
 ## Speaker volume
 

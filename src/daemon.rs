@@ -48,7 +48,8 @@ async fn run_linux(store: ConfigStore) -> Result<()> {
     for field in config.obsolete_fields() {
         tracing::warn!(
             field,
-            "obsolete configuration field ignored: auto-airplay no longer changes the speaker volume"
+            "obsolete configuration field `{field}` ignored: {}",
+            crate::config::obsolete_field_hint(field)
         );
     }
     let started = Instant::now();
@@ -177,7 +178,7 @@ async fn run_session(
     // Capture runs for the whole session; the AirPlay output is only held
     // while there is something to play.
     let sink = AudioSink::new();
-    let capture = CaptureHandle::start(input, Arc::clone(&sink))?;
+    let capture = CaptureHandle::start(input, Arc::clone(&sink), config.audio.jitter_buffer_ms)?;
 
     let idle = Duration::from_secs(config.runtime.idle_silence_seconds);
     let sound_threshold = config.audio.effective_sound_threshold_dbfs();

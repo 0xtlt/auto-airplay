@@ -59,3 +59,27 @@ never change the speaker volume, so the crate is vendored and patched.
    the wall clock upstream used. It reports a grandmaster that falls silent
    (15 s), changes, or jumps (over 50 ms for 3 s). `src/media_clock.rs`
    (`MediaClock`, exported) hands that clock to the host's output pacer.
+4. **Buffered sessions.** `Connection::setup` and `start_streaming_live`
+   hand buffered stream configurations (`StreamType::Buffered`) to a new
+   submodule, `src/connection/buffered.rs`; `stop`, `disconnect`,
+   `send_feedback` and `streamer_packets_sent` gain a buffered branch;
+   realtime streams take exactly the old paths. The session: start the PTP
+   follower (fails early if ports 319/320 cannot be bound), SETUP of the
+   timing channel with PTP and our address as timing peer, the events
+   connection, `SETPEERS` (the speaker's timing addresses and ours, the way
+   Apple senders send it), the PTP introduction, SETUP of a type 103 stream
+   (AAC-LC 44.1 kHz stereo, 1024 frames per packet), RECORD, then waiting
+   (8 s at most) until the speaker's clock is followed. Streaming connects to
+   the stream's data port, starts `airplay_audio::BufferedStreamer` and sends
+   one `SETRATEANCHORTIME`: RTP frame 0 plays `latency` (default 2 s) from now
+   on the speaker's PTP timeline. `stop` removes the stream with a `TEARDOWN`
+   that lists it. `send_feedback` fails when the stream's connection failed
+   (with the I/O error kind, so a receiver dropping it reads as such) or the
+   clock was lost. `AirPlayClient::set_buffered(latency)` selects all this;
+   `media_clock()` gives the speaker's clock to pace the input with;
+   `buffered_stats()` the stream's counters. When a buffered SETUP fails, the
+   client tears the connection down at once (realtime keeps upstream's
+   behaviour). `Connection::connect_unpaired`, `set_ptp_config` and
+   `AirPlayClient::connect_unpaired`, `set_ptp_config` are public but
+   `#[doc(hidden)]`, only so the host crate's `tests/buffered_session.rs` can
+   run a session against a fake speaker.

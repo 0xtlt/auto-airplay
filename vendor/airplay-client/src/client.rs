@@ -29,6 +29,11 @@ pub struct AirPlayClient {
     group_playback_state: Option<PlaybackState>,
     /// Stream statistics (shared across all streaming threads).
     stream_stats: Arc<crate::stats::StreamStats>,
+    /// Local addition: buffered streams send their audio this long before it
+    /// plays (`None`: realtime streams).
+    buffered_latency: Option<Duration>,
+    /// Local addition: where the PTP follower of a buffered stream talks.
+    ptp_config: Option<crate::ptp_follower::FollowerConfig>,
 }
 
 impl AirPlayClient {
@@ -45,6 +50,8 @@ impl AirPlayClient {
             group_streamer: None,
             group_playback_state: None,
             stream_stats: crate::stats::StreamStats::new(),
+            buffered_latency: None,
+            ptp_config: None,
         })
     }
 
@@ -61,6 +68,8 @@ impl AirPlayClient {
             group_streamer: None,
             group_playback_state: None,
             stream_stats: crate::stats::StreamStats::new(),
+            buffered_latency: None,
+            ptp_config: None,
         })
     }
 
@@ -79,6 +88,67 @@ impl AirPlayClient {
     /// Must be called before `connect()`.
     pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
         self.render_delay_ms = delay_ms;
+    }
+
+    /// Local addition: stream as AirPlay 2 buffered audio (type 103, AAC over
+    /// TCP, anchored to the speaker's PTP clock) instead of realtime audio.
+    /// The speaker holds `latency` of audio, so network stalls up to that
+    /// long are not heard; it is also the latency added. Must be called
+    /// before `connect()`.
+    pub fn set_buffered(&mut self, latency: Duration) {
+        self.stream_config = StreamConfig::airplay2_buffered();
+        self.buffered_latency = Some(latency);
+    }
+
+    /// Local addition: where the PTP follower of a buffered stream talks.
+    /// Public only so the host crate's tests can use unprivileged ports.
+    #[doc(hidden)]
+    pub fn set_ptp_config(&mut self, config: crate::ptp_follower::FollowerConfig) {
+        self.ptp_config = Some(config);
+    }
+
+    /// Local addition: the speaker's clock a buffered stream plays on, once
+    /// connected. Audio for the stream should be produced at its pace.
+    pub fn media_clock(&self) -> Option<crate::MediaClock> {
+        self.connection.as_ref().and_then(Connection::media_clock)
+    }
+
+    /// Local addition: counters of the buffered stream, while there is one.
+    pub fn buffered_stats(&self) -> Option<airplay_audio::BufferedStats> {
+        self.connection.as_ref().and_then(Connection::buffered_stats)
+    }
+
+    /// Local addition: connects without pairing. Public only so the host
+    /// crate's tests can run a session against a fake receiver.
+    #[doc(hidden)]
+    pub async fn connect_unpaired(&mut self, device: &Device) -> Result<()> {
+        if self.connection.is_some() {
+            self.disconnect().await?;
+        }
+        let connection = Connection::connect_unpaired(device.clone(), self.stream_config.clone()).await?;
+        self.finish_connect(connection, device).await
+    }
+
+    /// Local addition: what `connect` does once connected and paired.
+    async fn finish_connect(&mut self, mut connection: Connection, device: &Device) -> Result<()> {
+        connection.set_render_delay_ms(self.render_delay_ms);
+        if let Some(latency) = self.buffered_latency {
+            connection.set_buffered_latency(latency);
+        }
+        if let Some(ref config) = self.ptp_config {
+            connection.set_ptp_config(config.clone());
+        }
+        if let Err(error) = connection.setup().await {
+            // A failed buffered SETUP frees the speaker (and the PTP ports)
+            // at once; realtime keeps upstream's behaviour.
+            if self.buffered_latency.is_some() {
+                let _ = connection.disconnect().await;
+            }
+            return Err(error);
+        }
+        self.connection = Some(connection);
+        self.emit_event(ClientEvent::Connected(device.clone())).await;
+        Ok(())
     }
 
     /// Emit an event if handler is set.
@@ -109,19 +179,11 @@ impl AirPlayClient {
         let stream_config = self.stream_config.clone();
 
         // Establish connection
-        let mut connection = Connection::connect(device.clone(), stream_config).await?;
+        let connection = Connection::connect(device.clone(), stream_config).await?;
 
-        // Set render delay for retransmit headroom
-        connection.set_render_delay_ms(self.render_delay_ms);
-
-        // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
-        connection.setup().await?;
-
-        self.connection = Some(connection);
-
-        self.emit_event(ClientEvent::Connected(device.clone())).await;
-
-        Ok(())
+        // Local patch: render delay, buffered stream settings and SETUP in
+        // `finish_connect`.
+        self.finish_connect(connection, device).await
     }
 
     /// Connect to a device with PIN (for password-protected devices).

@@ -11,6 +11,8 @@
 //! - Audio buffer management
 //! - Retransmission handling
 
+/// Local addition: buffered streams (type 103) over TCP.
+pub mod buffered;
 pub mod cipher;
 mod decoder;
 mod encoder;
@@ -31,4 +33,5 @@ pub use live_decoder::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 pub use rtp::{RtpPacket, RtpSender, RtpReceiver, RtpHeader, RetransmitRequest, build_retransmit_response};
 pub use buffer::{AudioBuffer, AudioFrame};
 pub use streamer::AudioStreamer;
+pub use buffered::{BufferedStats, BufferedStreamer, StreamFailure};
 pub use traits::{AudioSource, EncoderTrait};

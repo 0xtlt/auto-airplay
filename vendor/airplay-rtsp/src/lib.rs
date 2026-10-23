@@ -25,5 +25,5 @@ pub use raop_session::RaopSession;
 pub use request::{RtspRequest, RtspMethod};
 pub use response::RtspResponse;
 pub use sdp::SdpBuilder;
-pub use session::{RtspSession, SessionState};
+pub use session::{RtspSession, SessionState, compression_type, split_network_time};
 pub use traits::RtspTransport;

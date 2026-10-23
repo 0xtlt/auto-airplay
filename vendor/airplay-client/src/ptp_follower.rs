@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -59,7 +59,8 @@ pub const LOCK_MIN_SYNCS: usize = 8;
 pub const SILENCE_LIMIT: Duration = Duration::from_secs(15);
 /// Our priority1: worse than a HomePod (248), as a Mac announces itself.
 pub const FOLLOWER_PRIORITY1: u8 = 250;
-/// How long to wait for the receiver's Announce after introducing ourselves.
+/// How long Syncs may come without an Announce before the follower locks on
+/// the Sync's sender as the timeline.
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
 /// Interval of the introductory Syncs (logSyncInterval -3).
 const INTRO_INTERVAL: Duration = Duration::from_millis(125);
@@ -725,6 +726,9 @@ struct Shared {
     /// Last clock reading handed out: readings never go backwards.
     last_reading_ns: AtomicU64,
     running: AtomicBool,
+    /// Sequence numbers of what we introduce ourselves with.
+    sync_sequence: AtomicU16,
+    signaling_sequence: AtomicU16,
 }
 
 impl Shared {
@@ -937,14 +941,18 @@ impl Shared {
 pub struct PtpFollower {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    introductions: Mutex<Vec<JoinHandle<()>>>,
+    event: UdpSocket,
+    general: UdpSocket,
     event_addr: SocketAddr,
     general_addr: SocketAddr,
 }
 
 impl PtpFollower {
-    /// Binds the PTP ports and introduces us to the receiver. Fails if the
-    /// ports cannot be bound (319 and 320 need `CAP_NET_BIND_SERVICE` or root
-    /// on Linux, and no other PTP daemon on this machine).
+    /// Binds the PTP ports and listens. Fails if the ports cannot be bound
+    /// (319 and 320 need `CAP_NET_BIND_SERVICE` or root on Linux, and no
+    /// other PTP daemon on this machine). Call [`Self::introduce`] once the
+    /// receiver knows us as a timing peer.
     pub fn start(config: FollowerConfig) -> io::Result<Self> {
         let any: IpAddr = match config.master {
             IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
@@ -981,6 +989,8 @@ impl PtpFollower {
             locked: AtomicBool::new(false),
             last_reading_ns: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            sync_sequence: AtomicU16::new(0),
+            signaling_sequence: AtomicU16::new(0),
         });
 
         let mut threads = Vec::new();
@@ -998,10 +1008,11 @@ impl PtpFollower {
         }
         {
             let shared = Arc::clone(&shared);
+            let general = general.try_clone()?;
             threads.push(
                 thread::Builder::new()
-                    .name("ptp-intro".into())
-                    .spawn(move || introduce_and_watch(&shared, &event, &general))?,
+                    .name("ptp-watch".into())
+                    .spawn(move || watch(&shared, &general))?,
             );
         }
         tracing::info!(
@@ -1014,9 +1025,36 @@ impl PtpFollower {
         Ok(Self {
             shared,
             threads,
+            introductions: Mutex::new(Vec::new()),
+            event,
+            general,
             event_addr,
             general_addr,
         })
+    }
+
+    /// Introduces us to the receiver the way a Mac does (three Syncs, two
+    /// Announces ranking below a HomePod, a Signaling), in the background.
+    /// Once the receiver announces a better clock, we yield to it.
+    pub fn introduce(&self) {
+        let shared = Arc::clone(&self.shared);
+        let sockets = self
+            .event
+            .try_clone()
+            .and_then(|event| Ok((event, self.general.try_clone()?)));
+        let spawned = sockets.and_then(|(event, general)| {
+            thread::Builder::new()
+                .name("ptp-intro".into())
+                .spawn(move || introduce(&shared, &event, &general))
+        });
+        match spawned {
+            Ok(thread) => self
+                .introductions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(thread),
+            Err(error) => tracing::warn!(%error, "PTP: cannot introduce ourselves to the speaker"),
+        }
     }
 
     /// Our event socket (Sync, Delay_Req).
@@ -1112,7 +1150,13 @@ impl PtpFollower {
     /// Stops the threads and closes the sockets.
     pub fn stop(&mut self) {
         self.shared.running.store(false, Ordering::Release);
-        for thread in self.threads.drain(..) {
+        let introductions = std::mem::take(
+            &mut *self
+                .introductions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for thread in self.threads.drain(..).chain(introductions) {
             let _ = thread.join();
         }
     }
@@ -1147,73 +1191,85 @@ fn receive_loop(shared: &Shared, socket: &UdpSocket, event: &UdpSocket) {
     }
 }
 
-/// Introduces us like a Mac does, yields to the receiver's clock, then
-/// watches for silence.
-fn introduce_and_watch(shared: &Shared, event: &UdpSocket, general: &UdpSocket) {
+fn send(socket: &UdpSocket, packet: &[u8], to: SocketAddr) {
+    if let Err(error) = socket.send_to(packet, to) {
+        tracing::debug!(%error, %to, "PTP: send failed");
+    }
+}
+
+/// Introduces us like a Mac does: three two-step Syncs with their
+/// Follow_Ups, two Announces ranking below a HomePod, then the Mac's
+/// Signaling (the same messages upstream's `run_bmca_yield_flow` sends).
+fn introduce(shared: &Shared, event: &UdpSocket, general: &UdpSocket) {
     let config = &shared.config;
     let event_to = SocketAddr::new(config.master, config.master_event_port);
     let general_to = SocketAddr::new(config.master, config.master_general_port);
     let ours = wire::AnnounceBody::follower(config.identity);
-    let send = |socket: &UdpSocket, packet: Vec<u8>, to: SocketAddr| {
-        if let Err(error) = socket.send_to(&packet, to) {
-            tracing::debug!(%error, %to, "PTP: send failed");
-        }
-    };
-
-    for round in 0..3u16 {
+    for round in 0..3 {
         if !shared.running.load(Ordering::Acquire) {
             return;
         }
+        let sequence = shared
+            .sync_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         let sent = u128::from(mono_now_ns());
         send(
             event,
-            wire::sync(shared.identity, round, true, sent),
+            &wire::sync(shared.identity, sequence, true, sent),
             event_to,
         );
         send(
             general,
-            wire::follow_up(shared.identity, round, sent, 0),
+            &wire::follow_up(shared.identity, sequence, sent, 0),
             general_to,
         );
         if round < 2 {
             send(
                 general,
-                wire::announce(shared.identity, round, &ours, 1),
+                &wire::announce(shared.identity, sequence, &ours, 1),
                 general_to,
             );
         }
         thread::sleep(INTRO_INTERVAL);
     }
+    let sequence = shared
+        .signaling_sequence
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     send(
         general,
-        wire::signaling_mac_style(shared.identity, 0),
+        &wire::signaling_mac_style(shared.identity, sequence),
         general_to,
     );
+}
 
-    let deadline = mono_now_ns() + ANNOUNCE_WAIT.as_nanos() as u64;
+/// Yields to the receiver's clock once it announces a better one, then
+/// watches for silence.
+fn watch(shared: &Shared, general: &UdpSocket) {
+    let config = &shared.config;
+    let general_to = SocketAddr::new(config.master, config.master_general_port);
+    let ours = wire::AnnounceBody::follower(config.identity);
     let mut yielded = false;
     while shared.running.load(Ordering::Acquire) {
-        if !yielded {
-            let announce = shared.state().announce;
-            if let Some(theirs) = announce {
-                yielded = true;
-                if theirs.rank() < ours.rank() {
-                    send(
-                        general,
-                        wire::signaling_initial_intervals(shared.identity, 1),
-                        general_to,
-                    );
-                } else {
-                    tracing::warn!(
-                        their_priority1 = theirs.priority1,
-                        our_priority1 = ours.priority1,
-                        "PTP: the speaker's clock ranks below ours; it may not act as the grandmaster"
-                    );
-                }
-            } else if mono_now_ns() >= deadline {
-                yielded = true;
-                tracing::debug!(
-                    "PTP: no Announce from the speaker yet; listening for Syncs anyway"
+        let announce = shared.state().announce;
+        if let (false, Some(theirs)) = (yielded, announce) {
+            yielded = true;
+            if theirs.rank() < ours.rank() {
+                let sequence = shared
+                    .signaling_sequence
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+                send(
+                    general,
+                    &wire::signaling_initial_intervals(shared.identity, sequence),
+                    general_to,
+                );
+            } else {
+                tracing::warn!(
+                    their_priority1 = theirs.priority1,
+                    our_priority1 = ours.priority1,
+                    "PTP: the speaker's clock ranks below ours; it may not act as the grandmaster"
                 );
             }
         }

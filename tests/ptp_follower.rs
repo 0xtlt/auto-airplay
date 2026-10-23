@@ -14,11 +14,11 @@
 //! HomePods (where port 320 can be bound: upstream always sends there). The
 //! estimator and the clock model are tested on their own.
 
-use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+#[path = "support/grandmaster.rs"]
+mod grandmaster;
+
+use std::net::UdpSocket;
+use std::thread;
 use std::time::Duration;
 
 use airplay_audio::timeline::mono_now_ns;
@@ -27,277 +27,7 @@ use airplay_client::ptp_follower::{
     ClockModel, DIVERGENCE_LIMIT_NS, FOLLOWER_PRIORITY1, FollowerConfig, ModelUpdate,
     OffsetEstimator, PtpFollower, SLEW_PPM,
 };
-
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-/// A HomePod's clock identity (from upstream's capture notes).
-const GM_IDENTITY: [u8; 8] = [0x14, 0x14, 0x7d, 0xe8, 0x54, 0x98, 0x00, 0x08];
-/// Grandmaster time minus local time at the start: about 11 days of uptime.
-const GM_BASE_NS: i128 = 987_654_321_000_000;
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How the fake grandmaster behaves; tests change it while it runs.
-#[derive(Debug, Clone)]
-struct Behaviour {
-    /// Its clock runs this fast (ppm) against the local monotonic clock.
-    ppm: f64,
-    /// Added to its clock (a step).
-    step_ns: i128,
-    identity: [u8; 8],
-    priority1: u8,
-    /// One-way delay of every message, each way.
-    delay: Duration,
-    /// Every n-th Sync and Delay_Req (0: none) is held up by `spike` more.
-    spike_every: u32,
-    spike: Duration,
-    /// Answer Delay_Req at all.
-    answer_delay_req: bool,
-    /// Send nothing at all.
-    silent: bool,
-}
-
-impl Default for Behaviour {
-    fn default() -> Self {
-        Self {
-            ppm: 0.0,
-            step_ns: 0,
-            identity: GM_IDENTITY,
-            priority1: 248,
-            delay: Duration::from_micros(300),
-            spike_every: 0,
-            spike: Duration::ZERO,
-            answer_delay_req: true,
-            silent: false,
-        }
-    }
-}
-
-struct Clock {
-    start_ns: u64,
-}
-
-impl Clock {
-    /// Grandmaster time at local time `local_ns`.
-    fn master_ns(&self, behaviour: &Behaviour, local_ns: u64) -> i128 {
-        let elapsed = i128::from(local_ns - self.start_ns);
-        GM_BASE_NS
-            + i128::from(local_ns)
-            + (elapsed as f64 * behaviour.ppm / 1e6) as i128
-            + behaviour.step_ns
-    }
-}
-
-/// A grandmaster on the loopback interface, the way a HomePod behaves with a
-/// Mac: Announce every 250 ms, two-step Sync every 125 ms, Delay_Resp for
-/// every Delay_Req, all sent to the follower's ports.
-struct FakeGrandmaster {
-    event_addr: SocketAddr,
-    general_addr: SocketAddr,
-    behaviour: Arc<Mutex<Behaviour>>,
-    clock: Arc<Clock>,
-    received: Arc<Mutex<Vec<(SocketAddr, Message)>>>,
-    follower: Arc<Mutex<Option<(SocketAddr, SocketAddr)>>>,
-    running: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl FakeGrandmaster {
-    fn start(behaviour: Behaviour) -> Self {
-        let event = UdpSocket::bind((LOCALHOST, 0)).unwrap();
-        let general = UdpSocket::bind((LOCALHOST, 0)).unwrap();
-        event
-            .set_read_timeout(Some(Duration::from_millis(1)))
-            .unwrap();
-        general.set_nonblocking(true).unwrap();
-        let mut gm = Self {
-            event_addr: event.local_addr().unwrap(),
-            general_addr: general.local_addr().unwrap(),
-            behaviour: Arc::new(Mutex::new(behaviour)),
-            clock: Arc::new(Clock {
-                start_ns: mono_now_ns(),
-            }),
-            received: Arc::default(),
-            follower: Arc::default(),
-            running: Arc::new(AtomicBool::new(true)),
-            thread: None,
-        };
-        let behaviour = Arc::clone(&gm.behaviour);
-        let clock = Arc::clone(&gm.clock);
-        let received = Arc::clone(&gm.received);
-        let follower = Arc::clone(&gm.follower);
-        let running = Arc::clone(&gm.running);
-        gm.thread = Some(thread::spawn(move || {
-            run_grandmaster(
-                &event, &general, &behaviour, &clock, &received, &follower, &running,
-            )
-        }));
-        gm
-    }
-
-    /// A follower configured to talk to this grandmaster.
-    fn follower_config(&self) -> FollowerConfig {
-        FollowerConfig {
-            local_event_port: 0,
-            local_general_port: 0,
-            master_event_port: self.event_addr.port(),
-            master_general_port: self.general_addr.port(),
-            ..FollowerConfig::new(LOCALHOST)
-        }
-    }
-
-    fn start_follower(&self) -> PtpFollower {
-        self.start_follower_with(self.follower_config())
-    }
-
-    fn start_follower_with(&self, config: FollowerConfig) -> PtpFollower {
-        let follower = PtpFollower::start(config).unwrap();
-        // It listens on all addresses; reach it on the loopback one.
-        let event = SocketAddr::new(LOCALHOST, follower.event_addr().port());
-        let general = SocketAddr::new(LOCALHOST, follower.general_addr().port());
-        *self.follower.lock().unwrap() = Some((event, general));
-        follower
-    }
-
-    fn change(&self, change: impl FnOnce(&mut Behaviour)) {
-        change(&mut self.behaviour.lock().unwrap());
-    }
-
-    /// Grandmaster time now.
-    fn now_ns(&self) -> i128 {
-        let behaviour = self.behaviour.lock().unwrap().clone();
-        self.clock.master_ns(&behaviour, mono_now_ns())
-    }
-
-    fn received(&self) -> Vec<(SocketAddr, Message)> {
-        self.received.lock().unwrap().clone()
-    }
-}
-
-impl Drop for FakeGrandmaster {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_grandmaster(
-    event: &UdpSocket,
-    general: &UdpSocket,
-    behaviour: &Mutex<Behaviour>,
-    clock: &Clock,
-    received: &Mutex<Vec<(SocketAddr, Message)>>,
-    follower: &Mutex<Option<(SocketAddr, SocketAddr)>>,
-    running: &AtomicBool,
-) {
-    // (local send time, use the event socket, packet, destination is general)
-    let mut queue: VecDeque<(u64, bool, Vec<u8>, bool)> = VecDeque::new();
-    let mut next_sync = mono_now_ns();
-    let mut next_announce = mono_now_ns();
-    let mut sync_sequence = 0u16;
-    let mut announce_sequence = 0u16;
-    let mut spike_counter = 0u32;
-    let mut buffer = [0u8; 512];
-
-    while running.load(Ordering::Acquire) {
-        let now = mono_now_ns();
-        let current = behaviour.lock().unwrap().clone();
-        let source = PortIdentity {
-            clock: current.identity,
-            port: 1,
-        };
-        let delay = current.delay.as_nanos() as u64;
-        let mut spike = || {
-            spike_counter += 1;
-            if current.spike_every > 0 && spike_counter.is_multiple_of(current.spike_every) {
-                current.spike.as_nanos() as u64
-            } else {
-                0
-            }
-        };
-
-        if !current.silent && now >= next_sync {
-            next_sync += 125_000_000;
-            sync_sequence = sync_sequence.wrapping_add(1);
-            // Leaves now; the network holds both the Sync and its Follow_Up.
-            let sent = clock.master_ns(&current, now);
-            let arrives = now + delay + spike();
-            queue.push_back((
-                arrives,
-                true,
-                wire::sync(source, sync_sequence, true, 0),
-                false,
-            ));
-            queue.push_back((
-                arrives,
-                false,
-                wire::follow_up(source, sync_sequence, sent as u128, 0),
-                true,
-            ));
-        }
-        if !current.silent && now >= next_announce {
-            next_announce += 250_000_000;
-            announce_sequence = announce_sequence.wrapping_add(1);
-            let body = AnnounceBody {
-                priority1: current.priority1,
-                priority2: 239,
-                clock_accuracy: 0x21,
-                variance: 17258,
-                ..AnnounceBody::follower(current.identity)
-            };
-            queue.push_back((
-                now + delay,
-                false,
-                wire::announce(source, announce_sequence, &body, -2),
-                true,
-            ));
-        }
-
-        let destinations = *follower.lock().unwrap();
-        while queue.front().is_some_and(|&(at, ..)| at <= mono_now_ns()) {
-            let (_, from_event, packet, to_general) = queue.pop_front().unwrap();
-            if let Some((follower_event, follower_general)) = destinations {
-                let socket = if from_event { event } else { general };
-                let to = if to_general {
-                    follower_general
-                } else {
-                    follower_event
-                };
-                let _ = socket.send_to(&packet, to);
-            }
-        }
-        // Keep the queue in send order (spikes hold up what follows).
-        let mut sorted: Vec<_> = queue.drain(..).collect();
-        sorted.sort_by_key(|&(at, ..)| at);
-        queue.extend(sorted);
-
-        for (socket, is_event) in [(event, true), (general, false)] {
-            let Ok((length, from)) = socket.recv_from(&mut buffer) else {
-                continue;
-            };
-            let arrived = mono_now_ns();
-            let Some(message) = wire::parse(&buffer[..length]) else {
-                continue;
-            };
-            if is_event
-                && let Message::DelayReq { header, .. } = &message
-                && current.answer_delay_req
-                && !current.silent
-            {
-                // It reached us `delay` (plus any spike) after it left.
-                let reached = clock.master_ns(&current, arrived + delay + spike());
-                queue.push_back((
-                    arrived,
-                    false,
-                    wire::delay_resp(source, header.sequence, reached as u128, header.source, 0),
-                    true,
-                ));
-            }
-            received.lock().unwrap().push((from, message));
-        }
-    }
-}
+use grandmaster::{Behaviour, FakeGrandmaster, GM_IDENTITY, LOCALHOST, LOCK_TIMEOUT};
 
 /// How far the follower's clock is from the grandmaster's, in ms, worst of a
 /// few readings over `over`.
@@ -322,7 +52,10 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn wait_locked(follower: &PtpFollower) {
     if let Err(error) = runtime().block_on(follower.wait_until_locked(LOCK_TIMEOUT)) {
-        panic!("the follower never locked: {error} ({:?})", follower.status());
+        panic!(
+            "the follower never locked: {error} ({:?})",
+            follower.status()
+        );
     }
 }
 
@@ -430,7 +163,9 @@ fn reports_a_silent_grandmaster() {
     wait_locked(&follower);
     gm.change(|behaviour| behaviour.silent = true);
     thread::sleep(Duration::from_millis(1_500));
-    let lost = follower.lost().expect("a silent grandmaster must be reported");
+    let lost = follower
+        .lost()
+        .expect("a silent grandmaster must be reported");
     assert!(lost.contains("no PTP Sync"), "{lost}");
     assert!(!follower.is_locked());
 }
@@ -566,7 +301,11 @@ fn estimator_forgets_samples_outside_its_window() {
     estimator.add_forward(6_000_000_000, 6_000_000_000 + 50);
     assert_eq!(estimator.forward_samples(), 1);
     assert_eq!(estimator.estimate().unwrap().offset_ns, 50);
-    assert!(OffsetEstimator::new(Duration::from_secs(1)).estimate().is_none());
+    assert!(
+        OffsetEstimator::new(Duration::from_secs(1))
+            .estimate()
+            .is_none()
+    );
 }
 
 #[test]
@@ -623,11 +362,15 @@ fn wire_round_trips() {
     let requester = port([1, 2, 3, 4, 5, 6, 7, 8]);
     let time = 188_748_500_000_123u128;
 
-    let Some(Message::Sync { header, origin_ns }) = wire::parse(&wire::sync(source, 7, false, time))
+    let Some(Message::Sync { header, origin_ns }) =
+        wire::parse(&wire::sync(source, 7, false, time))
     else {
         panic!("not a Sync")
     };
-    assert_eq!((header.sequence, header.source, origin_ns), (7, source, time));
+    assert_eq!(
+        (header.sequence, header.source, origin_ns),
+        (7, source, time)
+    );
     assert_eq!(header.flags & wire::TWO_STEP, 0);
 
     let Some(Message::FollowUp {
@@ -648,7 +391,10 @@ fn wire_round_trips() {
     else {
         panic!("not a Delay_Resp")
     };
-    assert_eq!((header.sequence, receive_ns, requesting), (9, time, requester));
+    assert_eq!(
+        (header.sequence, receive_ns, requesting),
+        (9, time, requester)
+    );
     assert_eq!(header.correction_ns(), -5);
 
     let body = AnnounceBody::follower(GM_IDENTITY);
@@ -670,7 +416,10 @@ fn timestamps_use_48_bit_seconds() {
     let mut out = Vec::new();
     let time = (0x1234_5678_9ABCu128) * 1_000_000_000 + 999_999_999;
     wire::write_timestamp(&mut out, time);
-    assert_eq!(out, [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0x3B, 0x9A, 0xC9, 0xFF]);
+    assert_eq!(
+        out,
+        [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0x3B, 0x9A, 0xC9, 0xFF]
+    );
     assert_eq!(wire::read_timestamp(&out), time);
 }
 

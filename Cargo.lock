@@ -57,6 +57,7 @@ dependencies = [
  "alac-encoder",
  "async-trait",
  "biquad",
+ "chacha20poly1305",
  "crossbeam-channel",
  "fdk-aac",
  "futures",

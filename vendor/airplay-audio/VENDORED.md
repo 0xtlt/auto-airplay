@@ -58,3 +58,18 @@ way to change it from outside, so it is vendored like `vendor/airplay-client`.
    last: the join never returned. The sender thread now exits on a shared flag
    (`sender_running`), `run_streamer` checks the cached state first, and `stop`
    aborts the producer task before joining the thread.
+4. **Buffered streams (type 103) over TCP.** New module `src/buffered.rs`, no
+   upstream code changed. `BufferedStreamer` takes a `LiveAudioDecoder`,
+   resamples to 44.1 kHz, encodes AAC-LC at 256 kbps (fdk-aac, raw access
+   units of 1024 frames) and sends each one as soon as it is encoded on the
+   receiver's TCP data port: a 2-byte big-endian length, `0x80`, a 24-bit
+   sequence number, the RTP timestamp, the SSRC (`0x16000000`, which Apple
+   senders use for AAC-LC 44.1 kHz stereo), the payload sealed with
+   ChaCha20-Poly1305 under the stream key (timestamp and SSRC as additional
+   data), the tag and an 8-byte nonce that counts packets (it never repeats,
+   unlike the realtime path's sequence-number nonce). Encoding and writing run
+   on two threads with a 512-packet queue between them, so a stalled
+   connection never holds up the encoder; a write blocked for 10 s fails the
+   stream, and the failure keeps its I/O error kind. Adds a direct
+   `chacha20poly1305` dependency (already in the tree through
+   `airplay-crypto`).

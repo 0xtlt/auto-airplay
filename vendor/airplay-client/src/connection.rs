@@ -25,6 +25,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
 
+// Local addition: buffered streams (type 103), see `connection/buffered.rs`.
+mod buffered;
+
 /// Generate a random MAC-like device ID for the client.
 fn generate_device_id() -> String {
     use rand::Rng;
@@ -228,6 +231,15 @@ pub struct Connection {
     eq_params: Option<Arc<EqParams>>,
     /// Stream statistics (shared with control channel threads).
     stream_stats: Arc<crate::stats::StreamStats>,
+    /// Local addition: the PTP follower of a buffered stream.
+    ptp_follower: Option<crate::ptp_follower::PtpFollower>,
+    /// Local addition: where the PTP follower talks (tests change it).
+    ptp_config: Option<crate::ptp_follower::FollowerConfig>,
+    /// Local addition: the sender of a buffered stream.
+    buffered: Option<airplay_audio::BufferedStreamer>,
+    /// Local addition: how long before it plays a buffered stream's audio is
+    /// sent (the receiver holds that much).
+    buffered_latency: std::time::Duration,
 }
 
 impl Connection {
@@ -351,6 +363,10 @@ impl Connection {
             eq_config: None,
             eq_params: None,
             stream_stats: crate::stats::StreamStats::new(),
+            ptp_follower: None,
+            ptp_config: None,
+            buffered: None,
+            buffered_latency: buffered::DEFAULT_LATENCY,
         })
     }
 
@@ -522,6 +538,10 @@ impl Connection {
             eq_config: None,
             eq_params: None,
             stream_stats: crate::stats::StreamStats::new(),
+            ptp_follower: None,
+            ptp_config: None,
+            buffered: None,
+            buffered_latency: buffered::DEFAULT_LATENCY,
         })
     }
 
@@ -729,6 +749,10 @@ impl Connection {
             eq_config: None,
             eq_params: None,
             stream_stats: crate::stats::StreamStats::new(),
+            ptp_follower: None,
+            ptp_config: None,
+            buffered: None,
+            buffered_latency: buffered::DEFAULT_LATENCY,
         })
     }
 
@@ -740,6 +764,10 @@ impl Connection {
 
     /// Complete RTSP SETUP phases (called before streaming).
     pub async fn setup(&mut self) -> Result<()> {
+        // Local addition: buffered streams set up their own way.
+        if self.stream_config.stream_type == airplay_core::StreamType::Buffered {
+            return self.setup_buffered().await;
+        }
         tracing::info!(
             "RTSP setup start (stream_type={:?}, timing={:?})",
             self.stream_config.stream_type,
@@ -1010,6 +1038,13 @@ impl Connection {
         if let Some(ref mut streamer) = self.streamer {
             streamer.stop().await?;
         }
+        // Local addition: a buffered stream and its PTP follower.
+        if let Some(mut streamer) = self.buffered.take() {
+            streamer.stop();
+        }
+        if let Some(mut follower) = self.ptp_follower.take() {
+            follower.stop();
+        }
 
         if let Some(task) = self.timing_task.take() {
             task.abort();
@@ -1250,6 +1285,10 @@ impl Connection {
     /// This is similar to `start_streaming()` but uses a `LiveAudioDecoder` that
     /// receives PCM frames from a channel, enabling streaming from external sources.
     pub async fn start_streaming_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
+        // Local addition: a buffered stream goes over TCP, see `buffered.rs`.
+        if self.stream_config.stream_type == airplay_core::StreamType::Buffered {
+            return self.start_streaming_buffered(live_decoder).await;
+        }
         // Ensure setup is complete
         if self.session.state() != SessionState::Ready {
             self.setup().await?;
@@ -1408,6 +1447,11 @@ impl Connection {
 
     /// Stop streaming.
     pub async fn stop(&mut self) -> Result<()> {
+        // Local addition: a buffered stream is torn down on its own.
+        if self.stream_config.stream_type == airplay_core::StreamType::Buffered {
+            self.stop_buffered().await;
+            return Ok(());
+        }
         if let Some(ref mut streamer) = self.streamer {
             streamer.stop().await?;
         }
@@ -1433,6 +1477,9 @@ impl Connection {
 
     /// Get the total packets sent by this connection's streamer (0 if no streamer).
     pub fn streamer_packets_sent(&self) -> u64 {
+        if let Some(ref buffered) = self.buffered {
+            return buffered.stats().sent;
+        }
         self.streamer.as_ref().map_or(0, |s| s.packets_sent())
     }
 
@@ -1491,6 +1538,9 @@ impl Connection {
     /// AirPlay 2 receivers expect periodic feedback requests (~every 2 seconds).
     /// Call this from your playback loop to maintain the session.
     pub async fn send_feedback(&mut self) -> Result<()> {
+        // Local addition: a failed buffered stream or a lost PTP clock fails
+        // the feedback, which is how the caller watches the session.
+        self.buffered_health()?;
         let uri = self.session.request_uri();
         let req = RtspRequest::feedback(uri);
         match tokio::time::timeout(std::time::Duration::from_secs(2), self.rtsp.send(req)).await {

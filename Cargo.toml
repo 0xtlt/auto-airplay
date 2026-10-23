@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 airplay-client = { path = "vendor/airplay-client" }
 airplay-core = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
-airplay-audio = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+airplay-audio = { path = "vendor/airplay-audio" }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

@@ -230,7 +230,7 @@ Do not commit a real configuration file. Common secret and configuration filenam
 ## Development
 
 ```bash
-cargo fmt --all -- --check # vendor/airplay-client is excluded via its rustfmt.toml
+cargo fmt --all -- --check # the crates in vendor/ are excluded via their rustfmt.toml
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
@@ -249,4 +249,4 @@ Pushing a version tag such as `v0.1.0` builds checksum-protected ARM64 and ARMv7
 
 ## License and acknowledgements
 
-GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`.
+GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`. The `airplay-audio` crate is vendored the same way in [`vendor/airplay-audio`](vendor/airplay-audio/VENDORED.md).

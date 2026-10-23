@@ -138,6 +138,8 @@ Each second, the sender tells the speaker in a sync packet when a given RTP time
 
 Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
 
+`cargo test --test sender_timing -- --nocapture` measures this against the pinned upstream sender and prints the comparison.
+
 ## Speaker volume
 
 `auto-airplay` never changes the speaker volume: not on the first connection, not when it re-acquires the speaker after silence, not after an automatic reconnect, a process recycle, or a restart caused by a configuration change. Set the volume on the speaker, the iPhone, or the Home app and it is kept. `auto-airplay output test` also plays at the speaker's current volume.

@@ -5,7 +5,7 @@
 //! difference of the two timestamps as the latency they must buffer
 //! (shairport-sync: `sync_rtp_timestamp - rtp_timestamp_less_latency`);
 //! iTunes sends 88200 frames, OwnTone and pyatv their own buffer. Bytes 2-3
-//! are not a sequence number: every sender writes 7 there.
+//! carry 7, as in other senders' sync packets.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -66,9 +66,7 @@ fn bytes_4_to_7_wrap_at_the_start_of_a_stream() {
 #[test]
 fn bytes_2_and_3_are_7_in_every_sync_packet() {
     // iTunes, OwnTone, pyatv and libraop send 7 there in every sync packet;
-    // shairport-sync reads 7 as "add 11025 frames of latency". Upstream sent
-    // a counter: the 8th sync packet (counter 7) announced 250 ms more than
-    // the others.
+    // upstream sent a counter of sync packets.
     let mut sender = sender();
     for n in 0..300_u32 {
         let packet = sender

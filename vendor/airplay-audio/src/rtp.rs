@@ -376,15 +376,14 @@ const PACKET_HISTORY_SIZE: usize = 512;
 
 /// Local patch: bytes 2-3 of every NTP sync packet (PT=84).
 ///
-/// Not a sequence number: iTunes and Apple Music, OwnTone, pyatv and libraop
-/// (AirConnect) all send 7 in every sync packet ("seems that seq=7 shall be
-/// forced", libraop). shairport-sync, which mimics Apple receivers, reads the
-/// field as flags: with 7 it adds a fixed 11025-frame latency to the one the
-/// packet announces. Upstream sent a counter, so a receiver reading the field
-/// that way saw the latency change on the 8th sync packet (counter 7) and
-/// change back on the 9th: the playback point moved 250 ms, then back.
-/// OwnTone found that AirPlay 2 receivers do not take the latency from this
-/// field; 7 is the value they are known to work with.
+/// iTunes and Apple Music, OwnTone, pyatv and libraop (AirConnect: "seems
+/// that seq=7 shall be forced") all send 7 in every sync packet; upstream
+/// sent a counter of sync packets. 7 only aligns this sender with those known
+/// to work with HomePods: what a HomePod does with the field is not known.
+/// shairport-sync reads 7 as "add 11025 frames of latency", but adds them
+/// anyway for senders that announce AirPlay 371 or later, as this one does
+/// (`AirPlay/745.83`), so the value changes nothing there; OwnTone found that
+/// AirPlay 2 receivers do not take the latency from it.
 const NTP_SYNC_BYTES_2_3: u16 = 7;
 
 /// RTP sender over UDP.
@@ -645,8 +644,8 @@ impl RtpSender {
             0x80
         };
         packet[1] = 0xd4;
-        // Local patch: a constant, as every AirPlay sender writes it. Upstream
-        // wrote the sync counter here. (The counter still gates the logs.)
+        // Local patch: 7, as other AirPlay senders write it. Upstream wrote
+        // the sync counter here. (The counter still gates the logs.)
         packet[2..4].copy_from_slice(&NTP_SYNC_BYTES_2_3.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
         // RTP timestamps wrap: so does this one, near the start of a stream.
@@ -1275,8 +1274,8 @@ mod tests {
 
         #[test]
         fn every_sync_carries_7_in_bytes_2_and_3() {
-            // Local patch: upstream counted syncs in these bytes; the 8th one
-            // carried 7, which shairport-sync reads as "add 11025 frames".
+            // Local patch: upstream counted sync packets in these bytes; other
+            // AirPlay senders always write 7.
             let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
             let mut sender = RtpSender::new(addr, 0xABCD);
             sender.set_control_dest("127.0.0.1:5001".parse().unwrap());

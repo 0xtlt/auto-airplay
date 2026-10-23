@@ -77,15 +77,16 @@ way to change it from outside, so it is vendored like `vendor/airplay-client`.
    `prepare_sync` builds, as `send_ptp_sync` does. PTP sync packets keep
    their format and announce when the packet plays.
 5. **Sync packets carry 7 in bytes 2-3.** Upstream wrote a counter of sync
-   packets there. Every other sender writes a constant: 7 for iTunes and
-   Apple Music, OwnTone, pyatv and libraop (AirConnect: "seems that seq=7
-   shall be forced"). shairport-sync, which mimics Apple receivers, reads the
-   field as flags and adds a fixed 11025 frames to the announced latency when
-   it is 7: with the counter, the 8th sync packet (counter 7) moved the
-   playback point 250 ms and the 9th moved it back. OwnTone found that
-   AirPlay 2 receivers do not take the latency from this field. `prepare_sync`
-   writes 7 (`NTP_SYNC_BYTES_2_3`); the counter still limits the first-syncs
-   log. PTP sync packets (not used for live streaming) are unchanged.
+   packets there; iTunes and Apple Music, OwnTone, pyatv and libraop
+   (AirConnect: "seems that seq=7 shall be forced") all write 7. The change
+   only aligns this sender with those known to work with HomePods: what a
+   HomePod does with the field is not known. shairport-sync reads 7 as "add
+   11025 frames of latency" but adds them anyway for senders that announce
+   AirPlay 371 or later, as this one does (`AirPlay/745.83`); OwnTone found
+   that AirPlay 2 receivers do not take the latency from the field.
+   `prepare_sync` writes 7 (`NTP_SYNC_BYTES_2_3`); the counter still limits
+   the first-syncs log. PTP sync packets (not used for live streaming) are
+   unchanged.
 6. **Output counters.** `AudioStreamer::take_output_stats` returns what the
    sender did since the previous call (`OutputStats`, exported): packets sent,
    those sent more than a packet late and the largest lateness; retransmit

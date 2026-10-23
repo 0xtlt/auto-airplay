@@ -4,7 +4,7 @@ use airplay_core::{StreamConfig, error::Result};
 use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
 use crate::eq::{EqConfig, EqParams, Equalizer};
-use crate::timeline::{mono_now_ns, wall_minus_mono_ns, Timeline, SENDER_QUEUE};
+use crate::timeline::{announced_latency, mono_now_ns, wall_minus_mono_ns, Timeline, SENDER_QUEUE};
 use airplay_timing::{ClockOffset, unix_to_ntp};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering}};
 use tokio::sync::{Mutex, watch};
@@ -295,9 +295,9 @@ struct StreamerInner {
     equalizer: Option<Equalizer>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
-    /// Render delay in nanoseconds added to NTP timestamps in sync packets.
-    /// Tells the receiver to render audio this far in the future, giving more
-    /// time for retransmit recovery of lost packets.
+    /// Render delay in nanoseconds: how long after it is sent a packet plays.
+    /// Gives time for retransmit recovery of lost packets. Local patch: sync
+    /// packets announce it as the stream's latency (see `timeline`).
     render_delay_ns: u64,
     /// Whether to use PTP-mode sync packets (PT=87) instead of NTP (PT=84).
     use_ptp_sync: bool,
@@ -403,9 +403,11 @@ impl AudioStreamer {
 
     /// Set render delay in milliseconds.
     ///
-    /// This shifts NTP timestamps in sync packets into the future, telling
-    /// the receiver to buffer audio longer before rendering. This gives more
-    /// time for retransmit recovery of lost packets.
+    /// Local patch: sync packets announce it as the latency (bytes 4-7: the
+    /// RTP timestamp minus the latency), within the stream's `latency_min` and
+    /// `latency_max`. The receiver buffers audio that long before rendering
+    /// it, which gives time for retransmit recovery of lost packets. Upstream
+    /// moved the NTP time of sync packets into the future instead.
     pub async fn set_render_delay_ms(&mut self, delay_ms: u32) {
         let delay_ns = delay_ms as u64 * 1_000_000;
         self.inner.lock().await.render_delay_ns = delay_ns;
@@ -895,17 +897,27 @@ async fn run_streamer(
         set_realtime_priority();
     }
 
-    // Local patch: the stream's timeline sets when each packet is sent and
-    // the time its sync packet announces (see `timeline`).
+    // Local patch: the stream's timeline sets when each packet is sent; sync
+    // packets announce the render delay as the stream latency, and each
+    // packet plays that long after it is sent (see `timeline`).
     let mut timeline = {
         let guard = inner.lock().await;
-        let format = &guard.config.audio_format;
-        Timeline::new(
-            format.sample_rate.as_hz(),
-            format.frames_per_packet,
+        let config = &guard.config;
+        let rate = config.audio_format.sample_rate.as_hz();
+        let latency = announced_latency(
             Duration::from_nanos(guard.render_delay_ns),
-        )
+            rate,
+            config.latency_min,
+            config.latency_max,
+        );
+        Timeline::new(rate, latency)
     };
+    let latency_frames = timeline.latency_frames();
+    tracing::info!(
+        latency_frames,
+        latency_ms = timeline.margin() as f64 / 1e6,
+        "AirPlay sync packets announce the stream latency: each packet plays this long after it is sent"
+    );
     // Without the sender thread: when the next packet is due.
     let mut fallback_next_ns: Option<u64> = None;
     // Late packets reported so far, and when the next report may be logged.
@@ -1072,14 +1084,18 @@ async fn run_streamer(
                     }
                 };
 
-                // The anchor: when the packet's first frame plays, on the wall
-                // clock the timing server reports. It is the deadline plus the
-                // margin upstream had on average (the render delay minus the
-                // packets queued ahead of the sender thread), so the latency
-                // is unchanged; only the noise is gone.
-                let render_adjusted =
-                    (slot.anchor_ns + wall_minus_mono_ns() + i128::from(offset_ns)).max(0) as u64;
-                let ntp = unix_to_ntp(render_adjusted);
+                // Local patch: an NTP sync packet goes out with the packet, at
+                // its deadline, and carries that time (on the wall clock the
+                // timing server reports) with the latency: bytes 4-7 name the
+                // frame that plays then, `latency_frames` before the packet's
+                // first one. So the packet plays the latency after it is sent,
+                // and the receiver knows how much audio it holds. Upstream
+                // announced a latency of zero and moved the time forward.
+                let wall_offset_ns = wall_minus_mono_ns() + i128::from(offset_ns);
+                let ntp = unix_to_ntp((i128::from(slot.deadline_ns) + wall_offset_ns).max(0) as u64);
+                // PTP sync packets (not used for live streaming) announce when
+                // the packet plays: its anchor.
+                let render_adjusted = (slot.anchor_ns + wall_offset_ns).max(0) as u64;
 
                 // Set marker bit on first audio packet (required by some receivers)
                 let first_packet = !guard.first_packet_sent;
@@ -1108,7 +1124,7 @@ async fn run_streamer(
                                 let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
                                 guard.rtp_senders[0].prepare_ptp_sync(rtp_ts, render_adjusted, next_rtp_ts, &ptp_clock_id)?
                             } else {
-                                guard.rtp_senders[0].prepare_sync(rtp_ts, ntp)?
+                                guard.rtp_senders[0].prepare_sync(rtp_ts, latency_frames, ntp)?
                             }
                         } else {
                             None
@@ -1182,7 +1198,7 @@ async fn run_streamer(
                                 let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
                                 guard.rtp_senders[0].send_ptp_sync(rtp_ts, render_adjusted, next_rtp_ts, &ptp_clock_id)?;
                             } else {
-                                guard.rtp_senders[0].send_sync(rtp_ts, ntp)?;
+                                guard.rtp_senders[0].send_sync(rtp_ts, latency_frames, ntp)?;
                             }
                         }
 

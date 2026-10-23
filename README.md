@@ -134,7 +134,9 @@ bt_input stats: losses_per_min=2 concealed_per_min=2 concealed_ms=340 buffer_fil
 
 ## AirPlay timing
 
-Each second, the sender tells the speaker in a sync packet when a given RTP timestamp must play, and the speaker plays the stream at the rate consecutive sync packets imply. `auto-airplay` derives both the time each packet is sent and the time each sync packet announces from the position in the stream, never from the moment the packet was prepared: decoding, encoding and scheduling delays change neither, so the speaker sees a steady clock and never has to speed up or slow down. Audio is announced to play `output.render_delay_ms` minus the 10 packets (about 80 ms) queued ahead of the sending thread after it is sent: about 170 ms with the default 250.
+Each second, the sender tells the speaker in a sync packet when a given RTP timestamp must play, and the speaker plays the stream at the rate consecutive sync packets imply. `auto-airplay` derives both the time each packet is sent and the time each sync packet announces from the position in the stream, never from the moment the packet was prepared: decoding, encoding and scheduling delays change neither, so the speaker sees a steady clock and never has to speed up or slow down.
+
+The sync packet also announces the latency, the audio the speaker must hold: it goes out with an audio packet, carries the time it is sent, the packet's RTP timestamp, and that timestamp minus the latency (bytes 4-7), as iTunes and other AirPlay senders do. The latency is `output.render_delay_ms` (default 250 ms, 11025 frames at 44.1 kHz), kept between the minimum and maximum the stream declares when it is set up (250 ms and 2 s). Each packet therefore plays that long after it is sent, plus the speaker's own fixed delay.
 
 Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
 

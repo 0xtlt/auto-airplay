@@ -24,8 +24,9 @@ use std::time::Duration;
 use airplay_audio::timeline::mono_now_ns;
 use airplay_client::ptp_follower::wire::{self, AnnounceBody, Message, PortIdentity};
 use airplay_client::ptp_follower::{
-    ClockModel, DIVERGENCE_LIMIT_NS, FOLLOWER_PRIORITY1, FollowerConfig, ModelUpdate,
-    OffsetEstimator, PtpFollower, SLEW_PPM,
+    ClockModel, DIVERGENCE_LIMIT_NS, FOLLOWER_PRIORITY1, FollowerConfig, ForwardSample,
+    ModelUpdate, OffsetEstimator, PAIR_TIMEOUT, PENDING_LIMIT, PairKey, PtpFollower, SLEW_PPM,
+    SyncPairer,
 };
 use grandmaster::{Behaviour, FakeGrandmaster, GM_IDENTITY, LOCALHOST, LOCK_TIMEOUT};
 
@@ -286,6 +287,92 @@ fn does_not_take_a_grandmaster_that_ranks_below_it() {
         .filter(|(_, message)| matches!(message, Message::Signaling { .. }))
         .count();
     assert_eq!(yields, 1, "no yield Signaling to a worse clock");
+}
+
+// ----- Sync and Follow_Up in either order -----
+
+#[test]
+fn locks_when_follow_ups_overtake_their_syncs() {
+    // Every Follow_Up is handled 3 ms before its Sync: on two sockets read by
+    // two threads, that happens even on a perfect link.
+    let gm = FakeGrandmaster::start(Behaviour {
+        follow_up_first: true,
+        ..Behaviour::default()
+    });
+    let follower = gm.start_follower();
+    wait_locked(&follower);
+    let error = worst_error_ms(&gm, &follower, Duration::from_secs(1));
+    assert!(error < 2.0, "clock off by {error:.3} ms");
+    assert!(follower.status().delay_responses > 0);
+}
+
+fn key(clock: u8, domain: u8, sequence: u16) -> PairKey {
+    PairKey {
+        source: port([clock; 8]),
+        domain,
+        sequence,
+    }
+}
+
+#[test]
+fn pairer_matches_a_sync_and_its_follow_up_in_either_order() {
+    let expected = Some(ForwardSample {
+        received_ns: 5_000,
+        sent_ns: 9_000_000 + 30 + 40,
+    });
+    let mut sync_first = SyncPairer::default();
+    assert_eq!(sync_first.sync(key(1, 0, 7), 5_000, 30), None);
+    assert_eq!(
+        sync_first.follow_up(key(1, 0, 7), 6_000, 9_000_000, 40),
+        expected
+    );
+
+    let mut follow_up_first = SyncPairer::default();
+    assert_eq!(
+        follow_up_first.follow_up(key(1, 0, 7), 4_000, 9_000_000, 40),
+        None
+    );
+    assert_eq!(follow_up_first.sync(key(1, 0, 7), 5_000, 30), expected);
+    assert_eq!(follow_up_first.waiting(), (0, 0));
+}
+
+#[test]
+fn pairer_matches_on_port_domain_and_sequence() {
+    let mut pairer = SyncPairer::default();
+    assert_eq!(pairer.follow_up(key(1, 0, 7), 0, 1_000, 0), None);
+    // Another port, another domain, another sequence: no pair.
+    assert_eq!(pairer.sync(key(2, 0, 7), 10, 0), None);
+    assert_eq!(pairer.sync(key(1, 1, 7), 10, 0), None);
+    assert_eq!(pairer.sync(key(1, 0, 8), 10, 0), None);
+    assert_eq!(pairer.waiting(), (3, 1));
+    assert!(pairer.sync(key(1, 0, 7), 10, 0).is_some());
+    assert_eq!(pairer.waiting(), (3, 0));
+}
+
+#[test]
+fn pairer_forgets_what_waits_past_the_timeout() {
+    let timeout = PAIR_TIMEOUT.as_nanos() as u64;
+    let mut pairer = SyncPairer::default();
+    assert_eq!(pairer.follow_up(key(1, 0, 7), 1_000, 1_000, 0), None);
+    // Its Sync, too late: the Follow_Up is gone, the Sync waits instead.
+    assert_eq!(pairer.sync(key(1, 0, 7), 1_000 + timeout + 1, 0), None);
+    assert_eq!(pairer.waiting(), (1, 0));
+    // A Follow_Up after the timeout finds no Sync either.
+    assert_eq!(
+        pairer.follow_up(key(1, 0, 7), 2_000 + 2 * timeout, 1_000, 0),
+        None
+    );
+    assert_eq!(pairer.waiting(), (0, 1));
+}
+
+#[test]
+fn pairer_keeps_a_bounded_number_waiting() {
+    let mut pairer = SyncPairer::default();
+    for sequence in 0..(PENDING_LIMIT as u16 + 10) {
+        pairer.follow_up(key(1, 0, sequence), 0, 0, 0);
+        pairer.sync(key(2, 0, sequence), 0, 0);
+    }
+    assert_eq!(pairer.waiting(), (PENDING_LIMIT, PENDING_LIMIT));
 }
 
 // ----- estimator and clock model -----

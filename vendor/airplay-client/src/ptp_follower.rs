@@ -66,8 +66,14 @@ const ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
 const INTRO_INTERVAL: Duration = Duration::from_millis(125);
 /// Receive timeout of the socket threads, so they notice `stop`.
 const RECV_POLL: Duration = Duration::from_millis(100);
-/// Two-step Syncs and Delay_Reqs remembered while waiting for their pair.
-const PENDING_LIMIT: usize = 32;
+/// Syncs, Follow_Ups and Delay_Reqs remembered while waiting for their pair,
+/// at most.
+pub const PENDING_LIMIT: usize = 32;
+/// A Sync or Follow_Up waits this long for its pair, at most. A Follow_Up
+/// trails its Sync by milliseconds and the next pair comes 125 ms later;
+/// a whole second covers any reordering without mixing up sequence numbers
+/// (they wrap after hours).
+pub const PAIR_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// PTP messages: wire format (IEEE 1588-2008, the parts AirPlay uses).
 ///
@@ -624,6 +630,105 @@ impl ClockModel {
     }
 }
 
+/// What a two-step Sync and its Follow_Up are matched on: the clock port
+/// that sent them, the PTP domain and the sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairKey {
+    pub source: wire::PortIdentity,
+    pub domain: u8,
+    pub sequence: u16,
+}
+
+impl PairKey {
+    pub fn of(header: &wire::Header) -> Self {
+        Self {
+            source: header.source,
+            domain: header.domain,
+            sequence: header.sequence,
+        }
+    }
+}
+
+/// A Sync and its time, paired: received at local `received_ns`, sent at
+/// grandmaster time `sent_ns` (corrections included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardSample {
+    pub received_ns: u64,
+    pub sent_ns: i128,
+}
+
+/// Pairs two-step Syncs with their Follow_Ups, whichever is handled first.
+///
+/// They come on two sockets read by two threads: even in order on the wire,
+/// a Follow_Up can be handled before its Sync. Each waits for the other at
+/// most [`PAIR_TIMEOUT`], and at most [`PENDING_LIMIT`] of each wait.
+#[derive(Debug, Default)]
+pub struct SyncPairer {
+    /// Key, local receive time, correction (ns).
+    syncs: VecDeque<(PairKey, u64, i128)>,
+    /// Key, local time stored, precise origin, correction (ns).
+    follow_ups: VecDeque<(PairKey, u64, u128, i128)>,
+}
+
+impl SyncPairer {
+    /// A two-step Sync received at `received_ns`.
+    pub fn sync(
+        &mut self,
+        key: PairKey,
+        received_ns: u64,
+        correction_ns: i128,
+    ) -> Option<ForwardSample> {
+        self.expire(received_ns);
+        if let Some(index) = self.follow_ups.iter().position(|entry| entry.0 == key) {
+            let (_, _, origin, follow_up_correction) = self.follow_ups.remove(index)?;
+            return Some(ForwardSample {
+                received_ns,
+                sent_ns: origin as i128 + correction_ns + follow_up_correction,
+            });
+        }
+        if self.syncs.len() >= PENDING_LIMIT {
+            self.syncs.pop_front();
+        }
+        self.syncs.push_back((key, received_ns, correction_ns));
+        None
+    }
+
+    /// A Follow_Up handled at `now_ns`.
+    pub fn follow_up(
+        &mut self,
+        key: PairKey,
+        now_ns: u64,
+        precise_origin_ns: u128,
+        correction_ns: i128,
+    ) -> Option<ForwardSample> {
+        self.expire(now_ns);
+        if let Some(index) = self.syncs.iter().position(|entry| entry.0 == key) {
+            let (_, received_ns, sync_correction) = self.syncs.remove(index)?;
+            return Some(ForwardSample {
+                received_ns,
+                sent_ns: precise_origin_ns as i128 + sync_correction + correction_ns,
+            });
+        }
+        if self.follow_ups.len() >= PENDING_LIMIT {
+            self.follow_ups.pop_front();
+        }
+        self.follow_ups
+            .push_back((key, now_ns, precise_origin_ns, correction_ns));
+        None
+    }
+
+    /// Syncs and Follow_Ups waiting for their pair.
+    pub fn waiting(&self) -> (usize, usize) {
+        (self.syncs.len(), self.follow_ups.len())
+    }
+
+    fn expire(&mut self, now_ns: u64) {
+        let oldest = now_ns.saturating_sub(PAIR_TIMEOUT.as_nanos() as u64);
+        self.syncs.retain(|entry| entry.1 >= oldest);
+        self.follow_ups.retain(|entry| entry.1 >= oldest);
+    }
+}
+
 /// Where the follower talks PTP.
 #[derive(Debug, Clone)]
 pub struct FollowerConfig {
@@ -692,18 +797,11 @@ pub struct FollowerStatus {
     pub lost: Option<String>,
 }
 
-struct PendingSync {
-    sequence: u16,
-    source: wire::PortIdentity,
-    received_ns: u64,
-    correction_ns: i128,
-}
-
 #[derive(Default)]
 struct State {
     estimator: Option<OffsetEstimator>,
     model: ClockModel,
-    pending_syncs: VecDeque<PendingSync>,
+    pairer: SyncPairer,
     pending_delay_reqs: VecDeque<(u16, u64)>,
     delay_req_sequence: u16,
     announce: Option<wire::AnnounceBody>,
@@ -794,32 +892,32 @@ impl Shared {
         match message {
             wire::Message::Sync { header, origin_ns } => {
                 state.syncs += 1;
-                if header.flags & wire::TWO_STEP != 0 {
-                    if state.pending_syncs.len() >= PENDING_LIMIT {
-                        state.pending_syncs.pop_front();
-                    }
-                    state.pending_syncs.push_back(PendingSync {
-                        sequence: header.sequence,
-                        source: header.source,
-                        received_ns,
-                        correction_ns: header.correction_ns(),
-                    });
+                let sample = if header.flags & wire::TWO_STEP != 0 {
+                    state
+                        .pairer
+                        .sync(PairKey::of(&header), received_ns, header.correction_ns())
                 } else {
-                    let sent = origin_ns as i128 + header.correction_ns();
-                    self.forward_sample(&mut state, header.source, received_ns, sent, event);
+                    Some(ForwardSample {
+                        received_ns,
+                        sent_ns: origin_ns as i128 + header.correction_ns(),
+                    })
+                };
+                if let Some(sample) = sample {
+                    self.forward_sample(&mut state, &header, sample, event);
                 }
             }
             wire::Message::FollowUp {
                 header,
                 precise_origin_ns,
             } => {
-                let position = state.pending_syncs.iter().position(|sync| {
-                    sync.sequence == header.sequence && sync.source == header.source
-                });
-                if let Some(sync) = position.and_then(|index| state.pending_syncs.remove(index)) {
-                    let sent =
-                        precise_origin_ns as i128 + sync.correction_ns + header.correction_ns();
-                    self.forward_sample(&mut state, header.source, sync.received_ns, sent, event);
+                let sample = state.pairer.follow_up(
+                    PairKey::of(&header),
+                    received_ns,
+                    precise_origin_ns,
+                    header.correction_ns(),
+                );
+                if let Some(sample) = sample {
+                    self.forward_sample(&mut state, &header, sample, event);
                 }
             }
             wire::Message::DelayResp {
@@ -874,20 +972,19 @@ impl Shared {
     fn forward_sample(
         &self,
         state: &mut State,
-        source: wire::PortIdentity,
-        received_ns: u64,
-        sent_ns: i128,
+        header: &wire::Header,
+        sample: ForwardSample,
         event: &UdpSocket,
     ) {
-        state.first_follow_up_ns.get_or_insert(received_ns);
-        state.last_follow_up_ns = Some(received_ns);
-        state.sync_source.get_or_insert(source.clock);
+        state.sync_source.get_or_insert(header.source.clock);
+        state.first_follow_up_ns.get_or_insert(sample.received_ns);
+        state.last_follow_up_ns = Some(sample.received_ns);
         state
             .estimator
             .get_or_insert_with(|| OffsetEstimator::new(ESTIMATE_WINDOW))
-            .add_forward(received_ns, sent_ns);
+            .add_forward(sample.received_ns, sample.sent_ns);
         self.send_delay_req(state, event);
-        self.update_model(state, received_ns);
+        self.update_model(state, sample.received_ns);
     }
 
     fn send_delay_req(&self, state: &mut State, event: &UdpSocket) {

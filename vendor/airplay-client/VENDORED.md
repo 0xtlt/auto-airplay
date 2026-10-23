@@ -57,7 +57,10 @@ never change the speaker volume, so the crate is vendored and patched.
    only slews toward it (500 ppm at most), so it never jumps. Its timestamps
    are on the monotonic clock (`airplay_audio::timeline::mono_now_ns`), not
    the wall clock upstream used. It reports a grandmaster that falls silent
-   (15 s), changes, or jumps (over 50 ms for 3 s). `src/media_clock.rs`
+   (15 s), changes, or jumps (over 50 ms for 3 s). Sync and Follow_Up arrive
+   on two sockets read by two threads, so either can be handled first:
+   `SyncPairer` pairs them in either order (on port identity, domain and
+   sequence), each waiting at most 1 s and 32 deep. `src/media_clock.rs`
    (`MediaClock`, exported) hands that clock to the host's output pacer.
 4. **Buffered sessions.** `Connection::setup` and `start_streaming_live`
    hand buffered stream configurations (`StreamType::Buffered`) to a new

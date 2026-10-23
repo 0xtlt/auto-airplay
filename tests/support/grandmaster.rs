@@ -42,7 +42,13 @@ pub struct Behaviour {
     pub answer_delay_req: bool,
     /// Send nothing at all.
     pub silent: bool,
+    /// Send each Follow_Up before its Sync (by `FOLLOW_UP_LEAD`), as a
+    /// reordering link, or two receiving threads, can present them.
+    pub follow_up_first: bool,
 }
+
+/// How far ahead of its Sync a Follow_Up goes when `follow_up_first` is set.
+pub const FOLLOW_UP_LEAD: Duration = Duration::from_millis(3);
 
 impl Default for Behaviour {
     fn default() -> Self {
@@ -56,6 +62,7 @@ impl Default for Behaviour {
             spike: Duration::ZERO,
             answer_delay_req: true,
             silent: false,
+            follow_up_first: false,
         }
     }
 }
@@ -140,12 +147,18 @@ impl FakeGrandmaster {
 
     pub fn start_follower_with(&self, config: FollowerConfig) -> PtpFollower {
         let follower = PtpFollower::start(config).unwrap();
+        self.target(&follower);
+        follower.introduce();
+        follower
+    }
+
+    /// Sends to `follower` (another grandmaster's follower: this one then
+    /// shares the address of the one it follows).
+    pub fn target(&self, follower: &PtpFollower) {
         // It listens on all addresses; reach it on the loopback one.
         let event = SocketAddr::new(LOCALHOST, follower.event_addr().port());
         let general = SocketAddr::new(LOCALHOST, follower.general_addr().port());
         *self.follower.lock().unwrap() = Some((event, general));
-        follower.introduce();
-        follower
     }
 
     pub fn change(&self, change: impl FnOnce(&mut Behaviour)) {
@@ -303,10 +316,23 @@ fn run_grandmaster(
                     let _ = socket.send_to(&bytes, to);
                 }
                 Outgoing::SyncPair { sequence, held_ns } => {
-                    let sent = clock.master_ns(&current, mono_now_ns() - held_ns);
-                    let _ = event.send_to(&wire::sync(source, sequence, true, 0), follower_event);
-                    let follow_up = wire::follow_up(source, sequence, sent as u128, 0);
-                    let _ = general.send_to(&follow_up, follower_general);
+                    let sync = wire::sync(source, sequence, true, 0);
+                    let follow_up = |sent: i128| wire::follow_up(source, sequence, sent as u128, 0);
+                    if current.follow_up_first {
+                        // The Sync leaves FOLLOW_UP_LEAD later (spun for, so
+                        // its time is right to the microsecond).
+                        let departs = mono_now_ns() + FOLLOW_UP_LEAD.as_nanos() as u64;
+                        let sent = clock.master_ns(&current, departs - held_ns);
+                        let _ = general.send_to(&follow_up(sent), follower_general);
+                        while mono_now_ns() < departs {
+                            std::hint::spin_loop();
+                        }
+                        let _ = event.send_to(&sync, follower_event);
+                    } else {
+                        let sent = clock.master_ns(&current, mono_now_ns() - held_ns);
+                        let _ = event.send_to(&sync, follower_event);
+                        let _ = general.send_to(&follow_up(sent), follower_general);
+                    }
                 }
             }
         }

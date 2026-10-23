@@ -12,13 +12,14 @@
 //!   given, resampled (to the dither, from the first frame on); retransmit
 //!   requests are answered with the packets asked for (payload type 86) and
 //!   counted by `take_output_stats`. (Which requests count as late, and how
-//!   old, is tested on a controlled clock in `tests/output_stats.rs`.)
+//!   old, is tested on a controlled clock in `tests/output_stats.rs`.) A
+//!   packet whose send fails is neither counted nor dated.
 //!
 //! A sine shows any splice: once a sine is fitted to a second of audio, what
 //! is left is the dither (about 2 LSB) unless a frame is missing, repeated or
 //! altered, which leaves hundreds to thousands.
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -548,4 +549,73 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
         (3, 6, 3, 3),
         "{stats:?}"
     );
+}
+
+#[test]
+fn failed_sends_are_neither_counted_nor_dated() {
+    // An IPv6 speaker for the sender's IPv4 sockets: every send fails at once.
+    let speaker: SocketAddr = "[::1]:9".parse().unwrap();
+    let (sender, decoder) = LiveAudioDecoder::create_pair(INPUT_RATE, CH as u8, 64);
+    // More than the second of audio `start_live` waits for, queued up front.
+    for chunk in 0..64 {
+        let frame = LivePcmFrame {
+            samples: tone(chunk * PLAYOUT_CHUNK_FRAMES, PLAYOUT_CHUNK_FRAMES),
+            channels: CH as u8,
+            sample_rate: INPUT_RATE,
+        };
+        assert!(sender.try_send(frame));
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (handed_over, resend_failed, stats) = runtime.block_on(async {
+        let mut rtp = RtpSender::new(speaker, 0x0a1b_2c3d);
+        rtp.set_control_dest(speaker);
+        rtp.bind(0).unwrap();
+        rtp.set_control_socket(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let mut streamer = AudioStreamer::new(StreamConfig::default());
+        streamer.set_rtp_sender(rtp).await;
+        streamer.set_render_delay_ms(250).await;
+        streamer.set_timing_offset(ClockOffset::default()).await;
+        streamer.start_live(decoder).await.unwrap();
+        // The sender thread's queue holds 8 packets: once more than 16 were
+        // handed over, it has tried to send some (5 s at most).
+        let started = Instant::now();
+        while streamer.packets_sent() <= 16 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        streamer.stop().await.unwrap();
+        // Packet 0 was prepared and kept for resending, but never went out.
+        let resend = streamer
+            .handle_retransmit(&RetransmitRequest {
+                first_sequence: 0,
+                count: 1,
+            })
+            .await;
+        (
+            streamer.packets_sent(),
+            resend.is_err(),
+            streamer.take_output_stats(),
+        )
+    });
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    drop(sender);
+
+    assert!(handed_over > 16, "{handed_over} packets handed over");
+    assert!(resend_failed, "the resend cannot go out either");
+    assert_eq!(
+        (stats.packets_sent, stats.late_packets, stats.max_late_us),
+        (0, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        (stats.rtx_requested, stats.rtx_served, stats.rtx_missed),
+        (1, 0, 1),
+        "{stats:?}"
+    );
+    // Never sent: no age, and not judged late.
+    assert_eq!((stats.rtx_late, stats.rtx_max_age_us), (0, 0), "{stats:?}");
 }

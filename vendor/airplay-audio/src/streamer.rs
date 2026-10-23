@@ -248,14 +248,19 @@ fn sender_thread_main(
 
                 // Send per-target audio packets
                 // Local patch: when the audio packet really went out (right
-                // after its first send), for the periodic report.
+                // after its first successful send), for the periodic report.
+                // A packet no target took is not recorded.
                 let mut sent_ns = None;
                 for (i, target) in targets.iter().enumerate() {
                     if let Some(wire_data) = wire_packets.get(i) {
-                        if let Err(e) = target.data_socket.send_to(wire_data, target.data_dest) {
-                            tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
+                        match target.data_socket.send_to(wire_data, target.data_dest) {
+                            Ok(_) => {
+                                sent_ns.get_or_insert_with(mono_now_ns);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
+                            }
                         }
-                        sent_ns.get_or_insert_with(mono_now_ns);
                     }
                 }
 

@@ -8,7 +8,8 @@
 //!   (symphonia's ALAC decoder), uncompressed ("escape") packets included.
 //! * On loopback, with the daemon's input path (jitter buffer and pacer) and
 //!   the real sender (`AudioStreamer::start_live`): the packets arrive in
-//!   order and the audio decoded from them is the sine, continuous; retransmit
+//!   order, and the audio decoded from them is exactly what the sender was
+//!   given, resampled (to the dither, from the first frame on); retransmit
 //!   requests are answered with the packets asked for (payload type 86) and
 //!   counted by `take_output_stats`.
 //!
@@ -17,7 +18,7 @@
 //! altered, which leaves hundreds to thousands.
 
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use airplay_audio::{
     RetransmitRequest, RtpSender,
 };
 use airplay_client::{AudioFormat, ClockOffset, StreamConfig};
+use airplay_resampler::Resampler;
 use auto_airplay::output_stats::OutputReport;
 use auto_airplay::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES};
 use symphonia::core::audio::SampleBuffer;
@@ -44,6 +46,10 @@ const AMPLITUDE: f64 = 0.5 * 32_767.0;
 /// Dither and rounding stay within about 2.5 LSB of the fitted sine; a splice
 /// leaves far more.
 const MAX_RESIDUAL: f64 = 16.0;
+/// Two resamplings of the same audio differ by their dither (TPDF, 1 LSB
+/// each way) and its rounding: 2 LSB measured; a lost or repeated frame
+/// leaves thousands.
+const MAX_DITHER_DIFFERENCE: i32 = 4;
 
 /// `frames` stereo frames of the 48 kHz test tone from frame `first` on.
 fn tone(first: usize, frames: usize) -> Vec<i16> {
@@ -298,8 +304,20 @@ fn listen(socket: UdpSocket, wire: Arc<Mutex<Wire>>, running: Arc<AtomicBool>) -
 }
 
 /// The daemon's input path: a 48 kHz capture into the jitter buffer, and a
-/// playout thread handing paced chunks to the sender's live queue.
-fn input(running: &Arc<AtomicBool>) -> (LiveAudioDecoder, Vec<JoinHandle<()>>) {
+/// playout thread handing paced chunks to the sender's live queue while
+/// `feeding` is set.
+struct Input {
+    /// Every chunk the live queue took, in order: what the sender was given.
+    fed: Arc<Mutex<Vec<i16>>>,
+    /// Chunks the live queue refused (none expected: a chunk is only pulled
+    /// from the jitter buffer when the queue has room).
+    refused: Arc<AtomicUsize>,
+    feeding: Arc<AtomicBool>,
+    capture: JoinHandle<()>,
+    playout: JoinHandle<()>,
+}
+
+fn input(running: &Arc<AtomicBool>) -> (LiveAudioDecoder, Input) {
     let buffer = Arc::new(Mutex::new(JitterBuffer::new(INPUT_RATE, CH as u8, 400)));
     let epoch = Instant::now();
     let capture = {
@@ -321,8 +339,12 @@ fn input(running: &Arc<AtomicBool>) -> (LiveAudioDecoder, Vec<JoinHandle<()>>) {
     // The capture runs all along: the cushion is full when the stream attaches.
     thread::sleep(Duration::from_millis(600));
     let (sender, decoder) = LiveAudioDecoder::create_pair(INPUT_RATE, CH as u8, 64);
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let feeding = Arc::new(AtomicBool::new(true));
     let playout = {
-        let running = Arc::clone(running);
+        let (fed, refused, feeding) =
+            (Arc::clone(&fed), Arc::clone(&refused), Arc::clone(&feeding));
         thread::spawn(move || {
             let mut pacer = {
                 let mut buffer = buffer.lock().unwrap();
@@ -330,7 +352,7 @@ fn input(running: &Arc<AtomicBool>) -> (LiveAudioDecoder, Vec<JoinHandle<()>>) {
                 buffer.pacer()
             };
             let mut chunk = vec![0_i16; PLAYOUT_CHUNK_FRAMES * CH];
-            while running.load(Ordering::Acquire) {
+            while feeding.load(Ordering::Acquire) {
                 let now = epoch.elapsed();
                 let sent = if sender.is_full() {
                     pacer.blocked(now);
@@ -345,8 +367,12 @@ fn input(running: &Arc<AtomicBool>) -> (LiveAudioDecoder, Vec<JoinHandle<()>>) {
                         channels: CH as u8,
                         sample_rate: INPUT_RATE,
                     };
-                    assert!(sender.try_send(frame), "the live queue refused a chunk");
-                    pacer.sent(PLAYOUT_CHUNK_FRAMES);
+                    if sender.try_send(frame) {
+                        fed.lock().unwrap().extend_from_slice(&chunk);
+                        pacer.sent(PLAYOUT_CHUNK_FRAMES);
+                    } else {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
                     true
                 } else {
                     false
@@ -358,11 +384,28 @@ fn input(running: &Arc<AtomicBool>) -> (LiveAudioDecoder, Vec<JoinHandle<()>>) {
         })
     };
     thread::sleep(Duration::from_millis(500));
-    (decoder, vec![capture, playout])
+    let input = Input {
+        fed,
+        refused,
+        feeding,
+        capture,
+        playout,
+    };
+    (decoder, input)
+}
+
+/// The first frame of `sent` more than `tolerance` off the start of
+/// `reference`, with the difference there.
+fn first_difference(sent: &[i16], reference: &[i16], tolerance: i32) -> Option<(usize, i32)> {
+    sent.iter()
+        .zip(reference)
+        .enumerate()
+        .map(|(n, (&a, &b))| (n / CH, (i32::from(a) - i32::from(b)).abs()))
+        .find(|&(_, difference)| difference > tolerance)
 }
 
 #[test]
-fn the_sender_streams_continuous_audio_and_answers_retransmits() {
+fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
     let running = Arc::new(AtomicBool::new(true));
     let wire = Arc::new(Mutex::new(Wire::default()));
     let data = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -372,8 +415,15 @@ fn the_sender_streams_continuous_audio_and_answers_retransmits() {
         listen(data, Arc::clone(&wire), Arc::clone(&running)),
         listen(control, Arc::clone(&wire), Arc::clone(&running)),
     ];
-    let (decoder, input_threads) = input(&running);
-    threads.extend(input_threads);
+    let (decoder, input) = input(&running);
+    let Input {
+        fed,
+        refused,
+        feeding,
+        capture,
+        playout,
+    } = input;
+    threads.push(capture);
 
     // Two workers, as in the daemon.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -418,6 +468,11 @@ fn the_sender_streams_continuous_audio_and_answers_retransmits() {
             .unwrap();
         assert_eq!((recent, old, gone), (2, 1, 0));
         let stats = streamer.take_output_stats();
+        // Stop feeding first: once stopped, the stream's queue is gone.
+        feeding.store(false, Ordering::Release);
+        tokio::task::spawn_blocking(move || playout.join().unwrap())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         streamer.stop().await.unwrap();
         (stats, streamer.take_output_stats(), (last, received))
@@ -435,19 +490,37 @@ fn the_sender_streams_continuous_audio_and_answers_retransmits() {
         assert_eq!(pair[1].0, pair[0].0.wrapping_add(1), "sequence numbers");
         assert_eq!(pair[1].1, pair[0].1.wrapping_add(352), "RTP timestamps");
     }
-    // The tone, continuous, after the fade-in of the start.
+    // The audio on the wire is what the sender was given, resampled, from
+    // its first frame on: nothing lost, repeated or altered on the way. (The
+    // simulated capture may be concealed in the jitter buffer when the test
+    // machine is loaded; that happens before the sender, in what it is given.)
+    assert_eq!(
+        refused.load(Ordering::Relaxed),
+        0,
+        "the live queue refused chunks"
+    );
     let mut alac = alac_decoder();
-    let pcm: Vec<i16> = wire
+    let sent: Vec<i16> = wire
         .audio
         .iter()
         .flat_map(|(_, rtp, payload)| decode(&mut alac, payload, u64::from(*rtp)))
         .collect();
-    let (residual, at) = worst_residual(&pcm, RTP_RATE);
-    assert!(
-        residual <= MAX_RESIDUAL,
-        "a step of {residual:.1} LSB at frame {at} (packet {})",
-        at / FRAMES_PER_PACKET
-    );
+    let mut resampler = Resampler::new(INPUT_RATE, RTP_RATE as u32, CH as u8).unwrap();
+    let reference: Vec<i16> = fed
+        .lock()
+        .unwrap()
+        .as_chunks::<{ PLAYOUT_CHUNK_FRAMES * CH }>()
+        .0
+        .iter()
+        .flat_map(|chunk| resampler.process(chunk).unwrap())
+        .collect();
+    assert!(sent.len() <= reference.len(), "more audio sent than given");
+    if let Some((at, difference)) = first_difference(&sent, &reference, MAX_DITHER_DIFFERENCE) {
+        panic!(
+            "the sent audio is {difference} LSB off what was given at frame {at} (packet {})",
+            at / FRAMES_PER_PACKET
+        );
+    }
 
     // The packets asked for, sent again whole on the control port.
     let mut resent: Vec<u16> = wire.resent.iter().map(|&(_, inner)| inner).collect();

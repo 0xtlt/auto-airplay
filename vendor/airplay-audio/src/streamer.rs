@@ -231,8 +231,7 @@ fn sender_thread_main(
             SenderMessage::Resume => {}
             SenderMessage::Packet { wire_packets, sync_data, deadline_ns } => {
                 precise_sleep_until(deadline_ns);
-                let woke_ns = mono_now_ns();
-                let late_ns = woke_ns.saturating_sub(deadline_ns);
+                let late_ns = mono_now_ns().saturating_sub(deadline_ns);
 
                 // Send sync packet to ALL targets' control dests
                 if let Some(ref sync) = sync_data {
@@ -248,11 +247,15 @@ fn sender_thread_main(
                 }
 
                 // Send per-target audio packets
+                // Local patch: when the audio packet really went out (right
+                // after its first send), for the periodic report.
+                let mut sent_ns = None;
                 for (i, target) in targets.iter().enumerate() {
                     if let Some(wire_data) = wire_packets.get(i) {
                         if let Err(e) = target.data_socket.send_to(wire_data, target.data_dest) {
                             tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
                         }
+                        sent_ns.get_or_insert_with(mono_now_ns);
                     }
                 }
 
@@ -267,9 +270,11 @@ fn sender_thread_main(
                 lateness.max_late_us.fetch_max(late_ns / 1_000, Ordering::Relaxed);
                 // Local patch: the periodic report. Each packet's deadline and
                 // send time judge the requests for it later (atomics only).
-                if let Some(header) = wire_packets.first().and_then(|wire| wire.get(2..4)) {
+                if let (Some(sent_ns), Some(header)) =
+                    (sent_ns, wire_packets.first().and_then(|wire| wire.get(2..4)))
+                {
                     let sequence = u16::from_be_bytes([header[0], header[1]]);
-                    output.record_send(sequence, deadline_ns, woke_ns, frame_ns);
+                    output.record_send(sequence, deadline_ns, sent_ns, frame_ns);
                 }
                 if packet_count % 500 == 0 {
                     tracing::debug!(

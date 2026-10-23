@@ -443,9 +443,19 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
         streamer.start_live(decoder).await.unwrap();
         tokio::time::sleep(Duration::from_secs(6)).await;
 
-        // What a receiver asks for when packets did not reach it: the last
-        // two, one 100 packets (0.8 s) back, and three that left the
-        // 512-packet history long ago.
+        // Stop feeding, then the stream (in that order: once stopped, the
+        // stream's queue is gone). From here on the retransmit history holds
+        // every packet prepared, and nothing changes it.
+        feeding.store(false, Ordering::Release);
+        tokio::task::spawn_blocking(move || playout.join().unwrap())
+            .await
+            .unwrap();
+        streamer.stop().await.unwrap();
+
+        // What a receiver asks for when packets did not reach it, picked in
+        // that history from a packet that arrived: it and the one before,
+        // one 100 packets (0.8 s) back, and three 600 back, whose slots newer
+        // packets took.
         let last = wire.lock().unwrap().audio.last().unwrap().0;
         let ask = |first_sequence: u16, count: u16| RetransmitRequest {
             first_sequence,
@@ -465,13 +475,11 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
             .unwrap();
         assert_eq!((recent, old, gone), (2, 1, 0));
         let stats = streamer.take_output_stats();
-        // Stop feeding first: once stopped, the stream's queue is gone.
-        feeding.store(false, Ordering::Release);
-        tokio::task::spawn_blocking(move || playout.join().unwrap())
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        streamer.stop().await.unwrap();
+        // Until the packets sent again have arrived (5 s at most).
+        let asked = Instant::now();
+        while wire.lock().unwrap().resent.len() < 3 && asked.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         (stats, last)
     });
     runtime.shutdown_timeout(Duration::from_secs(2));

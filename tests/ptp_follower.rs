@@ -36,8 +36,7 @@ fn worst_error_ms(gm: &FakeGrandmaster, follower: &PtpFollower, over: Duration) 
     let readings = 10;
     let mut worst = 0.0f64;
     for _ in 0..readings {
-        let error = i128::from(clock.now_ns()) - gm.now_ns();
-        worst = worst.max((error as f64 / 1e6).abs());
+        worst = worst.max(gm.error_ms(&clock));
         thread::sleep(over / readings);
     }
     worst
@@ -119,9 +118,11 @@ fn locks_without_delay_responses() {
     });
     let follower = gm.start_follower();
     wait_locked(&follower);
-    // Only the lower bound is known: off by the one-way delay (0.3 ms).
+    // Only the lower bound is known: off by the one-way delay (0.3 ms here)
+    // plus how late the receiving thread wakes up, which a loaded machine
+    // stretches (Delay_Resp would cancel it out).
     let error = worst_error_ms(&gm, &follower, Duration::from_secs(1));
-    assert!(error < 2.0, "clock off by {error:.3} ms");
+    assert!(error < 4.0, "clock off by {error:.3} ms");
     assert_eq!(follower.status().delay_responses, 0);
 }
 

@@ -166,10 +166,10 @@ Latency, measured from the moment audio is handed to the AirPlay sender to the m
 
 | mode | handoff to play |
 |---|---|
-| realtime (`render_delay_ms = 250`) | 1635 ms (about 1.46 s queued in the sender, 0.17 s in the speaker) |
-| buffered (`speaker_buffer_ms = 2000`) | 2047 ms (almost all of it in the speaker) |
+| realtime (`render_delay_ms = 250`) | about 1640 ms (1.47 s queued in the sender, 0.17 s in the speaker) |
+| buffered (`speaker_buffer_ms = 2000`) | about 2045 ms (almost all of it in the speaker) |
 
-Buffered mode adds about 410 ms with the default buffer, and 100 ms more or less per 100 ms of `speaker_buffer_ms`. The jitter buffer (`audio.jitter_buffer_ms`, 400 ms) comes on top in both modes.
+Buffered mode adds about 400 ms with the default buffer (399 and 412 ms in two runs), and 100 ms more or less per 100 ms of `speaker_buffer_ms`. The jitter buffer (`audio.jitter_buffer_ms`, 400 ms) comes on top in both modes.
 
 Requirements and limits:
 

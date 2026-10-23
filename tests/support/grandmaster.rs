@@ -13,6 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use airplay_audio::timeline::mono_now_ns;
+use airplay_client::MediaClock;
 use airplay_client::ptp_follower::wire::{self, AnnounceBody, Message, PortIdentity};
 use airplay_client::ptp_follower::{FollowerConfig, PtpFollower};
 
@@ -160,6 +161,26 @@ impl FakeGrandmaster {
     pub fn master_ns(&self, local_ns: u64) -> i128 {
         let behaviour = self.behaviour.lock().unwrap().clone();
         self.clock.master_ns(&behaviour, local_ns)
+    }
+
+    /// How far `clock` is from this grandmaster's clock, in ms: the reading
+    /// is taken between two of the grandmaster's (retried if the test thread
+    /// was preempted in between), so scheduling cannot inflate it.
+    pub fn error_ms(&self, clock: &MediaClock) -> f64 {
+        loop {
+            let before = self.now_ns();
+            let reading = i128::from(clock.now_ns());
+            let after = self.now_ns();
+            if after - before > 1_000_000 {
+                continue;
+            }
+            let error = if reading < before {
+                before - reading
+            } else {
+                (reading - after).max(0)
+            };
+            return error as f64 / 1e6;
+        }
     }
 
     pub fn received(&self) -> Vec<(SocketAddr, Message)> {

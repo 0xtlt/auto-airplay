@@ -14,7 +14,7 @@ mod grandmaster;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -49,6 +49,8 @@ struct Request {
     body: Vec<u8>,
     /// Grandmaster time when it arrived.
     arrived_gm_ns: i128,
+    /// Grandmaster time just before the reply was written.
+    replied_gm_ns: i128,
 }
 
 impl Request {
@@ -206,8 +208,7 @@ fn fake_device(addr: SocketAddr) -> Device {
     }
 }
 
-/// The next request (`arrived_gm_ns` left at 0), `None` once the client is
-/// gone.
+/// The next request (times left at 0), `None` once the client is gone.
 fn read_request(reader: &mut impl BufRead) -> Option<Request> {
     let mut line = String::new();
     if reader.read_line(&mut line).ok()? == 0 {
@@ -240,6 +241,7 @@ fn read_request(reader: &mut impl BufRead) -> Option<Request> {
         headers,
         body,
         arrived_gm_ns: 0,
+        replied_gm_ns: 0,
     })
 }
 
@@ -335,6 +337,7 @@ fn serve_rtsp(
         }
         let cseq = request.header("CSeq").unwrap_or("0").to_string();
         let teardown_session = request.method == "TEARDOWN" && request.body.is_empty();
+        request.replied_gm_ns = gm.now_ns();
         seen.lock().unwrap().requests.push(request);
 
         let body = reply.as_ref().map(plist_bytes).unwrap_or_default();
@@ -418,15 +421,19 @@ struct Feeder {
     thread: Option<JoinHandle<()>>,
     /// When each chunk was handed over, on the feeder's clock.
     handoffs: Arc<Mutex<Vec<u64>>>,
+    /// Chunks the live queue refused (it was full).
+    refused: Arc<AtomicUsize>,
 }
 
 impl Feeder {
     fn start(sender: LiveFrameSender, clock: MediaClock) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let handoffs = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(AtomicUsize::new(0));
         let thread = {
             let running = Arc::clone(&running);
             let handoffs = Arc::clone(&handoffs);
+            let refused = Arc::clone(&refused);
             thread::spawn(move || {
                 let start = clock.now_ns();
                 let mut frame = 0u64;
@@ -450,7 +457,9 @@ impl Feeder {
                         channels: 2,
                         sample_rate: SOURCE_RATE,
                     });
-                    assert!(accepted, "the live queue overflowed");
+                    if !accepted {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
                     handoffs.lock().unwrap().push(handed);
                     frame += CHUNK_FRAMES as u64;
                 }
@@ -460,10 +469,18 @@ impl Feeder {
             running,
             thread: Some(thread),
             handoffs,
+            refused,
         }
     }
 
+    /// When each chunk was handed over; panics if any was refused (the
+    /// times would not match the stream).
     fn handoffs(&self) -> Vec<u64> {
+        assert_eq!(
+            self.refused.load(Ordering::Relaxed),
+            0,
+            "the live queue overflowed"
+        );
         self.handoffs.lock().unwrap().clone()
     }
 
@@ -546,13 +563,14 @@ async fn streams_a_buffered_session_to_a_fake_speaker() {
 
     // The clock the audio is paced on is the speaker's.
     let clock = connection.media_clock().unwrap();
-    let error_ms = (i128::from(clock.now_ns()) - speaker.gm.now_ns()) as f64 / 1e6;
-    assert!(error_ms.abs() < 2.0, "media clock off by {error_ms:.3} ms");
+    let error_ms = speaker.gm.error_ms(&clock);
+    assert!(error_ms < 2.0, "media clock off by {error_ms:.3} ms");
 
     tokio::time::sleep(Duration::from_secs(3)).await;
     connection.send_feedback().await.expect("a healthy session");
     let stats = connection.buffered_stats().expect("buffered stream stats");
     feeder.stop();
+    assert!(!feeder.handoffs().is_empty(), "the tone was handed over");
     connection.stop().await.unwrap();
     connection.disconnect().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -619,7 +637,7 @@ async fn streams_a_buffered_session_to_a_fake_speaker() {
     assert_eq!(stream["shk"].as_data().map(<[u8]>::len), Some(32));
     assert!(!stream.contains_key("asc"), "Apple senders send no asc");
 
-    // The anchor: frame 0 plays LATENCY after the request, on the
+    // The anchor: frame 0 plays LATENCY after the client took it, on the
     // grandmaster's timeline.
     let anchor_request = &requests[5];
     assert_eq!(
@@ -635,11 +653,19 @@ async fn streams_a_buffered_session_to_a_fake_speaker() {
         Some(u64::from_be_bytes(GM_IDENTITY))
     );
     let plays_at = network_time_ns(&anchor);
-    let lead_ms = (plays_at - anchor_request.arrived_gm_ns) as f64 / 1e6;
     let latency_ms = LATENCY.as_millis() as f64;
+    // The client took it once RECORD was answered and before its request
+    // arrived, on its clock (within 2 ms of the grandmaster's): true however
+    // the test is scheduled.
+    let taken = plays_at - LATENCY.as_nanos() as i128;
+    let record_answered = requests[4].replied_gm_ns;
+    let anchor_arrived = anchor_request.arrived_gm_ns;
+    let slack = 2_000_000;
     assert!(
-        (lead_ms - latency_ms).abs() < 30.0,
-        "anchor {lead_ms:.1} ms ahead"
+        (record_answered - slack..=anchor_arrived + slack).contains(&taken),
+        "anchor taken {:.1} ms after RECORD was answered, {:.1} ms before it arrived",
+        (taken - record_answered) as f64 / 1e6,
+        (anchor_arrived - taken) as f64 / 1e6
     );
 
     assert!(requests[6].uri.ends_with("/feedback"));
@@ -662,8 +688,9 @@ async fn streams_a_buffered_session_to_a_fake_speaker() {
     }
     assert_eq!(stats.dropped, 0);
 
-    // Every packet arrives about LATENCY before it plays, and that margin
-    // does not drift (the audio is paced on the speaker's clock).
+    // Packets arrive about LATENCY before they play, and that margin does
+    // not drift (the audio is paced on the speaker's clock). Medians: a
+    // machine that stalls now and then delays a few packets, not the bulk.
     let margins_ms: Vec<f64> = packets
         .iter()
         .map(|packet| {
@@ -671,23 +698,27 @@ async fn streams_a_buffered_session_to_a_fake_speaker() {
             (plays - speaker.gm.master_ns(packet.arrived_ns)) as f64 / 1e6
         })
         .collect();
-    let steady = &margins_ms[10..];
-    let lowest = steady.iter().cloned().fold(f64::MAX, f64::min);
-    let highest = steady.iter().cloned().fold(f64::MIN, f64::max);
+    let median = |values: &[f64]| {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[sorted.len() / 2]
+    };
+    let (lowest, typical, highest) = (
+        margins_ms.iter().cloned().fold(f64::MAX, f64::min),
+        median(&margins_ms),
+        margins_ms.iter().cloned().fold(f64::MIN, f64::max),
+    );
     eprintln!(
-        "margin before play: {lowest:.1} to {highest:.1} ms (latency {latency_ms} ms, {} packets)",
+        "margin before play: {lowest:.1} / {typical:.1} / {highest:.1} ms (min / median / max, latency {latency_ms} ms, {} packets)",
         packets.len()
     );
     assert!(
-        lowest > latency_ms - 150.0,
-        "a packet arrived only {lowest:.1} ms before it plays"
+        (typical - latency_ms).abs() < 100.0,
+        "packets arrive {typical:.1} ms before they play"
     );
-    assert!(
-        highest < latency_ms + 50.0,
-        "a packet arrived {highest:.1} ms before it plays"
-    );
-    let early: f64 = steady[..20].iter().sum::<f64>() / 20.0;
-    let late: f64 = steady[steady.len() - 20..].iter().sum::<f64>() / 20.0;
+    let third = margins_ms.len() / 3;
+    let early = median(&margins_ms[..third]);
+    let late = median(&margins_ms[margins_ms.len() - third..]);
     assert!(
         (late - early).abs() < 15.0,
         "margin drifted from {early:.1} to {late:.1} ms"

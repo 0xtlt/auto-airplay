@@ -18,6 +18,8 @@ pub enum RtspMethod {
     Post,  // For HTTP-style endpoints like /info
     Get,
     SetPeers,
+    /// Local patch: anchors a buffered stream to the PTP timeline.
+    SetRateAnchorTime,
 }
 
 /// RTSP request builder.
@@ -157,6 +159,31 @@ impl RtspRequest {
             .body(body)
     }
 
+    /// Local patch: `SETPEERS` as Apple senders send it, on the session URI.
+    /// The body is a binary plist array of the timing peers' addresses, and
+    /// the content type is literally `/peer-list-changed`.
+    pub fn setpeers_for_session(uri: impl Into<String>, body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::SetPeers, uri)
+            .header("Content-Type", "/peer-list-changed")
+            .body(body)
+    }
+
+    /// Local patch: `SETRATEANCHORTIME` with a binary plist body (see
+    /// `SetRateAnchorTimeRequest`).
+    pub fn set_rate_anchor_time(uri: impl Into<String>, body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::SetRateAnchorTime, uri)
+            .content_type_bplist()
+            .body(body)
+    }
+
+    /// Local patch: `TEARDOWN` with a binary plist body listing the streams to
+    /// remove; the session itself stays up.
+    pub fn teardown_streams(uri: impl Into<String>, body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::Teardown, uri)
+            .content_type_bplist()
+            .body(body)
+    }
+
     pub fn record_with_info(uri: impl Into<String>, seq: u16, rtptime: u32) -> Self {
         Self::new(RtspMethod::Record, uri)
             .header("X-Apple-ProtocolVersion", "1")
@@ -256,6 +283,7 @@ impl RtspMethod {
             Self::Post => "POST",
             Self::Get => "GET",
             Self::SetPeers => "SETPEERS",
+            Self::SetRateAnchorTime => "SETRATEANCHORTIME",
         }
     }
 }

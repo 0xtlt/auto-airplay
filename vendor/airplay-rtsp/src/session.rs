@@ -7,9 +7,11 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::plist_codec::{
-    self, SetupPhase1Request, SetupPhase1Response, SetupPhase2Request, SetupPhase2Response,
-    StreamDef, TimingPeerInfo,
+    self, SetRateAnchorTimeRequest, SetupPhase1Request, SetupPhase1Response, SetupPhase2Request,
+    SetupPhase2Response, StreamDef, StreamTypeRef, TeardownStreamsRequest, TimingPeerInfo,
 };
+use airplay_core::codec::AudioCodec;
+use airplay_core::stream::StreamType;
 
 /// Session state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,12 @@ pub struct RtspSession {
     shk: [u8; 32],
     /// RTSP request host (local IP used in request URI)
     request_host: Option<String>,
+    /// Local patch: the receiver's timing peer info from the SETUP phase 1
+    /// reply (its addresses, for SETPEERS).
+    receiver_timing_peer_info: Option<TimingPeerInfo>,
+    /// Local patch: the receiver's buffer for a buffered stream, in bytes, from
+    /// the SETUP phase 2 reply.
+    audio_buffer_size: Option<u64>,
 }
 
 impl RtspSession {
@@ -102,6 +110,8 @@ impl RtspSession {
             ekey,
             shk,
             request_host: None,
+            receiver_timing_peer_info: None,
+            audio_buffer_size: None,
         }
     }
 
@@ -333,6 +343,9 @@ impl RtspSession {
             }
         }
 
+        // Local patch: keep the receiver's timing peers for SETPEERS.
+        self.receiver_timing_peer_info = phase1_response.timing_peer_info.clone();
+
         // Store the ports from phase 1 (data and control will come in phase 2)
         self.ports = Some(SessionPorts {
             data_port: 0,    // Will be set in phase 2
@@ -347,8 +360,6 @@ impl RtspSession {
 
     /// Build SETUP phase 2 request body (binary plist).
     pub fn build_setup_phase2(&self) -> Result<Vec<u8>> {
-        use airplay_core::codec::AudioCodec;
-
         if self.state != SessionState::SetupPhase1 {
             return Err(RtspError::SetupFailed(format!(
                 "Cannot build phase 2 from state {:?}",
@@ -360,7 +371,13 @@ impl RtspSession {
         // Generate AudioSpecificConfig for AAC codecs.
         // Use ASC from StreamConfig if provided (e.g. ALAC magic cookie),
         // otherwise generate for AAC if needed
-        let asc = if let Some(ref asc) = self.stream_config.asc {
+        //
+        // Local patch: a buffered stream sends no `asc`. Apple senders do not;
+        // the receiver knows the format from `audioFormat`.
+        let buffered = self.stream_config.stream_type == StreamType::Buffered;
+        let asc = if buffered {
+            None
+        } else if let Some(ref asc) = self.stream_config.asc {
             Some(asc.clone())
         } else {
             match self.stream_config.audio_format.codec {
@@ -386,7 +403,7 @@ impl RtspSession {
             audio_format: self.stream_config.audio_format.codec.audio_format_value(),
             audio_mode: "default".to_string(),
             sample_rate: self.stream_config.audio_format.sample_rate.as_hz(),
-            ct: self.stream_config.audio_format.codec.compression_type(),
+            ct: compression_type(self.stream_config.audio_format.codec),
             control_port: self.local_control_port,
             is_media: true,
             latency_min: self.stream_config.latency_min,
@@ -460,9 +477,54 @@ impl RtspSession {
             ports.data_port = audio_stream.data_port;
             ports.control_port = audio_stream.control_port;
         }
+        self.audio_buffer_size = audio_stream.audio_buffer_size;
 
         self.state = SessionState::Ready;
         Ok(())
+    }
+
+    /// Local patch: the receiver's timing peer addresses from the SETUP
+    /// phase 1 reply (empty if it sent none).
+    pub fn receiver_timing_addresses(&self) -> Vec<String> {
+        self.receiver_timing_peer_info
+            .as_ref()
+            .map(|info| info.addresses.clone())
+            .unwrap_or_default()
+    }
+
+    /// Local patch: the receiver's buffer for a buffered stream, in bytes.
+    pub fn audio_buffer_size(&self) -> Option<u64> {
+        self.audio_buffer_size
+    }
+
+    /// Local patch: `SETRATEANCHORTIME` body: the frame `rtp_time` plays at
+    /// `network_time_ns` on the PTP timeline `timeline_id`, at `rate` (1
+    /// plays, 0 pauses).
+    pub fn build_rate_anchor(
+        &self,
+        rtp_time: u32,
+        network_time_ns: u64,
+        timeline_id: u64,
+        rate: u64,
+    ) -> Result<Vec<u8>> {
+        let (network_time_secs, network_time_frac) = split_network_time(network_time_ns);
+        plist_codec::encode(&SetRateAnchorTimeRequest {
+            network_time_secs,
+            network_time_frac,
+            network_time_flags: 0,
+            network_time_timeline_id: timeline_id,
+            rtp_time: u64::from(rtp_time),
+            rate,
+        })
+    }
+
+    /// Local patch: `TEARDOWN` body removing this session's stream.
+    pub fn build_teardown_streams(&self) -> Result<Vec<u8>> {
+        plist_codec::encode(&TeardownStreamsRequest {
+            streams: vec![StreamTypeRef {
+                stream_type: self.stream_config.stream_type as u32,
+            }],
+        })
     }
 
     /// Transition to playing state.
@@ -527,6 +589,28 @@ impl RtspSession {
         plist_codec::encode(&peer_addresses.to_vec())
     }
 
+}
+
+/// Local patch: the `ct` of a SETUP stream. Compression types are bit flags:
+/// 1 LPCM, 2 ALAC, 4 AAC-LC, 8 AAC-ELD, 32 Opus. Upstream took
+/// `AudioCodec::compression_type()`, which says 3 for AAC and 4 for AAC-ELD.
+pub fn compression_type(codec: AudioCodec) -> u8 {
+    match codec {
+        AudioCodec::Pcm => 1,
+        AudioCodec::Alac => 2,
+        AudioCodec::Aac => 4,
+        AudioCodec::AacEld => 8,
+        AudioCodec::Opus => 32,
+    }
+}
+
+/// Local patch: a time in ns as AirPlay's network time: whole seconds and the
+/// fraction of a second in units of 2^-64 s.
+pub fn split_network_time(time_ns: u64) -> (u64, u64) {
+    let secs = time_ns / 1_000_000_000;
+    let nanos = u128::from(time_ns % 1_000_000_000);
+    let frac = ((nanos << 64) / 1_000_000_000) as u64;
+    (secs, frac)
 }
 
 #[cfg(test)]

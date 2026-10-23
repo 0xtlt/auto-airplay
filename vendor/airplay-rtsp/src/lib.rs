@@ -13,7 +13,9 @@ mod connection;
 mod request;
 mod response;
 mod session;
-mod plist_codec;
+/// Public only so the integration tests of the host crate can decode payloads.
+#[doc(hidden)]
+pub mod plist_codec;
 pub mod raop_session;
 pub mod sdp;
 mod traits;

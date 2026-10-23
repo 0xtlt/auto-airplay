@@ -68,11 +68,14 @@ pub struct AudioFormatInfo {
 }
 
 /// Timing peer info for PTP.
+///
+/// Local patch: both fields default when absent, so a receiver that leaves
+/// one out of its SETUP reply does not fail the whole SETUP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimingPeerInfo {
-    #[serde(rename = "Addresses")]
+    #[serde(rename = "Addresses", default)]
     pub addresses: Vec<String>,
-    #[serde(rename = "ID")]
+    #[serde(rename = "ID", default)]
     pub id: String,
     /// Only present in sender's request, not in receiver's response
     #[serde(rename = "SupportsClockPortMatchingOverride", default)]
@@ -157,17 +160,60 @@ pub struct SetupPhase2Request {
 }
 
 /// Stream response from SETUP phase 2.
+///
+/// Local patch: `controlPort` defaults to 0 (a buffered stream, type 103, has
+/// no use for one and a receiver may leave it out), and `audioBufferSize` (the
+/// receiver's buffer for a buffered stream, in bytes) is read when present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamResponse {
     #[serde(rename = "type")]
     pub stream_type: u32,
     #[serde(rename = "dataPort")]
     pub data_port: u16,
-    #[serde(rename = "controlPort")]
+    #[serde(rename = "controlPort", default)]
     pub control_port: u16,
     /// Stream ID - may be very large (use i64 to handle plist signed encoding)
     #[serde(rename = "streamID", default)]
     pub stream_id: i64,
+    /// Receiver buffer for a buffered stream, in bytes.
+    #[serde(rename = "audioBufferSize", default, skip_serializing_if = "Option::is_none")]
+    pub audio_buffer_size: Option<u64>,
+}
+
+/// Local patch: `SETRATEANCHORTIME` body of a buffered stream (type 103).
+///
+/// It ties the stream to the PTP timeline the receiver follows: the frame with
+/// RTP timestamp `rtp_time` plays at network time
+/// `network_time_secs + network_time_frac / 2^64` seconds on the timeline of
+/// clock `network_time_timeline_id` (the grandmaster's clock identity, read
+/// as a big-endian `u64`). `rate` 1 plays, 0 pauses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRateAnchorTimeRequest {
+    #[serde(rename = "networkTimeSecs")]
+    pub network_time_secs: u64,
+    #[serde(rename = "networkTimeFrac")]
+    pub network_time_frac: u64,
+    #[serde(rename = "networkTimeFlags")]
+    pub network_time_flags: u64,
+    #[serde(rename = "networkTimeTimelineID")]
+    pub network_time_timeline_id: u64,
+    #[serde(rename = "rtpTime")]
+    pub rtp_time: u64,
+    pub rate: u64,
+}
+
+/// Local patch: one entry of a `TEARDOWN` body that removes streams.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamTypeRef {
+    #[serde(rename = "type")]
+    pub stream_type: u32,
+}
+
+/// Local patch: `TEARDOWN` body that removes the listed streams but keeps the
+/// session (a bare `TEARDOWN` ends the session).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeardownStreamsRequest {
+    pub streams: Vec<StreamTypeRef>,
 }
 
 /// SETUP phase 2 response body.

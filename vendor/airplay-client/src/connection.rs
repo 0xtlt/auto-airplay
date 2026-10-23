@@ -1408,6 +1408,10 @@ impl Connection {
 
     /// Pause streaming.
     pub async fn pause(&mut self) -> Result<()> {
+        // Local addition: a buffered stream pauses with its own requests.
+        if self.stream_config.stream_type == airplay_core::StreamType::Buffered {
+            return self.pause_buffered().await;
+        }
         if let Some(ref mut streamer) = self.streamer {
             streamer.pause().await?;
         }
@@ -1433,6 +1437,10 @@ impl Connection {
 
     /// Resume streaming.
     pub async fn resume(&mut self) -> Result<()> {
+        // Local addition: a buffered stream resumes with a new anchor.
+        if self.stream_config.stream_type == airplay_core::StreamType::Buffered {
+            return self.resume_buffered().await;
+        }
         if let Some(ref mut streamer) = self.streamer {
             streamer.resume().await?;
         }

@@ -7,8 +7,9 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::plist_codec::{
-    self, SetRateAnchorTimeRequest, SetupPhase1Request, SetupPhase1Response, SetupPhase2Request,
-    SetupPhase2Response, StreamDef, StreamTypeRef, TeardownStreamsRequest, TimingPeerInfo,
+    self, FlushBufferedRequest, SetRateAnchorTimeRequest, SetRateRequest, SetupPhase1Request,
+    SetupPhase1Response, SetupPhase2Request, SetupPhase2Response, StreamDef, StreamTypeRef,
+    TeardownStreamsRequest, TimingPeerInfo,
 };
 use airplay_core::codec::AudioCodec;
 use airplay_core::stream::StreamType;
@@ -515,6 +516,22 @@ impl RtspSession {
             network_time_timeline_id: timeline_id,
             rtp_time: u64::from(rtp_time),
             rate,
+        })
+    }
+
+    /// Local patch: `SETRATEANCHORTIME` body that only sets the rate.
+    pub fn build_rate(&self, rate: u64) -> Result<Vec<u8>> {
+        plist_codec::encode(&SetRateRequest { rate })
+    }
+
+    /// Local patch: `FLUSHBUFFERED` body dropping everything the receiver
+    /// holds before the packet `until_seq` (RTP time `until_ts`).
+    pub fn build_flush_buffered(&self, until_seq: u32, until_ts: u32) -> Result<Vec<u8>> {
+        plist_codec::encode(&FlushBufferedRequest {
+            flush_from_seq: None,
+            flush_from_ts: None,
+            flush_until_seq: u64::from(until_seq),
+            flush_until_ts: u64::from(until_ts),
         })
     }
 

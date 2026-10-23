@@ -70,6 +70,8 @@ way to change it from outside, so it is vendored like `vendor/airplay-client`.
    unlike the realtime path's sequence-number nonce). Encoding and writing run
    on two threads with a 512-packet queue between them, so a stalled
    connection never holds up the encoder; a write blocked for 10 s fails the
-   stream, and the failure keeps its I/O error kind. Adds a direct
+   stream, and the failure keeps its I/O error kind. `pause` stops making
+   packets (dropping the input meanwhile) and returns where the stream
+   stopped; `resume` carries on from there with a fresh encoder. Adds a direct
    `chacha20poly1305` dependency (already in the tree through
    `airplay-crypto`).

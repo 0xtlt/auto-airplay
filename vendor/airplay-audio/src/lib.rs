@@ -33,5 +33,5 @@ pub use live_decoder::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 pub use rtp::{RtpPacket, RtpSender, RtpReceiver, RtpHeader, RetransmitRequest, build_retransmit_response};
 pub use buffer::{AudioBuffer, AudioFrame};
 pub use streamer::AudioStreamer;
-pub use buffered::{BufferedStats, BufferedStreamer, StreamFailure};
+pub use buffered::{BufferedStats, BufferedStreamer, StreamFailure, StreamPosition};
 pub use traits::{AudioSource, EncoderTrait};

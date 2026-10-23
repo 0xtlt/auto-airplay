@@ -20,6 +20,8 @@ pub enum RtspMethod {
     SetPeers,
     /// Local patch: anchors a buffered stream to the PTP timeline.
     SetRateAnchorTime,
+    /// Local patch: drops audio a buffered stream already sent.
+    FlushBuffered,
 }
 
 /// RTSP request builder.
@@ -176,6 +178,14 @@ impl RtspRequest {
             .body(body)
     }
 
+    /// Local patch: `FLUSHBUFFERED` with a binary plist body (see
+    /// `FlushBufferedRequest`).
+    pub fn flush_buffered(uri: impl Into<String>, body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::FlushBuffered, uri)
+            .content_type_bplist()
+            .body(body)
+    }
+
     /// Local patch: `TEARDOWN` with a binary plist body listing the streams to
     /// remove; the session itself stays up.
     pub fn teardown_streams(uri: impl Into<String>, body: Vec<u8>) -> Self {
@@ -284,6 +294,7 @@ impl RtspMethod {
             Self::Get => "GET",
             Self::SetPeers => "SETPEERS",
             Self::SetRateAnchorTime => "SETRATEANCHORTIME",
+            Self::FlushBuffered => "FLUSHBUFFERED",
         }
     }
 }

@@ -33,6 +33,10 @@ them from outside, so it is vendored like `vendor/airplay-client`.
    - `RtspRequest::setpeers_for_session`: `SETPEERS` on the session URI with
      the content type Apple senders use (`/peer-list-changed`). Upstream's
      `setpeers` (URI `/peer-list-changed`, binary plist content type) is kept.
+   - `RtspMethod::FlushBuffered` and `RtspRequest::flush_buffered`;
+     `RtspSession::build_flush_buffered` (drop what the receiver holds up to
+     a sequence number and RTP time) and `build_rate` (a `SETRATEANCHORTIME`
+     that only sets the rate) for pausing a buffered stream.
    - `RtspRequest::teardown_streams` and `RtspSession::build_teardown_streams`:
      `TEARDOWN` with a body that removes the stream but keeps the session.
    - SETUP phase 2: `ct` comes from `session::compression_type`, which treats

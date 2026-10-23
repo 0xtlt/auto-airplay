@@ -202,6 +202,28 @@ pub struct SetRateAnchorTimeRequest {
     pub rate: u64,
 }
 
+/// Local patch: `SETRATEANCHORTIME` body that only sets the rate (0 pauses
+/// a buffered stream; the anchor is kept).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRateRequest {
+    pub rate: u64,
+}
+
+/// Local patch: `FLUSHBUFFERED` body: the receiver drops the buffered audio
+/// from `flushFromSeq`/`flushFromTS` (from what plays now if absent) up to,
+/// not including, `flushUntilSeq`/`flushUntilTS`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushBufferedRequest {
+    #[serde(rename = "flushFromSeq", default, skip_serializing_if = "Option::is_none")]
+    pub flush_from_seq: Option<u64>,
+    #[serde(rename = "flushFromTS", default, skip_serializing_if = "Option::is_none")]
+    pub flush_from_ts: Option<u64>,
+    #[serde(rename = "flushUntilSeq")]
+    pub flush_until_seq: u64,
+    #[serde(rename = "flushUntilTS")]
+    pub flush_until_ts: u64,
+}
+
 /// Local patch: one entry of a `TEARDOWN` body that removes streams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamTypeRef {

@@ -80,8 +80,14 @@ never change the speaker volume, so the crate is vendored and patched.
    (8 s at most) until the speaker's clock is followed. Streaming connects to
    the stream's data port, starts `airplay_audio::BufferedStreamer` and sends
    one `SETRATEANCHORTIME`: RTP frame 0 plays `latency` (default 2 s) from now
-   on the speaker's PTP timeline. `stop` removes the stream with a `TEARDOWN`
-   that lists it. `send_feedback` fails when the stream's connection failed
+   on the speaker's PTP timeline. `pause` and `resume` have buffered branches
+   too (upstream's FLUSH and RECORD are realtime requests): pause stops making
+   packets (the live input of the pause is dropped), sends
+   `SETRATEANCHORTIME` with rate 0 and `FLUSHBUFFERED` up to the first packet
+   after the pause, so the speaker drops the audio it still holds; resume
+   restarts the AAC encoder and anchors that packet `latency` from now at
+   rate 1. Sequence numbers and RTP time carry on across the pause. `stop`
+   removes the stream with a `TEARDOWN` that lists it. `send_feedback` fails when the stream's connection failed
    (with the I/O error kind, so a receiver dropping it reads as such) or the
    clock was lost. `AirPlayClient::set_buffered(latency)` selects all this;
    `media_clock()` gives the speaker's clock to pace the input with;

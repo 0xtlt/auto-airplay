@@ -749,6 +749,138 @@ async fn streams_a_buffered_session_to_a_fake_speaker() {
     );
 }
 
+/// The frequency of the tone in `pcm` (interleaved stereo at 44.1 kHz),
+/// from its rising zero crossings on the left channel, and its RMS level.
+fn tone_of(pcm: &[i16]) -> (f64, f64) {
+    let left: Vec<f64> = pcm
+        .iter()
+        .step_by(2)
+        .map(|&sample| f64::from(sample))
+        .collect();
+    let rms = (left.iter().map(|sample| sample * sample).sum::<f64>() / left.len() as f64).sqrt();
+    let crossings = left
+        .windows(2)
+        .filter(|pair| pair[0] < 0.0 && pair[1] >= 0.0)
+        .count();
+    (crossings as f64 / (left.len() as f64 / RTP_RATE), rms)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pauses_and_resumes_a_buffered_stream() {
+    let speaker = FakeSpeaker::start(Options::default());
+    let (mut connection, mut feeder) = start_session(&speaker, speaker.ptp_config()).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+    connection.pause().await.expect("pause");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let resumed_at = mono_now_ns();
+    connection.resume().await.expect("resume");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    connection
+        .send_feedback()
+        .await
+        .expect("healthy after the resume");
+    feeder.stop();
+    connection.stop().await.unwrap();
+    connection.disconnect().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let requests = speaker.requests();
+    let methods: Vec<&str> = requests
+        .iter()
+        .map(|request| request.method.as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "GET",
+            "SETUP",
+            "SETPEERS",
+            "SETUP",
+            "RECORD",
+            "SETRATEANCHORTIME",
+            "SETRATEANCHORTIME",
+            "FLUSHBUFFERED",
+            "SETRATEANCHORTIME",
+            "POST",
+            "TEARDOWN",
+            "TEARDOWN"
+        ],
+        "pause and resume must not use FLUSH or RECORD"
+    );
+
+    // Pause: rate 0 alone (the anchor is kept), then a flush of everything
+    // the speaker holds, up to the first packet after the pause.
+    let pause = requests[6].dictionary();
+    assert_eq!(pause.len(), 1, "{pause:?}");
+    assert_eq!(pause["rate"].as_unsigned_integer(), Some(0));
+    let flush = requests[7].dictionary();
+    assert_eq!(flush.len(), 2, "flush from now: {flush:?}");
+    let until_seq = flush["flushUntilSeq"].as_unsigned_integer().unwrap();
+    let until_ts = flush["flushUntilTS"].as_unsigned_integer().unwrap();
+    assert!(until_seq > 30, "paused after {until_seq} packets");
+    assert_eq!(until_ts, until_seq * 1024);
+
+    // Resume: a new anchor for that first packet, LATENCY after the client
+    // took it (between the flush's answer and the anchor's arrival).
+    let resume_request = &requests[8];
+    let resume = resume_request.dictionary();
+    assert_eq!(resume["rate"].as_unsigned_integer(), Some(1));
+    assert_eq!(resume["rtpTime"].as_unsigned_integer(), Some(until_ts));
+    assert_eq!(
+        resume["networkTimeTimelineID"].as_unsigned_integer(),
+        Some(u64::from_be_bytes(GM_IDENTITY))
+    );
+    let plays_at = network_time_ns(&resume);
+    let taken = plays_at - LATENCY.as_nanos() as i128;
+    let slack = 2_000_000;
+    assert!(
+        (requests[7].replied_gm_ns - slack..=resume_request.arrived_gm_ns + slack).contains(&taken),
+        "resume anchor taken outside the resume"
+    );
+
+    // The packets: one numbering across the pause, nothing made during it.
+    assert!(speaker.seen.lock().unwrap().data_error.is_none());
+    let packets = speaker.packets();
+    for (index, packet) in packets.iter().enumerate() {
+        assert_eq!(packet.sequence, index as u32);
+        assert_eq!(packet.timestamp, 1024 * index as u32);
+    }
+    let (before, after) = packets.split_at(until_seq as usize);
+    assert!(after.len() > 40, "{} packets after the resume", after.len());
+    assert!(
+        after.iter().all(|packet| packet.arrived_ns >= resumed_at),
+        "a packet from after the pause was sent before the resume"
+    );
+
+    // After the resume: the tone again (fresh encoder, so skip its priming),
+    // about LATENCY before it plays.
+    let decoded = decode(&packets);
+    let resumed_pcm = &decoded[(before.len() + 4) * 2048..];
+    let (frequency, rms) = tone_of(resumed_pcm);
+    assert!(
+        (frequency / TONE_HZ - 1.0).abs() < 0.01,
+        "{frequency:.1} Hz"
+    );
+    let expected_rms = TONE_AMPLITUDE / 2f64.sqrt();
+    assert!((rms / expected_rms - 1.0).abs() < 0.1, "rms {rms:.0}");
+    let mut margins_ms: Vec<f64> = after
+        .iter()
+        .map(|packet| {
+            let frames = f64::from(packet.timestamp) - until_ts as f64;
+            let plays = plays_at + (frames / RTP_RATE * 1e9) as i128;
+            (plays - speaker.gm.master_ns(packet.arrived_ns)) as f64 / 1e6
+        })
+        .collect();
+    margins_ms.sort_by(f64::total_cmp);
+    let typical = margins_ms[margins_ms.len() / 2];
+    let latency_ms = LATENCY.as_millis() as f64;
+    assert!(
+        (typical - latency_ms).abs() < 100.0,
+        "after the resume, packets arrive {typical:.1} ms before they play"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_data_connection_fails_the_session() {
     let speaker = FakeSpeaker::start(Options::default());

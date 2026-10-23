@@ -229,6 +229,32 @@ pub struct BufferedStats {
     pub longest_write_us: u64,
 }
 
+/// Where a buffered stream is: the sequence number and RTP timestamp of the
+/// next packet it will send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamPosition {
+    pub sequence: u32,
+    pub timestamp: u32,
+}
+
+/// What the encoding thread works on; `pause` and `resume` take it too, so a
+/// packet is either made before a pause or after the resume.
+struct Encoding {
+    encoder: AacLcEncoder,
+    packetizer: Packetizer,
+    timestamp: u32,
+    paused: bool,
+}
+
+impl Encoding {
+    fn position(&self) -> StreamPosition {
+        StreamPosition {
+            sequence: self.packetizer.next_sequence(),
+            timestamp: self.timestamp,
+        }
+    }
+}
+
 /// Encodes a live source into a buffered stream on a TCP connection.
 ///
 /// Two threads: one encodes what the decoder delivers, as soon as it does,
@@ -239,6 +265,7 @@ pub struct BufferedStreamer {
     running: Arc<AtomicBool>,
     counters: Arc<BufferedCounters>,
     error: Arc<Mutex<Option<StreamFailure>>>,
+    encoding: Arc<Mutex<Encoding>>,
     queue: Receiver<Vec<u8>>,
     connection: TcpStream,
     threads: Vec<JoinHandle<()>>,
@@ -257,8 +284,12 @@ impl BufferedStreamer {
         connection.set_nodelay(true)?;
         connection.set_write_timeout(Some(WRITE_TIMEOUT))?;
         decoder.set_recv_timeout(INPUT_POLL);
-        let mut encoder = AacLcEncoder::new(AAC_BIT_RATE)?;
-        let mut packetizer = Packetizer::new(key, SSRC_AAC_44100_STEREO, 0);
+        let encoding = Arc::new(Mutex::new(Encoding {
+            encoder: AacLcEncoder::new(AAC_BIT_RATE)?,
+            packetizer: Packetizer::new(key, SSRC_AAC_44100_STEREO, 0),
+            timestamp: first_timestamp,
+            paused: false,
+        }));
 
         let running = Arc::new(AtomicBool::new(true));
         let counters = Arc::new(BufferedCounters::default());
@@ -269,6 +300,7 @@ impl BufferedStreamer {
             let running = Arc::clone(&running);
             let counters = Arc::clone(&counters);
             let error = Arc::clone(&error);
+            let encoding = Arc::clone(&encoding);
             let queue = queue.clone();
             thread::Builder::new()
                 .name("ap2-encode".into())
@@ -279,9 +311,7 @@ impl BufferedStreamer {
                         &queue,
                         &sender,
                         &mut decoder,
-                        &mut encoder,
-                        &mut packetizer,
-                        first_timestamp,
+                        &encoding,
                     ) {
                         fail(
                             &error,
@@ -315,10 +345,50 @@ impl BufferedStreamer {
             running,
             counters,
             error,
+            encoding,
             queue,
             connection,
             threads: vec![encode, write],
         })
+    }
+
+    fn encoding(&self) -> std::sync::MutexGuard<'_, Encoding> {
+        self.encoding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The next packet's sequence number and RTP timestamp.
+    pub fn position(&self) -> StreamPosition {
+        self.encoding().position()
+    }
+
+    /// Whether the stream is paused.
+    pub fn is_paused(&self) -> bool {
+        self.encoding().paused
+    }
+
+    /// Stops making packets: the input that arrives while paused is dropped
+    /// (a live source plays on). Returns where the stream stopped: no packet
+    /// from that position on is made before [`Self::resume`]. Packets
+    /// already queued are still sent.
+    pub fn pause(&self) -> StreamPosition {
+        let mut encoding = self.encoding();
+        encoding.paused = true;
+        encoding.position()
+    }
+
+    /// Makes packets again, from the input that arrives from now on, with a
+    /// fresh encoder (the audio before the pause is not continued).
+    /// Sequence numbers and RTP timestamps carry on where they stopped;
+    /// returns that position.
+    pub fn resume(&self) -> Result<StreamPosition> {
+        let mut encoding = self.encoding();
+        if encoding.paused {
+            encoding.encoder = AacLcEncoder::new(AAC_BIT_RATE)?;
+            encoding.paused = false;
+        }
+        Ok(encoding.position())
     }
 
     /// Why the stream stopped, if it failed.
@@ -379,19 +449,15 @@ fn fail(
         .get_or_insert(StreamFailure { message, kind });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     running: &AtomicBool,
     counters: &BufferedCounters,
     queue: &Receiver<Vec<u8>>,
     sender: &Sender<Vec<u8>>,
     decoder: &mut LiveAudioDecoder,
-    encoder: &mut AacLcEncoder,
-    packetizer: &mut Packetizer,
-    first_timestamp: u32,
+    encoding: &Mutex<Encoding>,
 ) -> Result<()> {
     let format = aac_format();
-    let mut timestamp = first_timestamp;
     while running.load(Ordering::Acquire) {
         let Some(frame) = decoder.decode_resampled(&format, FRAMES_PER_PACKET as usize)? else {
             if decoder.is_eof() {
@@ -400,12 +466,22 @@ fn encode_loop(
             }
             continue;
         };
-        let unit = encoder.encode(&frame.samples)?;
-        if unit.is_empty() {
-            continue;
-        }
-        let packet = packetizer.packet(timestamp, unit)?;
-        timestamp = timestamp.wrapping_add(FRAMES_PER_PACKET);
+        let packet = {
+            let mut guard = encoding
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let encoding = &mut *guard;
+            if encoding.paused {
+                continue;
+            }
+            let unit = encoding.encoder.encode(&frame.samples)?;
+            if unit.is_empty() {
+                continue;
+            }
+            let packet = encoding.packetizer.packet(encoding.timestamp, unit)?;
+            encoding.timestamp = encoding.timestamp.wrapping_add(FRAMES_PER_PACKET);
+            packet
+        };
         counters.packets.fetch_add(1, Ordering::Relaxed);
         match sender.try_send(packet) {
             Ok(()) => {}

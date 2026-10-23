@@ -291,21 +291,7 @@ impl Connection {
         if self.session.state() != SessionState::Ready {
             self.setup().await?;
         }
-        let (clock, timeline) = {
-            let follower = self
-                .ptp_follower
-                .as_ref()
-                .ok_or_else(|| RtspError::SetupFailed("no PTP follower".into()))?;
-            if let Some(reason) = follower.lost() {
-                return Err(CoreError::Connection(io::Error::other(format!(
-                    "PTP: {reason}"
-                ))));
-            }
-            let timeline = follower.timeline_id().ok_or_else(|| {
-                RtspError::SetupFailed("the speaker's PTP timeline is unknown".into())
-            })?;
-            (follower.clock(), timeline)
-        };
+        let (clock, timeline) = self.followed_clock()?;
 
         let speaker =
             *select_best_address(&self.device.addresses).ok_or(RtspError::ConnectionRefused)?;
@@ -359,6 +345,94 @@ impl Connection {
             "buffered stream started"
         );
         Ok(())
+    }
+
+    /// Pauses the buffered stream: no packet is made any more (the live
+    /// input of the pause is dropped), the speaker stops (`SETRATEANCHORTIME`
+    /// at rate 0) and drops what it still holds (`FLUSHBUFFERED` up to the
+    /// first packet after the pause): a live source must not resume with
+    /// audio from before the pause.
+    pub(super) async fn pause_buffered(&mut self) -> Result<()> {
+        let position = self.buffered.as_ref().ok_or(RtspError::NoSession)?.pause();
+        let body = self.session.build_rate(0)?;
+        let response = self
+            .rtsp
+            .send(RtspRequest::set_rate_anchor_time(
+                self.session.request_uri(),
+                body,
+            ))
+            .await?;
+        expect_ok("SETRATEANCHORTIME (pause)", response.status_code)?;
+        let body = self
+            .session
+            .build_flush_buffered(position.sequence, position.timestamp)?;
+        let response = self
+            .rtsp
+            .send(RtspRequest::flush_buffered(
+                self.session.request_uri(),
+                body,
+            ))
+            .await?;
+        expect_ok("FLUSHBUFFERED", response.status_code)?;
+        self.session.pause()?;
+        self.playback_state = PlaybackState::Paused;
+        tracing::info!(
+            sequence = position.sequence,
+            rtp_time = position.timestamp,
+            "buffered stream paused"
+        );
+        Ok(())
+    }
+
+    /// Resumes a paused buffered stream: packets are made again from the
+    /// live input, and a new anchor says the next one plays `latency` from
+    /// now on the speaker's clock (`SETRATEANCHORTIME` at rate 1).
+    pub(super) async fn resume_buffered(&mut self) -> Result<()> {
+        let (clock, timeline) = self.followed_clock()?;
+        let position = self
+            .buffered
+            .as_ref()
+            .ok_or(RtspError::NoSession)?
+            .resume()?;
+        let plays_at = clock
+            .now_ns()
+            .saturating_add(self.buffered_latency.as_nanos() as u64);
+        let body = self
+            .session
+            .build_rate_anchor(position.timestamp, plays_at, timeline, 1)?;
+        let response = self
+            .rtsp
+            .send(RtspRequest::set_rate_anchor_time(
+                self.session.request_uri(),
+                body,
+            ))
+            .await?;
+        expect_ok("SETRATEANCHORTIME (resume)", response.status_code)?;
+        self.session.start_playing()?;
+        self.playback_state = PlaybackState::Playing;
+        tracing::info!(
+            sequence = position.sequence,
+            rtp_time = position.timestamp,
+            "buffered stream resumed"
+        );
+        Ok(())
+    }
+
+    /// The speaker's clock and timeline, unless the clock was lost.
+    fn followed_clock(&self) -> Result<(MediaClock, u64)> {
+        let follower = self
+            .ptp_follower
+            .as_ref()
+            .ok_or_else(|| RtspError::SetupFailed("no PTP follower".into()))?;
+        if let Some(reason) = follower.lost() {
+            return Err(CoreError::Connection(io::Error::other(format!(
+                "PTP: {reason}"
+            ))));
+        }
+        let timeline = follower.timeline_id().ok_or_else(|| {
+            RtspError::SetupFailed("the speaker's PTP timeline is unknown".into())
+        })?;
+        Ok((follower.clock(), timeline))
     }
 
     /// Stops the buffered stream and removes it from the session.

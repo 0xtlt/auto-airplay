@@ -86,3 +86,13 @@ way to change it from outside, so it is vendored like `vendor/airplay-client`.
    AirPlay 2 receivers do not take the latency from this field. `prepare_sync`
    writes 7 (`NTP_SYNC_BYTES_2_3`); the counter still limits the first-syncs
    log. PTP sync packets (not used for live streaming) are unchanged.
+6. **Output counters.** `AudioStreamer::take_output_stats` returns what the
+   sender did since the previous call (`OutputStats`, exported): packets sent,
+   those sent more than a packet late and the largest lateness (sender
+   thread); retransmit requests, the packets they asked for, served and
+   missed (not in the history), those asked for after the time they play
+   (the announced latency after they were sent), and the oldest a requested
+   packet was when its request came in. The sender thread records the
+   sequence number and send time of the last packet, which dates the packets
+   a request asks for. `note_unparsed_retransmit_request` counts the requests
+   the control channel cannot parse (see `vendor/airplay-client`).

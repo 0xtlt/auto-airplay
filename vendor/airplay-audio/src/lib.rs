@@ -30,5 +30,5 @@ pub use eq::{EqConfig, EqParams, Equalizer};
 pub use live_decoder::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 pub use rtp::{RtpPacket, RtpSender, RtpReceiver, RtpHeader, RetransmitRequest, build_retransmit_response};
 pub use buffer::{AudioBuffer, AudioFrame};
-pub use streamer::AudioStreamer;
+pub use streamer::{AudioStreamer, OutputStats};
 pub use traits::{AudioSource, EncoderTrait};

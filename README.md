@@ -140,6 +140,14 @@ The sync packet also announces the latency, the audio the speaker must hold: it 
 
 Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
 
+Once a minute while streaming, the daemon also logs what the sender did, even when everything is zero:
+
+```text
+airplay_output stats: packets=7517 late_packets=0 send_jitter_max_ms=0.4 rtx_requests=2 rtx_unparsed=0 rtx_requested=3 rtx_served=3 rtx_missed=0 rtx_late=0 rtx_age_max_ms=38
+```
+
+`packets` counts the audio packets sent (7517 make a minute), `late_packets` those sent more than one packet (8 ms) after their deadline, and `send_jitter_max_ms` is the latest one went out. The speaker asks for a packet again when it did not arrive: `rtx_requests` counts its requests, `rtx_requested` the packets they asked for, `rtx_served` those sent again, `rtx_missed` those that could not be (older than the 4 s history), `rtx_late` those asked for after the time they play (the latency after they were sent, so the resend arrives too late), and `rtx_age_max_ms` is the longest between sending a packet and the request for it. `rtx_unparsed` counts requests the daemon could not read (none expected). Find it with `journalctl -u "auto-airplay@$USER.service" | grep airplay_output`. Requests every minute mean packets get lost between the Pi and the speaker, usually on Wi-Fi; `rtx_late` above zero means some resends come too late to help.
+
 `cargo test --test sender_timing -- --ignored --nocapture` times this against the pinned upstream sender and prints the comparison. It needs a machine that keeps real time, so `cargo test` alone only checks what holds however the test is scheduled: anchors stay on the timeline or restart it, never move a little.
 
 ## Speaker volume

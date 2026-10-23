@@ -160,6 +160,131 @@ struct SendLateness {
     max_late_us: AtomicU64,
 }
 
+/// Local patch: what the sender did over a period, for a periodic report.
+/// Counts are since the previous [`AudioStreamer::take_output_stats`];
+/// maxima are over the same period.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputStats {
+    /// Audio packets sent.
+    pub packets_sent: u64,
+    /// Of those, sent more than one packet duration after their deadline.
+    pub late_packets: u64,
+    /// The latest a packet was sent after its deadline, in µs.
+    pub max_late_us: u64,
+    /// Retransmit requests received.
+    pub rtx_requests: u64,
+    /// Retransmit requests (payload type 85) of a length the control channel
+    /// does not understand: ignored, nothing sent again.
+    pub rtx_unparsed: u64,
+    /// Packets those requests asked for.
+    pub rtx_requested: u64,
+    /// Requested packets sent again.
+    pub rtx_served: u64,
+    /// Requested packets not sent again: not in the history (any more), or
+    /// the resend failed.
+    pub rtx_missed: u64,
+    /// Requested packets asked for after the time the sync packets say they
+    /// play (the announced latency after they were sent): a resend cannot
+    /// arrive before that.
+    pub rtx_late: u64,
+    /// The oldest a requested packet was when the request came in (time since
+    /// it was sent), in µs: how long the receiver took to notice it missing,
+    /// plus the trip of its request.
+    pub rtx_max_age_us: u64,
+}
+
+/// Local patch: the counters behind [`OutputStats`], shared by the sender
+/// thread and the retransmit path.
+#[derive(Debug, Default)]
+struct OutputCounters {
+    sent: AtomicU64,
+    late: AtomicU64,
+    max_late_us: AtomicU64,
+    rtx_requests: AtomicU64,
+    rtx_unparsed: AtomicU64,
+    rtx_requested: AtomicU64,
+    rtx_served: AtomicU64,
+    rtx_missed: AtomicU64,
+    rtx_late: AtomicU64,
+    rtx_max_age_us: AtomicU64,
+    /// The last audio packet sent: its sequence number in the top 16 bits,
+    /// when it went out (µs on `mono_now_ns`) in the low 48. Zero before the
+    /// first one. Never reset: it dates the packets a receiver asks for.
+    last_sent: AtomicU64,
+}
+
+/// The low 48 bits of [`OutputCounters::last_sent`]: about 9 years of µs.
+const LAST_SENT_US_MASK: u64 = (1 << 48) - 1;
+
+impl OutputCounters {
+    /// The sender thread sent the audio packet `sequence`, `late_ns` after
+    /// its deadline.
+    fn record_send(&self, sequence: u16, late_ns: u64, frame_ns: u64) {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        if late_ns > frame_ns {
+            self.late.fetch_add(1, Ordering::Relaxed);
+        }
+        self.max_late_us.fetch_max(late_ns / 1_000, Ordering::Relaxed);
+        let sent_us = (mono_now_ns() / 1_000) & LAST_SENT_US_MASK;
+        self.last_sent.store((u64::from(sequence) << 48) | sent_us, Ordering::Relaxed);
+    }
+
+    /// A retransmit request came in at `now_ns`, when the last packet sent
+    /// was `last` (as in `last_sent`), and `served` of its packets went out
+    /// again (`None`: the resend failed). Packets are `packet_ns` apart and
+    /// play `latency_ns` after they are sent.
+    fn record_retransmit(
+        &self,
+        request: &crate::rtp::RetransmitRequest,
+        served: Option<u16>,
+        (now_ns, last): (u64, u64),
+        packet_ns: u64,
+        latency_ns: u64,
+    ) {
+        let count = u64::from(request.count);
+        let served = u64::from(served.unwrap_or(0)).min(count);
+        self.rtx_requests.fetch_add(1, Ordering::Relaxed);
+        self.rtx_requested.fetch_add(count, Ordering::Relaxed);
+        self.rtx_served.fetch_add(served, Ordering::Relaxed);
+        self.rtx_missed.fetch_add(count - served, Ordering::Relaxed);
+
+        if last == 0 || count == 0 || packet_ns == 0 {
+            return;
+        }
+        // Packets sent after the first one asked for. Negative: it was not
+        // sent yet, and there is no age to give.
+        let last_sequence = (last >> 48) as u16;
+        let behind = last_sequence.wrapping_sub(request.first_sequence) as i16;
+        if behind < 0 {
+            return;
+        }
+        let since_last_us = ((now_ns / 1_000) & LAST_SENT_US_MASK).saturating_sub(last & LAST_SENT_US_MASK);
+        let age_ns = since_last_us * 1_000 + behind as u64 * packet_ns;
+        self.rtx_max_age_us.fetch_max(age_ns / 1_000, Ordering::Relaxed);
+        // Each packet of the request is one packet younger than the one before.
+        if age_ns >= latency_ns {
+            let late = ((age_ns - latency_ns) / packet_ns + 1).min(count);
+            self.rtx_late.fetch_add(late, Ordering::Relaxed);
+        }
+    }
+
+    fn take(&self) -> OutputStats {
+        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        OutputStats {
+            packets_sent: take(&self.sent),
+            late_packets: take(&self.late),
+            max_late_us: take(&self.max_late_us),
+            rtx_requests: take(&self.rtx_requests),
+            rtx_unparsed: take(&self.rtx_unparsed),
+            rtx_requested: take(&self.rtx_requested),
+            rtx_served: take(&self.rtx_served),
+            rtx_missed: take(&self.rtx_missed),
+            rtx_late: take(&self.rtx_late),
+            rtx_max_age_us: take(&self.rtx_max_age_us),
+        }
+    }
+}
+
 /// Dedicated OS thread for precise packet timing.
 ///
 /// On Linux, uses `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` with
@@ -178,6 +303,7 @@ fn sender_thread_main(
     frame_duration: std::time::Duration,
     running: Arc<AtomicBool>,
     lateness: Arc<SendLateness>,
+    output: Arc<OutputCounters>,
 ) {
     set_realtime_priority();
     disable_wifi_power_save();
@@ -262,6 +388,11 @@ fn sender_thread_main(
                     lateness.late.fetch_add(1, Ordering::Relaxed);
                 }
                 lateness.max_late_us.fetch_max(late_ns / 1_000, Ordering::Relaxed);
+                // Local patch: the periodic report, and the time each packet
+                // went out, which dates the packets a receiver asks for again.
+                if let Some(header) = wire_packets.first().and_then(|wire| wire.get(2..4)) {
+                    output.record_send(u16::from_be_bytes([header[0], header[1]]), late_ns, frame_ns);
+                }
                 if packet_count % 500 == 0 {
                     tracing::debug!(
                         "TIMING STATS after {} pkts: avg_late={:.3}ms max_late={:.3}ms late_pkts={}",
@@ -323,6 +454,8 @@ pub struct AudioStreamer {
     sender_running: Arc<AtomicBool>,
     /// Local patch: packets the sender thread sent late.
     lateness: Arc<SendLateness>,
+    /// Local patch: what [`AudioStreamer::take_output_stats`] reports.
+    output: Arc<OutputCounters>,
 }
 
 impl Clone for AudioStreamer {
@@ -338,6 +471,7 @@ impl Clone for AudioStreamer {
             sender_tx: self.sender_tx.clone(),
             sender_running: Arc::clone(&self.sender_running),
             lateness: Arc::clone(&self.lateness),
+            output: Arc::clone(&self.output),
         }
     }
 }
@@ -374,6 +508,7 @@ impl AudioStreamer {
             sender_tx: None,
             sender_running: Arc::new(AtomicBool::new(false)),
             lateness: Arc::new(SendLateness::default()),
+            output: Arc::new(OutputCounters::default()),
         }
     }
 
@@ -440,13 +575,42 @@ impl AudioStreamer {
     ///
     /// Each RtpSender has its own packet history ring buffer, so retransmit
     /// responses are per-device (encrypted with the correct device key).
+    ///
+    /// Local patch: counted in [`AudioStreamer::take_output_stats`].
     pub async fn handle_retransmit_for_target(&self, index: usize, request: &crate::rtp::RetransmitRequest) -> airplay_core::error::Result<u16> {
+        // When the request came in, before waiting for the lock.
+        let arrival = (mono_now_ns(), self.output.last_sent.load(Ordering::Relaxed));
         let inner = self.inner.lock().await;
-        if let Some(sender) = inner.rtp_senders.get(index) {
-            sender.handle_retransmit(request)
-        } else {
-            Ok(0)
-        }
+        let Some(sender) = inner.rtp_senders.get(index) else {
+            return Ok(0);
+        };
+        let served = sender.handle_retransmit(request);
+        let config = &inner.config;
+        let rate = u64::from(config.audio_format.sample_rate.as_hz().max(1));
+        let packet_ns = u64::from(config.audio_format.frames_per_packet) * 1_000_000_000 / rate;
+        let latency = announced_latency(
+            Duration::from_nanos(inner.render_delay_ns),
+            config.audio_format.sample_rate.as_hz(),
+            config.latency_min,
+            config.latency_max,
+        );
+        let latency_ns = u64::from(latency) * 1_000_000_000 / rate;
+        drop(inner);
+        self.output.record_retransmit(request, served.as_ref().ok().copied(), arrival, packet_ns, latency_ns);
+        served
+    }
+
+    /// Local patch: what the sender did since the previous call (counts) or
+    /// over that time (maxima), for a periodic report. Counts every target
+    /// of a group together.
+    pub fn take_output_stats(&self) -> OutputStats {
+        self.output.take()
+    }
+
+    /// Local patch: the control channel received a retransmit request it
+    /// could not parse (see [`OutputStats::rtx_unparsed`]).
+    pub fn note_unparsed_retransmit_request(&self) {
+        self.output.rtx_unparsed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the total number of audio packets sent.
@@ -527,6 +691,7 @@ impl AudioStreamer {
                     self.sender_running.store(true, Ordering::Release);
                     let running = Arc::clone(&self.sender_running);
                     let lateness = Arc::clone(&self.lateness);
+                    let output = Arc::clone(&self.output);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -536,6 +701,7 @@ impl AudioStreamer {
                                 frame_duration,
                                 running,
                                 lateness,
+                                output,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -666,6 +832,7 @@ impl AudioStreamer {
                     self.sender_running.store(true, Ordering::Release);
                     let running = Arc::clone(&self.sender_running);
                     let lateness = Arc::clone(&self.lateness);
+                    let output = Arc::clone(&self.output);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -675,6 +842,7 @@ impl AudioStreamer {
                                 frame_duration,
                                 running,
                                 lateness,
+                                output,
                             );
                         })
                         .expect("Failed to spawn sender thread");

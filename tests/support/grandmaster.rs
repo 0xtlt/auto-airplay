@@ -94,7 +94,7 @@ impl FakeGrandmaster {
         let event = UdpSocket::bind((LOCALHOST, 0)).unwrap();
         let general = UdpSocket::bind((LOCALHOST, 0)).unwrap();
         event
-            .set_read_timeout(Some(Duration::from_millis(1)))
+            .set_read_timeout(Some(Duration::from_micros(200)))
             .unwrap();
         general.set_nonblocking(true).unwrap();
         let mut gm = Self {
@@ -176,6 +176,20 @@ impl Drop for FakeGrandmaster {
     }
 }
 
+/// Something to send once the simulated network delivers it.
+enum Outgoing {
+    Packet {
+        from_event: bool,
+        bytes: Vec<u8>,
+        to_general: bool,
+    },
+    /// A Sync and its Follow_Up, held up `held_ns` by the network: the
+    /// Follow_Up's timestamp is taken when they are really sent, minus that,
+    /// so the one-way delay the follower sees is exactly `held_ns` however
+    /// late this loop gets to it.
+    SyncPair { sequence: u16, held_ns: u64 },
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_grandmaster(
     event: &UdpSocket,
@@ -186,8 +200,8 @@ fn run_grandmaster(
     follower: &Mutex<Option<(SocketAddr, SocketAddr)>>,
     running: &AtomicBool,
 ) {
-    // (local send time, use the event socket, packet, destination is general)
-    let mut queue: VecDeque<(u64, bool, Vec<u8>, bool)> = VecDeque::new();
+    // (local time it arrives, what)
+    let mut queue: VecDeque<(u64, Outgoing)> = VecDeque::new();
     let mut next_sync = mono_now_ns();
     let mut next_announce = mono_now_ns();
     let mut sync_sequence = 0u16;
@@ -215,20 +229,14 @@ fn run_grandmaster(
         if !current.silent && now >= next_sync {
             next_sync += 125_000_000;
             sync_sequence = sync_sequence.wrapping_add(1);
-            // Leaves now; the network holds both the Sync and its Follow_Up.
-            let sent = clock.master_ns(&current, now);
-            let arrives = now + delay + spike();
+            // The network holds both the Sync and its Follow_Up.
+            let held_ns = delay + spike();
             queue.push_back((
-                arrives,
-                true,
-                wire::sync(source, sync_sequence, true, 0),
-                false,
-            ));
-            queue.push_back((
-                arrives,
-                false,
-                wire::follow_up(source, sync_sequence, sent as u128, 0),
-                true,
+                now + held_ns,
+                Outgoing::SyncPair {
+                    sequence: sync_sequence,
+                    held_ns,
+                },
             ));
         }
         if !current.silent && now >= next_announce {
@@ -243,31 +251,48 @@ fn run_grandmaster(
             };
             queue.push_back((
                 now + delay,
-                false,
-                wire::announce(source, announce_sequence, &body, -2),
-                true,
+                Outgoing::Packet {
+                    from_event: false,
+                    bytes: wire::announce(source, announce_sequence, &body, -2),
+                    to_general: true,
+                },
             ));
         }
 
         let destinations = *follower.lock().unwrap();
         // Until it has heard from both of the follower's sockets, a learnt
         // destination may be the wrong one: that only delays the first Syncs.
-        while queue.front().is_some_and(|&(at, ..)| at <= mono_now_ns()) {
-            let (_, from_event, packet, to_general) = queue.pop_front().unwrap();
-            if let Some((follower_event, follower_general)) = destinations {
-                let socket = if from_event { event } else { general };
-                let to = if to_general {
-                    follower_general
-                } else {
-                    follower_event
-                };
-                let _ = socket.send_to(&packet, to);
+        while queue.front().is_some_and(|&(at, _)| at <= mono_now_ns()) {
+            let (_, outgoing) = queue.pop_front().unwrap();
+            let Some((follower_event, follower_general)) = destinations else {
+                continue;
+            };
+            match outgoing {
+                Outgoing::Packet {
+                    from_event,
+                    bytes,
+                    to_general,
+                } => {
+                    let socket = if from_event { event } else { general };
+                    let to = if to_general {
+                        follower_general
+                    } else {
+                        follower_event
+                    };
+                    let _ = socket.send_to(&bytes, to);
+                }
+                Outgoing::SyncPair { sequence, held_ns } => {
+                    let sent = clock.master_ns(&current, mono_now_ns() - held_ns);
+                    let _ = event.send_to(&wire::sync(source, sequence, true, 0), follower_event);
+                    let follow_up = wire::follow_up(source, sequence, sent as u128, 0);
+                    let _ = general.send_to(&follow_up, follower_general);
+                }
             }
         }
         // Deliver in order of arrival (a held-up message arrives after the
         // ones sent behind it, as on a congested link).
         let mut sorted: Vec<_> = queue.drain(..).collect();
-        sorted.sort_by_key(|&(at, ..)| at);
+        sorted.sort_by_key(|&(at, _)| at);
         queue.extend(sorted);
 
         for (socket, is_event) in [(event, true), (general, false)] {
@@ -298,9 +323,17 @@ fn run_grandmaster(
                 let reached = clock.master_ns(&current, arrived + delay + spike());
                 queue.push_back((
                     arrived,
-                    false,
-                    wire::delay_resp(source, header.sequence, reached as u128, header.source, 0),
-                    true,
+                    Outgoing::Packet {
+                        from_event: false,
+                        bytes: wire::delay_resp(
+                            source,
+                            header.sequence,
+                            reached as u128,
+                            header.source,
+                            0,
+                        ),
+                        to_general: true,
+                    },
                 ));
             }
             received.lock().unwrap().push((from, message));

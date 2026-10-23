@@ -45,6 +45,8 @@ airplay-resampler = { git = "https://github.com/lmcgartland/airplay2-rs.git", re
 airplay-crypto = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 assert_cmd = "2.0"
 predicates = "3.1"
+# Decodes the ALAC packets back for tests/output_chain.rs.
+symphonia = { version = "0.5.5", default-features = false, features = ["alac"] }
 tokio = { version = "1.47", features = ["io-util"] }
 
 # The tests push minutes of audio through the jitter buffer and the real AirPlay

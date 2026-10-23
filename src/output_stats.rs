@@ -20,11 +20,13 @@ use airplay_client::OutputStats;
 ///   understand, ignored;
 /// * `rtx_requested`, `rtx_served`, `rtx_missed`: the packets they asked
 ///   for, sent again, and not sent again (out of the history, about 4 s);
-/// * `rtx_late`: requested packets asked for after the time the sync packets
-///   say they play (the announced latency after they were sent), too late
-///   for a resend to help;
-/// * `rtx_age_max_ms`: the longest between sending a packet and receiving
-///   the request for it again.
+/// * `rtx_late`: requested packets asked for once the time the sync packets
+///   announced for them had passed (their deadline plus the latency, however
+///   late they really went out), too late for a resend to help;
+/// * `rtx_age_max_ms`: the longest between a packet really going out and the
+///   request for it.
+///
+/// Only the last 512 packets sent (about 4 s) are judged late or dated.
 ///
 /// [`AirPlayClient::take_output_stats`]: airplay_client::AirPlayClient::take_output_stats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

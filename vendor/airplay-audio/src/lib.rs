@@ -22,6 +22,9 @@ mod streamer;
 /// Public only so the integration tests of the host crate can drive it.
 #[doc(hidden)]
 pub mod timeline;
+/// Public only so the integration tests of the host crate can drive it.
+#[doc(hidden)]
+pub mod output;
 mod traits;
 
 pub use decoder::{AudioDecoder, DecodedFrame};
@@ -30,5 +33,6 @@ pub use eq::{EqConfig, EqParams, Equalizer};
 pub use live_decoder::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 pub use rtp::{RtpPacket, RtpSender, RtpReceiver, RtpHeader, RetransmitRequest, build_retransmit_response};
 pub use buffer::{AudioBuffer, AudioFrame};
-pub use streamer::{AudioStreamer, OutputStats};
+pub use streamer::AudioStreamer;
+pub use output::OutputStats;
 pub use traits::{AudioSource, EncoderTrait};

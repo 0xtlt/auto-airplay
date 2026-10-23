@@ -11,7 +11,8 @@
 //!   order, and the audio decoded from them is exactly what the sender was
 //!   given, resampled (to the dither, from the first frame on); retransmit
 //!   requests are answered with the packets asked for (payload type 86) and
-//!   counted by `take_output_stats`.
+//!   counted by `take_output_stats`. (Which requests count as late, and how
+//!   old, is tested on a controlled clock in `tests/output_stats.rs`.)
 //!
 //! A sine shows any splice: once a sine is fitted to a second of audio, what
 //! is left is the dither (about 2 LSB) unless a frame is missing, repeated or
@@ -24,12 +25,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use airplay_audio::{
-    AlacEncoder, AudioEncoder, AudioStreamer, LiveAudioDecoder, LivePcmFrame, OutputStats,
-    RetransmitRequest, RtpSender,
+    AlacEncoder, AudioEncoder, AudioStreamer, LiveAudioDecoder, LivePcmFrame, RetransmitRequest,
+    RtpSender,
 };
 use airplay_client::{AudioFormat, ClockOffset, StreamConfig};
 use airplay_resampler::Resampler;
-use auto_airplay::output_stats::OutputReport;
 use auto_airplay::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_ALAC, CodecParameters, Decoder, DecoderOptions};
@@ -431,7 +431,7 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
         .enable_all()
         .build()
         .unwrap();
-    let (stats, after_stop, (last, received)) = runtime.block_on(async {
+    let (stats, last) = runtime.block_on(async {
         let mut rtp = RtpSender::new(data_addr, 0x0a1b_2c3d);
         rtp.set_control_dest(control_addr);
         rtp.bind(0).unwrap();
@@ -444,12 +444,9 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         // What a receiver asks for when packets did not reach it: the last
-        // two (just missed), one 100 packets (0.8 s) back, after the time it
-        // played, and three that left the 512-packet history long ago.
-        let (last, received) = {
-            let wire = wire.lock().unwrap();
-            (wire.audio.last().unwrap().0, wire.audio.len())
-        };
+        // two, one 100 packets (0.8 s) back, and three that left the
+        // 512-packet history long ago.
+        let last = wire.lock().unwrap().audio.last().unwrap().0;
         let ask = |first_sequence: u16, count: u16| RetransmitRequest {
             first_sequence,
             count,
@@ -475,7 +472,7 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         streamer.stop().await.unwrap();
-        (stats, streamer.take_output_stats(), (last, received))
+        (stats, last)
     });
     runtime.shutdown_timeout(Duration::from_secs(2));
     running.store(false, Ordering::Release);
@@ -530,9 +527,9 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
     assert_eq!(resent, expected);
     assert!(wire.resent.iter().all(|&(outer, inner)| outer == inner));
 
-    // ... and counted.
-    let ages_ms = 100.0 * 352.0 / 44.1..600.0 * 352.0 / 44.1 + 1_000.0;
-    assert!(stats.packets_sent >= received as u64, "{stats:?}");
+    // ... and counted. (Which requests came late and how old the packets
+    // were depends on when things ran here: see tests/output_stats.rs, on a
+    // controlled clock.)
     assert_eq!(
         (
             stats.rtx_requests,
@@ -542,49 +539,5 @@ fn the_sender_sends_what_it_is_given_and_answers_retransmits() {
         ),
         (3, 6, 3, 3),
         "{stats:?}"
-    );
-    // The one 100 packets back and the three out of the history were asked
-    // for after the time they played (250 ms after they were sent).
-    assert_eq!(stats.rtx_late, 4, "{stats:?}");
-    assert!(
-        ages_ms.contains(&(stats.rtx_max_age_us as f64 / 1_000.0)),
-        "{stats:?}"
-    );
-    // A new period starts with every count at zero.
-    assert_eq!(
-        OutputStats {
-            packets_sent: 0,
-            late_packets: 0,
-            max_late_us: 0,
-            ..after_stop
-        },
-        OutputStats::default(),
-        "{after_stop:?}"
-    );
-}
-
-#[test]
-fn the_output_line_has_the_greppable_shape() {
-    let stats = OutputStats {
-        packets_sent: 7_517,
-        late_packets: 1,
-        max_late_us: 8_412,
-        rtx_requests: 3,
-        rtx_unparsed: 2,
-        rtx_requested: 4,
-        rtx_served: 3,
-        rtx_missed: 1,
-        rtx_late: 1,
-        rtx_max_age_us: 412_999,
-    };
-    assert_eq!(
-        OutputReport(stats).to_string(),
-        "airplay_output stats: packets=7517 late_packets=1 send_jitter_max_ms=8.4 \
-         rtx_requests=3 rtx_unparsed=2 rtx_requested=4 rtx_served=3 rtx_missed=1 rtx_late=1 rtx_age_max_ms=412"
-    );
-    assert_eq!(
-        OutputReport(OutputStats::default()).to_string(),
-        "airplay_output stats: packets=0 late_packets=0 send_jitter_max_ms=0.0 \
-         rtx_requests=0 rtx_unparsed=0 rtx_requested=0 rtx_served=0 rtx_missed=0 rtx_late=0 rtx_age_max_ms=0"
     );
 }

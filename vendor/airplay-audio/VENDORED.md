@@ -88,11 +88,16 @@ way to change it from outside, so it is vendored like `vendor/airplay-client`.
    log. PTP sync packets (not used for live streaming) are unchanged.
 6. **Output counters.** `AudioStreamer::take_output_stats` returns what the
    sender did since the previous call (`OutputStats`, exported): packets sent,
-   those sent more than a packet late and the largest lateness (sender
-   thread); retransmit requests, the packets they asked for, served and
-   missed (not in the history), those asked for after the time they play
-   (the announced latency after they were sent), and the oldest a requested
-   packet was when its request came in. The sender thread records the
-   sequence number and send time of the last packet, which dates the packets
-   a request asks for. `note_unparsed_retransmit_request` counts the requests
-   the control channel cannot parse (see `vendor/airplay-client`).
+   those sent more than a packet late and the largest lateness; retransmit
+   requests, the packets they asked for, served and missed (not in the
+   history), those asked for once the time the sync packets announced for
+   them had passed, and the longest a requested packet had been out. New
+   module `src/output.rs` (public but `#[doc(hidden)]`, only so the host
+   crate's `tests/output_stats.rs` can drive it on its own clock): for each
+   of the last 512 packets, the sender thread stores its deadline (the
+   timeline's, which the sync packets announce) and when it really went out,
+   in atomics tagged with the sequence number, so it takes no lock. A request
+   is late once the deadline plus the announced latency has passed, however
+   late the packet went out, and across timeline restarts; its age counts
+   from when it really went out. `note_unparsed_retransmit_request` counts the
+   requests the control channel cannot parse (see `vendor/airplay-client`).

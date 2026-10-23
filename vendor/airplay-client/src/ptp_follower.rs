@@ -288,6 +288,20 @@ pub mod wire {
         },
     }
 
+    impl Message {
+        /// The message's header.
+        pub fn header(&self) -> &Header {
+            match self {
+                Message::Sync { header, .. }
+                | Message::DelayReq { header, .. }
+                | Message::FollowUp { header, .. }
+                | Message::DelayResp { header, .. }
+                | Message::Announce { header, .. }
+                | Message::Signaling { header } => header,
+            }
+        }
+    }
+
     /// Parses a message (`None` for anything else or anything malformed).
     pub fn parse(bytes: &[u8]) -> Option<Message> {
         let header = Header::parse(bytes)?;
@@ -729,6 +743,14 @@ impl SyncPairer {
     }
 }
 
+/// The clock port and domain the follower follows: messages from any other
+/// (another PTP instance or domain at the same address) are ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    pub port: wire::PortIdentity,
+    pub domain: u8,
+}
+
 /// Where the follower talks PTP.
 #[derive(Debug, Clone)]
 pub struct FollowerConfig {
@@ -793,6 +815,10 @@ pub struct FollowerStatus {
     /// Messages handled since the start.
     pub syncs: u64,
     pub delay_responses: u64,
+    /// The clock port and domain followed, once chosen.
+    pub source: Option<Source>,
+    /// Messages ignored because another clock port or domain sent them.
+    pub other_source_messages: u64,
     /// Why the clock is no longer valid, if it is not.
     pub lost: Option<String>,
 }
@@ -805,7 +831,10 @@ struct State {
     pending_delay_reqs: VecDeque<(u16, u64)>,
     delay_req_sequence: u16,
     announce: Option<wire::AnnounceBody>,
-    sync_source: Option<[u8; 8]>,
+    /// The clock port and domain followed: set by the first Announce, or by
+    /// the first Sync paired before any Announce.
+    source: Option<Source>,
+    other_source_messages: u64,
     timeline_id: Option<u64>,
     first_follow_up_ns: Option<u64>,
     last_follow_up_ns: Option<u64>,
@@ -889,6 +918,9 @@ impl Shared {
             return;
         };
         let mut state = self.state();
+        if !self.from_followed_source(&mut state, &message) {
+            return;
+        }
         match message {
             wire::Message::Sync { header, origin_ns } => {
                 state.syncs += 1;
@@ -967,6 +999,42 @@ impl Shared {
         }
     }
 
+    /// Whether `message` comes from the clock port and domain followed. The
+    /// first Announce chooses them (a grandmaster announces from the port it
+    /// sends Syncs from); Syncs and Follow_Ups that come before it are paired
+    /// per port and domain, and the first pair chooses them. Anything from
+    /// another port or domain at the same address is then ignored, so it can
+    /// neither move the clock nor keep a silent one looking alive.
+    fn from_followed_source(&self, state: &mut State, message: &wire::Message) -> bool {
+        let header = message.header();
+        let candidate = Source {
+            port: header.source,
+            domain: header.domain,
+        };
+        match state.source {
+            Some(source) if source == candidate => true,
+            Some(source) => {
+                if state.other_source_messages == 0 {
+                    tracing::info!(
+                        followed = %hex(&source.port.clock),
+                        followed_domain = source.domain,
+                        other = %hex(&candidate.port.clock),
+                        other_domain = candidate.domain,
+                        "PTP: ignoring another clock at the speaker's address"
+                    );
+                }
+                state.other_source_messages += 1;
+                false
+            }
+            None => {
+                if matches!(message, wire::Message::Announce { .. }) {
+                    state.source = Some(candidate);
+                }
+                true
+            }
+        }
+    }
+
     /// A Sync and its time are paired: take the sample, ask for the reverse
     /// path, and update the clock.
     fn forward_sample(
@@ -976,7 +1044,10 @@ impl Shared {
         sample: ForwardSample,
         event: &UdpSocket,
     ) {
-        state.sync_source.get_or_insert(header.source.clock);
+        state.source.get_or_insert(Source {
+            port: header.source,
+            domain: header.domain,
+        });
         state.first_follow_up_ns.get_or_insert(sample.received_ns);
         state.last_follow_up_ns = Some(sample.received_ns);
         state
@@ -991,7 +1062,9 @@ impl Shared {
         state.delay_req_sequence = state.delay_req_sequence.wrapping_add(1);
         let sequence = state.delay_req_sequence;
         let sent_ns = mono_now_ns();
-        let packet = wire::delay_req(self.identity, sequence, u128::from(sent_ns));
+        let mut packet = wire::delay_req(self.identity, sequence, u128::from(sent_ns));
+        // In the followed clock's domain (the header's domainNumber byte).
+        packet[4] = state.source.map_or(0, |source| source.domain);
         let to = SocketAddr::new(self.config.master, self.config.master_event_port);
         match event.send_to(&packet, to) {
             Ok(_) => {
@@ -1029,7 +1102,7 @@ impl Shared {
                 let timeline = state
                     .announce
                     .map(|announce| announce.grandmaster)
-                    .or(state.sync_source)
+                    .or(state.source.map(|source| source.port.clock))
                     .map(u64::from_be_bytes);
                 state.timeline_id = timeline;
                 tracing::info!(
@@ -1276,6 +1349,8 @@ impl PtpFollower {
                 .map_or(0, OffsetEstimator::reverse_samples),
             syncs: state.syncs,
             delay_responses: state.delay_responses,
+            source: state.source,
+            other_source_messages: state.other_source_messages,
             lost: state.lost.clone(),
         }
     }

@@ -42,6 +42,11 @@ pub struct Behaviour {
     pub answer_delay_req: bool,
     /// Send nothing at all.
     pub silent: bool,
+    /// The PTP domain of everything it sends.
+    pub domain: u8,
+    /// The grandmaster its Announces name, if not itself: it then relays
+    /// another clock's time, as a HomePod following an Apple TV would.
+    pub announced_grandmaster: Option<[u8; 8]>,
     /// Send each Follow_Up before its Sync (by `FOLLOW_UP_LEAD`), as a
     /// reordering link, or two receiving threads, can present them.
     pub follow_up_first: bool,
@@ -62,6 +67,8 @@ impl Default for Behaviour {
             spike: Duration::ZERO,
             answer_delay_req: true,
             silent: false,
+            domain: 0,
+            announced_grandmaster: None,
             follow_up_first: false,
         }
     }
@@ -210,6 +217,12 @@ impl Drop for FakeGrandmaster {
     }
 }
 
+/// `packet` in PTP domain `domain` (the header's domainNumber byte).
+fn in_domain(mut packet: Vec<u8>, domain: u8) -> Vec<u8> {
+    packet[4] = domain;
+    packet
+}
+
 /// Something to send once the simulated network delivers it.
 enum Outgoing {
     Packet {
@@ -281,7 +294,7 @@ fn run_grandmaster(
                 priority2: 239,
                 clock_accuracy: 0x21,
                 variance: 17258,
-                ..AnnounceBody::follower(current.identity)
+                ..AnnounceBody::follower(current.announced_grandmaster.unwrap_or(current.identity))
             };
             queue.push_back((
                 now + delay,
@@ -313,11 +326,16 @@ fn run_grandmaster(
                     } else {
                         follower_event
                     };
-                    let _ = socket.send_to(&bytes, to);
+                    let _ = socket.send_to(&in_domain(bytes, current.domain), to);
                 }
                 Outgoing::SyncPair { sequence, held_ns } => {
-                    let sync = wire::sync(source, sequence, true, 0);
-                    let follow_up = |sent: i128| wire::follow_up(source, sequence, sent as u128, 0);
+                    let sync = in_domain(wire::sync(source, sequence, true, 0), current.domain);
+                    let follow_up = |sent: i128| {
+                        in_domain(
+                            wire::follow_up(source, sequence, sent as u128, 0),
+                            current.domain,
+                        )
+                    };
                     if current.follow_up_first {
                         // The Sync leaves FOLLOW_UP_LEAD later (spun for, so
                         // its time is right to the microsecond).

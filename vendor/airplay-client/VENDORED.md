@@ -60,7 +60,12 @@ never change the speaker volume, so the crate is vendored and patched.
    (15 s), changes, or jumps (over 50 ms for 3 s). Sync and Follow_Up arrive
    on two sockets read by two threads, so either can be handled first:
    `SyncPairer` pairs them in either order (on port identity, domain and
-   sequence), each waiting at most 1 s and 32 deep. `src/media_clock.rs`
+   sequence), each waiting at most 1 s and 32 deep. Only one clock is
+   followed: the port identity and domain of the first Announce (or of the
+   first Sync paired before any Announce); messages from any other port or
+   domain at the speaker's address are ignored (counted), so they can neither
+   move the estimate nor keep a silent clock looking alive. Delay_Req goes out
+   in the followed clock's domain. `src/media_clock.rs`
    (`MediaClock`, exported) hands that clock to the host's output pacer.
 4. **Buffered sessions.** `Connection::setup` and `start_streaming_live`
    hand buffered stream configurations (`StreamType::Buffered`) to a new

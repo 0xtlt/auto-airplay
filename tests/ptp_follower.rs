@@ -193,7 +193,8 @@ fn reports_a_replaced_grandmaster() {
     let gm = FakeGrandmaster::start(Behaviour::default());
     let follower = gm.start_follower();
     wait_locked(&follower);
-    gm.change(|behaviour| behaviour.identity = [9, 8, 7, 6, 5, 4, 3, 2]);
+    // The speaker's own port now relays another grandmaster: a new timeline.
+    gm.change(|behaviour| behaviour.announced_grandmaster = Some([9, 8, 7, 6, 5, 4, 3, 2]));
     thread::sleep(Duration::from_millis(600));
     let lost = follower.lost().expect("a new grandmaster must be reported");
     assert!(lost.contains("grandmaster changed"), "{lost}");
@@ -373,6 +374,95 @@ fn pairer_keeps_a_bounded_number_waiting() {
         pairer.sync(key(2, 0, sequence), 0, 0);
     }
     assert_eq!(pairer.waiting(), (PENDING_LIMIT, PENDING_LIMIT));
+}
+
+// ----- one clock followed -----
+
+/// A second grandmaster at the same address (the loopback one), aimed at
+/// `follower`, its clock 3 s ahead of the first.
+fn second_clock(follower: &PtpFollower, behaviour: Behaviour) -> FakeGrandmaster {
+    let other = FakeGrandmaster::start(Behaviour {
+        step_ns: 3_000_000_000,
+        ..behaviour
+    });
+    other.target(follower);
+    other
+}
+
+#[test]
+fn ignores_another_clock_at_the_same_address() {
+    let gm = FakeGrandmaster::start(Behaviour::default());
+    let follower = gm.start_follower();
+    wait_locked(&follower);
+    // Another clock, even one ranking better, at the speaker's address.
+    let _other = second_clock(
+        &follower,
+        Behaviour {
+            identity: [9, 8, 7, 6, 5, 4, 3, 2],
+            priority1: 200,
+            ..Behaviour::default()
+        },
+    );
+    thread::sleep(Duration::from_millis(1_500));
+
+    let status = follower.status();
+    assert!(status.lost.is_none(), "{status:?}");
+    assert!(status.other_source_messages > 0, "{status:?}");
+    assert_eq!(
+        status.source.map(|source| source.port.clock),
+        Some(GM_IDENTITY)
+    );
+    assert_eq!(
+        follower.timeline_id(),
+        Some(u64::from_be_bytes(GM_IDENTITY))
+    );
+    let error = worst_error_ms(&gm, &follower, Duration::from_millis(500));
+    assert!(error < 2.0, "clock off by {error:.3} ms");
+}
+
+#[test]
+fn ignores_the_same_clock_in_another_domain() {
+    let gm = FakeGrandmaster::start(Behaviour::default());
+    let follower = gm.start_follower();
+    wait_locked(&follower);
+    let _other = second_clock(
+        &follower,
+        Behaviour {
+            domain: 1,
+            ..Behaviour::default()
+        },
+    );
+    thread::sleep(Duration::from_millis(1_500));
+
+    let status = follower.status();
+    assert!(status.lost.is_none(), "{status:?}");
+    assert!(status.other_source_messages > 0, "{status:?}");
+    assert_eq!(status.source.map(|source| source.domain), Some(0));
+    let error = worst_error_ms(&gm, &follower, Duration::from_millis(500));
+    assert!(error < 2.0, "clock off by {error:.3} ms");
+}
+
+#[test]
+fn another_clock_does_not_keep_a_silent_one_alive() {
+    let gm = FakeGrandmaster::start(Behaviour::default());
+    let follower = gm.start_follower_with(FollowerConfig {
+        silence_limit: Duration::from_millis(800),
+        ..gm.follower_config()
+    });
+    wait_locked(&follower);
+    let _other = second_clock(
+        &follower,
+        Behaviour {
+            identity: [9, 8, 7, 6, 5, 4, 3, 2],
+            ..Behaviour::default()
+        },
+    );
+    gm.change(|behaviour| behaviour.silent = true);
+    thread::sleep(Duration::from_millis(1_600));
+    let lost = follower
+        .lost()
+        .expect("the followed clock is silent, whatever the other one sends");
+    assert!(lost.contains("no PTP Sync"), "{lost}");
 }
 
 // ----- estimator and clock model -----

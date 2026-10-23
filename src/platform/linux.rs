@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 
 use crate::audio::{AudioFormat, FormatCandidate, select_best_format};
-use crate::config::{AudioConfig, ConfigStore, InputConfig, InputKind};
+use crate::config::{AudioConfig, ConfigStore, InputConfig, InputKind, StreamMode};
 use crate::discovery::select_output;
 
 const COMMON_SAMPLE_RATES: [u32; 8] = [
@@ -332,8 +332,34 @@ pub async fn doctor(store: &ConfigStore) -> Result<()> {
     let output = select_output(&outputs, selector)
         .with_context(|| format!("AirPlay output `{selector}` is not reachable"))?;
     println!("[ok] output: {} ({})", output.name, output.model);
+    if config.output.stream_mode == StreamMode::Buffered {
+        print_ptp_ports_check();
+    }
     println!("Ready.");
     Ok(())
+}
+
+/// Buffered mode follows the speaker's PTP clock on UDP 319 and 320.
+fn print_ptp_ports_check() {
+    use std::io::ErrorKind;
+    use std::net::UdpSocket;
+
+    let result = UdpSocket::bind(("0.0.0.0", 319)).and_then(|event| {
+        let general = UdpSocket::bind(("0.0.0.0", 320))?;
+        Ok((event, general))
+    });
+    match result {
+        Ok(_) => println!("[ok] buffered mode: UDP ports 319 and 320 (PTP) are free"),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => println!(
+            "[info] buffered mode: this shell cannot bind UDP 319 and 320 (PTP); the systemd \
+             unit grants the daemon CAP_NET_BIND_SERVICE for that"
+        ),
+        Err(error) if error.kind() == ErrorKind::AddrInUse => println!(
+            "[warn] buffered mode: UDP 319 or 320 (PTP) is in use: by the running daemon, or by \
+             another PTP daemon, which would make buffered mode fall back to realtime"
+        ),
+        Err(error) => println!("[warn] buffered mode: cannot bind UDP 319 and 320 (PTP): {error}"),
+    }
 }
 
 pub(crate) fn alsa_device_name(input: &InputConfig) -> Result<String> {

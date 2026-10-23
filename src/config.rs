@@ -105,6 +105,19 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    /// Checks the output settings. The daemon refuses to start with a
+    /// configuration that fails this check.
+    pub fn validate_output(&self) -> Result<(), String> {
+        if !SPEAKER_BUFFER_MS_RANGE.contains(&self.output.speaker_buffer_ms) {
+            return Err(format!(
+                "output speaker_buffer_ms must be between {} and {}",
+                SPEAKER_BUFFER_MS_RANGE.start(),
+                SPEAKER_BUFFER_MS_RANGE.end()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Why an obsolete key is ignored, and what replaces it.
@@ -189,7 +202,15 @@ pub struct OutputConfig {
     pub protocol: OutputProtocol,
     pub auto_reconnect: bool,
     pub discovery_timeout_seconds: u64,
+    /// Realtime streams: how long before it plays each packet is announced.
     pub render_delay_ms: u32,
+    /// How the AirPlay 2 speaker is fed (see [`StreamMode`]).
+    pub stream_mode: StreamMode,
+    /// Buffered streams: how much audio the speaker holds (ms): each packet
+    /// is sent this long before it plays, so a network stall shorter than it
+    /// is not heard. It is also the latency the mode adds. Must be within
+    /// [`SPEAKER_BUFFER_MS_RANGE`].
+    pub speaker_buffer_ms: u32,
 }
 
 impl Default for OutputConfig {
@@ -200,9 +221,32 @@ impl Default for OutputConfig {
             auto_reconnect: true,
             discovery_timeout_seconds: 4,
             render_delay_ms: 250,
+            stream_mode: StreamMode::Realtime,
+            speaker_buffer_ms: DEFAULT_SPEAKER_BUFFER_MS,
         }
     }
 }
+
+/// How audio is streamed to an AirPlay 2 speaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamMode {
+    /// AirPlay 2 realtime audio (type 96): ALAC over UDP, each packet sent
+    /// just in time; the speaker only holds `render_delay_ms`.
+    #[default]
+    Realtime,
+    /// AirPlay 2 buffered audio (type 103), what an Apple TV sends to a
+    /// HomePod: AAC over TCP, anchored to the speaker's PTP clock, sent
+    /// `speaker_buffer_ms` ahead. Needs UDP ports 319 and 320 (PTP).
+    Buffered,
+}
+
+/// Default of `output.speaker_buffer_ms`.
+pub const DEFAULT_SPEAKER_BUFFER_MS: u32 = 2_000;
+
+/// Accepted values of `output.speaker_buffer_ms`: half a second (still
+/// above the 470 ms Wi-Fi stalls this mode is for) to ten seconds.
+pub const SPEAKER_BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> = 500..=10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

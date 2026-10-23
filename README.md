@@ -111,6 +111,10 @@ reconnect_delay_seconds = 3
 [output]
 # Reconnect (instead of exiting) when the speaker connection is lost.
 auto_reconnect = true
+# "realtime" (default) or "buffered": see "AirPlay 2 buffered mode" below.
+stream_mode = "realtime"
+# Buffered mode only: audio the speaker holds, 500 to 10000 ms. Adds latency.
+speaker_buffer_ms = 2000
 ```
 
 ## Bluetooth packet loss
@@ -139,6 +143,39 @@ Each second, the sender tells the speaker in a sync packet when a given RTP time
 Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
 
 `cargo test --test sender_timing -- --ignored --nocapture` times this against the pinned upstream sender and prints the comparison. It needs a machine that keeps real time, so `cargo test` alone only checks what holds however the test is scheduled: anchors stay on the timeline or restart it, never move a little.
+
+## AirPlay 2 buffered mode
+
+Realtime mode (the default) sends each packet over UDP just before it is due: the speaker only holds about 170 ms of audio, so a Wi-Fi stall longer than that is heard as a stutter or a slowdown. Buffered mode streams the way an Apple TV does to a HomePod (AirPlay 2 stream type 103):
+
+- AAC at 256 kbps over TCP: nothing is lost, a stalled packet is retransmitted;
+- one anchor on the speaker's PTP clock, then the speaker plays on its own clock;
+- the speaker holds `speaker_buffer_ms` of audio (2 s by default), so stalls shorter than that are not heard.
+
+Turn it on:
+
+```toml
+[output]
+stream_mode = "buffered"
+# speaker_buffer_ms = 2000
+```
+
+The daemon picks up the change by itself (it restarts on configuration changes). `auto-airplay output test` plays the tone in the configured mode and shows the error if buffered mode cannot start. `auto-airplay doctor` checks the PTP ports.
+
+Latency, measured from the moment audio is handed to the AirPlay sender to the moment it is due to play (loopback, `cargo test --test buffered_session -- --ignored --nocapture`):
+
+| mode | handoff to play |
+|---|---|
+| realtime (`render_delay_ms = 250`) | 1635 ms (about 1.46 s queued in the sender, 0.17 s in the speaker) |
+| buffered (`speaker_buffer_ms = 2000`) | 2047 ms (almost all of it in the speaker) |
+
+Buffered mode adds about 410 ms with the default buffer, and 100 ms more or less per 100 ms of `speaker_buffer_ms`. The jitter buffer (`audio.jitter_buffer_ms`, 400 ms) comes on top in both modes.
+
+Requirements and limits:
+
+- **UDP ports 319 and 320.** The speaker's PTP clock is followed on them. The systemd unit grants `CAP_NET_BIND_SERVICE` for that from this version on: reinstall the unit (or add the capability to an existing one), and do not run another PTP daemon (`ptp4l`, `nqptp`) on the same machine.
+- **Fallback.** If a buffered stream cannot be set up (ports, no PTP answer, speaker refusing it), the daemon logs `AirPlay buffered stream unavailable; falling back to realtime for this session` and plays in realtime mode. The next session tries buffered again.
+- **Experimental.** The session is tested end to end against a fake speaker (RTSP, PTP grandmaster, TCP data port, AAC decoding), not yet against a real HomePod. In the logs, a working session shows `PTP: following the speaker's clock`, `the speaker accepted a buffered stream` and `buffered stream started`.
 
 ## Speaker volume
 
@@ -231,7 +268,7 @@ The original Pi Zero and Pi 1 are experimental because AirPlay encryption and AL
 - No PIN, password, or audio content is written to logs.
 - Configuration writes are atomic and use mode `0600`.
 - Debug logs from protocol dependencies are disabled by default. The one exception is the speaker's events channel (`events channel …` lines), which is logged at info level to diagnose dropped sessions; it records request methods and sizes, never keys or content.
-- The systemd template restricts filesystem access and grants only real-time scheduling capability.
+- The systemd template restricts filesystem access and grants only two capabilities: real-time scheduling, and binding the PTP ports 319 and 320 (buffered mode).
 
 Do not commit a real configuration file. Common secret and configuration filenames are ignored by Git.
 

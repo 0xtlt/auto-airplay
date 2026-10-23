@@ -1,9 +1,10 @@
 //! Feeding the AirPlay sender: pacing, and telling a dead stream from a busy one.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airplay_client::LiveAudioDecoder;
+use airplay_client::{LiveAudioDecoder, MediaClock};
 use auto_airplay::playout::{Feed, STALL_LIMIT, Stream};
 use auto_airplay::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES};
 
@@ -210,5 +211,62 @@ fn a_chunk_of_the_wrong_size_is_never_sent() {
         assert_eq!(fed, Feed::Idle);
         let received = fixture.decoder.as_mut().unwrap().decode_frame().unwrap();
         assert!(received.is_none());
+    }
+}
+
+/// Chunks a stream sends over 10 s of the playout thread's clock while its
+/// own clock (a buffered stream: the speaker's) runs `speaker_speed` times as
+/// fast, with an input that keeps up with the speaker.
+fn chunks_paced_on_the_speaker_clock(speaker_speed: f64) -> usize {
+    let mut buffer = JitterBuffer::new(RATE, CH as u8, 400);
+    buffer.push(&audio(RATE as usize));
+    buffer.start_playout();
+    let pacer = buffer.pacer();
+    let speaker_ns = Arc::new(AtomicU64::new(5_000_000_000));
+    let clock = {
+        let speaker_ns = Arc::clone(&speaker_ns);
+        MediaClock::from_fn(move || speaker_ns.load(Ordering::Relaxed))
+    };
+    let (sender, mut decoder) = LiveAudioDecoder::create_pair(RATE, CH as u8, 64);
+    let mut stream = Stream::with_clock(sender, pacer, clock);
+    stream.arm();
+    let buffer = Mutex::new(buffer);
+    let mut chunk = vec![0; PLAYOUT_CHUNK_FRAMES * CH];
+    let start = Instant::now();
+    let tick_ns = (STEP.as_nanos() as f64 * speaker_speed) as u64;
+    let input_frames = (RATE as f64 / 100.0 * speaker_speed).round() as usize;
+    let mut sent = 0;
+    for tick in 1..=1_000u32 {
+        speaker_ns.fetch_add(tick_ns, Ordering::Relaxed);
+        buffer.lock().unwrap().push(&audio(input_frames));
+        // The playout thread's own clock says 10 ms per tick.
+        let playout_now = STEP * tick;
+        if stream.feed(
+            &buffer,
+            &mut chunk,
+            (CH as u8, RATE),
+            playout_now,
+            start + playout_now,
+        ) == Feed::Sent
+        {
+            sent += 1;
+        }
+        while decoder.decode_frame().unwrap().is_some() {}
+    }
+    sent
+}
+
+#[test]
+fn a_buffered_stream_is_paced_on_the_speaker_clock() {
+    // 10 s of the thread's clock are 10.5 s of a speaker clock 5 % fast:
+    // the stream must deliver what the speaker plays, 23 chunks more.
+    let per_second = f64::from(RATE) / PLAYOUT_CHUNK_FRAMES as f64;
+    for speed in [1.0, 1.05, 0.95] {
+        let sent = chunks_paced_on_the_speaker_clock(speed) as f64;
+        let expected = 10.0 * speed * per_second;
+        assert!(
+            (sent - expected).abs() < 4.0,
+            "speaker at {speed}: {sent} chunks, expected {expected:.1}"
+        );
     }
 }

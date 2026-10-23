@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use airplay_client::{LiveFrameSender, LivePcmFrame};
+use airplay_client::{LiveFrameSender, LivePcmFrame, MediaClock};
 
 use crate::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES, Pacer, StatsSnapshot};
 
@@ -31,6 +31,11 @@ pub enum Feed {
 pub struct Stream {
     sender: LiveFrameSender,
     pacer: Pacer,
+    /// The clock the stream plays on, if not the playout thread's, and its
+    /// reading when the stream was attached. A buffered stream plays on the
+    /// speaker's clock: paced on it, the audio neither piles up in the
+    /// speaker nor runs short, however far the two clocks drift apart.
+    clock: Option<(MediaClock, u64)>,
     /// Stall detection only runs once the stream is playing: while it starts
     /// up, the queue legitimately stays full and refused chunks are dropped.
     armed: bool,
@@ -45,8 +50,18 @@ impl Stream {
         Self {
             sender,
             pacer,
+            clock: None,
             armed: false,
             refusing_since: None,
+        }
+    }
+
+    /// A stream paced on `clock` instead of the playout thread's clock.
+    pub fn with_clock(sender: LiveFrameSender, pacer: Pacer, clock: MediaClock) -> Self {
+        let start = clock.now_ns();
+        Self {
+            clock: Some((clock, start)),
+            ..Self::new(sender, pacer)
         }
     }
 
@@ -57,8 +72,9 @@ impl Stream {
     }
 
     /// Offers the stream the next chunk if one is due. `now` is the time on
-    /// the clock that paces the output, `clock` the time for stall detection;
-    /// the caller never sleeps with the buffer locked.
+    /// the clock that paces the output (unless the stream has a clock of its
+    /// own), `clock` the time for stall detection; the caller never sleeps
+    /// with the buffer locked.
     ///
     /// The sender is only offered audio while its queue has room, at the pace
     /// of the [`Pacer`].
@@ -70,6 +86,12 @@ impl Stream {
         now: Duration,
         clock: Instant,
     ) -> Feed {
+        let now = match &self.clock {
+            Some((stream_clock, start)) => {
+                Duration::from_nanos(stream_clock.now_ns().saturating_sub(*start))
+            }
+            None => now,
+        };
         if self.sender.is_full() {
             self.pacer.blocked(now);
             return self.refused(clock);
@@ -150,11 +172,20 @@ impl AudioSink {
     /// Starts forwarding frames to a new stream and clears any earlier failure.
     /// Playback starts from the audio queued in the jitter buffer.
     pub fn attach(&self, sender: LiveFrameSender) {
+        self.attach_with_clock(sender, None);
+    }
+
+    /// Same as [`attach`](Self::attach), the stream paced on `clock` if given
+    /// (a buffered stream plays on the speaker's clock).
+    pub fn attach_with_clock(&self, sender: LiveFrameSender, clock: Option<MediaClock>) {
         let mut stream = self.stream();
         *stream = self.installed().map(|buffer| {
             let mut buffer = lock(&buffer);
             buffer.start_playout();
-            Stream::new(sender, buffer.pacer())
+            match clock {
+                Some(clock) => Stream::with_clock(sender, buffer.pacer(), clock),
+                None => Stream::new(sender, buffer.pacer()),
+            }
         });
         self.failed.store(false, Ordering::Release);
     }

@@ -1,4 +1,7 @@
-use auto_airplay::config::{AppConfig, ConfigStore, OutputProtocol};
+use auto_airplay::config::{
+    AppConfig, ConfigStore, DEFAULT_SPEAKER_BUFFER_MS, OutputProtocol, SPEAKER_BUFFER_MS_RANGE,
+    StreamMode,
+};
 
 #[test]
 fn configuration_round_trips_without_losing_device_choices() {
@@ -475,4 +478,86 @@ fn changing_the_jitter_buffer_is_a_configuration_change() {
     assert_eq!(base, audio_from("[audio]\njitter_buffer_ms = 400\n"));
     assert_ne!(base, audio_from("[audio]\njitter_buffer_ms = 401\n"));
     assert_ne!(base, audio_from("[audio]\njitter_buffer_ms = 2000\n"));
+}
+
+// ----- AirPlay 2 buffered mode -----
+
+#[test]
+fn stream_mode_defaults_to_realtime_for_existing_configurations() {
+    let config = config_from("[output]\nselector = \"Salon\"\nrender_delay_ms = 250\n");
+
+    assert_eq!(config.output.stream_mode, StreamMode::Realtime);
+    assert_eq!(config.output.speaker_buffer_ms, DEFAULT_SPEAKER_BUFFER_MS);
+    assert_eq!(DEFAULT_SPEAKER_BUFFER_MS, 2_000);
+    assert!(config.validate_output().is_ok());
+}
+
+#[test]
+fn buffered_mode_is_enabled_by_one_key_and_survives_a_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[output]\nselector = \"Salon\"\nstream_mode = \"buffered\"\n",
+    )
+    .unwrap();
+    let store = ConfigStore::new(path.clone());
+
+    let config = store.load().unwrap();
+    assert_eq!(config.output.stream_mode, StreamMode::Buffered);
+    assert_eq!(config.output.speaker_buffer_ms, 2_000);
+
+    store.save(&config).unwrap();
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(raw.contains("stream_mode = \"buffered\""), "{raw}");
+    assert!(raw.contains("speaker_buffer_ms = 2000"), "{raw}");
+    assert_eq!(store.load().unwrap(), config);
+}
+
+#[test]
+fn default_configuration_writes_the_realtime_mode() {
+    let raw = toml::to_string_pretty(&AppConfig::default()).unwrap();
+    assert!(raw.contains("stream_mode = \"realtime\""), "{raw}");
+}
+
+#[test]
+fn unknown_stream_modes_are_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[output]\nstream_mode = \"burst\"\n").unwrap();
+
+    assert!(ConfigStore::new(path).load().is_err());
+}
+
+#[test]
+fn buffered_latency_bounds_are_validated() {
+    for (value, valid) in [
+        (499, false),
+        (500, true),
+        (2_000, true),
+        (10_000, true),
+        (10_001, false),
+    ] {
+        let config = config_from(&format!(
+            "[output]\nstream_mode = \"buffered\"\nspeaker_buffer_ms = {value}\n"
+        ));
+        assert_eq!(config.validate_output().is_ok(), valid, "{value}");
+        if !valid {
+            let message = config.validate_output().unwrap_err();
+            assert!(message.contains("speaker_buffer_ms"), "{message}");
+        }
+    }
+    assert_eq!(SPEAKER_BUFFER_MS_RANGE, 500..=10_000);
+}
+
+#[test]
+fn switching_the_stream_mode_is_a_configuration_change() {
+    let realtime = config_from("[output]\nselector = \"Salon\"\n");
+    let buffered = config_from("[output]\nselector = \"Salon\"\nstream_mode = \"buffered\"\n");
+    let longer = config_from(
+        "[output]\nselector = \"Salon\"\nstream_mode = \"buffered\"\nspeaker_buffer_ms = 3000\n",
+    );
+
+    assert_ne!(realtime, buffered);
+    assert_ne!(buffered, longer);
 }

@@ -2,13 +2,20 @@ use std::io::Seek;
 use std::time::Duration;
 
 use airplay_audio::AudioDecoder;
-use airplay_client::{AirPlayClient, RaopConnection};
+use airplay_client::{
+    AirPlayClient, LiveAudioDecoder, LiveFrameSender, LivePcmFrame, MediaClock, RaopConnection,
+};
 use airplay_core::Device;
 use anyhow::{Context, Result, bail};
 
 use crate::audio::{sine_wave, write_pcm16_wav};
-use crate::config::{OutputConfig, OutputProtocol};
+use crate::config::{OutputConfig, OutputProtocol, StreamMode};
 use crate::discovery::{DiscoveredOutput, select_output};
+
+/// Sample rate of the test tone sent as a live stream.
+const TONE_RATE: u32 = 44_100;
+/// Frames per chunk of the live test tone (what the AirPlay sender takes).
+const TONE_CHUNK_FRAMES: usize = 1024;
 
 pub async fn discover_outputs(seconds: u64) -> Result<Vec<DiscoveredOutput>> {
     let devices = discover_devices(seconds).await?;
@@ -63,6 +70,38 @@ pub async fn test_output(
             connection.stop().await?;
             connection.disconnect().await?;
         }
+        OutputProtocol::AirPlay2 if config.stream_mode == StreamMode::Buffered => {
+            // No fallback here: this is the place to see why buffered mode
+            // does not work with a speaker.
+            let latency = Duration::from_millis(config.speaker_buffer_ms.into());
+            println!(
+                "Buffered mode: the tone starts about {:.1} s after streaming starts.",
+                latency.as_secs_f32()
+            );
+            let mut client = AirPlayClient::new()?;
+            client.set_buffered(latency);
+            client
+                .connect(&device)
+                .await
+                .context("cannot set up a buffered AirPlay stream")?;
+            let clock = client
+                .media_clock()
+                .context("the speaker's clock is not followed")?;
+            let (sender, decoder) = LiveAudioDecoder::create_pair(TONE_RATE, 2, 64);
+            let tone = sine_wave(TONE_RATE, 2, frequency, duration);
+            let feeder = std::thread::spawn(move || feed_live_tone(&sender, &clock, &tone));
+            client.start_live_streaming_with_decoder(decoder).await?;
+            tokio::time::sleep(Duration::from_secs_f32(duration + 1.0) + latency).await;
+            if let Some(stats) = client.buffered_stats() {
+                println!(
+                    "Sent {} packets ({} bytes), {} dropped.",
+                    stats.sent, stats.bytes, stats.dropped
+                );
+            }
+            let _ = feeder.join();
+            client.stop().await?;
+            client.disconnect().await?;
+        }
         OutputProtocol::AirPlay2 => {
             let mut client = AirPlayClient::new()?;
             client.set_render_delay_ms(config.render_delay_ms);
@@ -76,6 +115,29 @@ pub async fn test_output(
 
     println!("Output test completed successfully.");
     Ok(())
+}
+
+/// Hands `tone` (interleaved stereo at [`TONE_RATE`]) to a live stream in
+/// chunks, at the pace of the speaker's `clock`, as the daemon's playout does.
+fn feed_live_tone(sender: &LiveFrameSender, clock: &MediaClock, tone: &[i16]) {
+    let start = clock.now_ns();
+    for (index, chunk) in tone.chunks(TONE_CHUNK_FRAMES * 2).enumerate() {
+        let due = start + (index * TONE_CHUNK_FRAMES) as u64 * 1_000_000_000 / u64::from(TONE_RATE);
+        while clock.now_ns() < due {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The sender resamples whole chunks only: pad the last one.
+        let mut samples = chunk.to_vec();
+        samples.resize(TONE_CHUNK_FRAMES * 2, 0);
+        let frame = LivePcmFrame {
+            samples,
+            channels: 2,
+            sample_rate: TONE_RATE,
+        };
+        if !sender.send(frame) {
+            return;
+        }
+    }
 }
 
 async fn discover_devices(seconds: u64) -> Result<Vec<Device>> {

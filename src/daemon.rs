@@ -21,7 +21,7 @@ use tokio::time::MissedTickBehavior;
 use crate::capture::{AudioSink, CaptureHandle};
 use crate::config::ConfigStore;
 #[cfg(target_os = "linux")]
-use crate::config::{AppConfig, OutputProtocol};
+use crate::config::{AppConfig, OutputProtocol, StreamMode};
 #[cfg(target_os = "linux")]
 use crate::preemption::{
     ExitKind, PREEMPTIONS_ENV, PreemptionGate, backoff_delay, count_after, decode_preemptions,
@@ -119,6 +119,8 @@ struct OutputTarget {
     selector: String,
     discovery_seconds: u64,
     render_delay_ms: u32,
+    stream_mode: StreamMode,
+    buffered_latency: Duration,
     sample_rate: u32,
     channels: u8,
 }
@@ -171,9 +173,17 @@ async fn run_session(
         selector,
         discovery_seconds: config.output.discovery_timeout_seconds,
         render_delay_ms: config.output.render_delay_ms,
+        stream_mode: config.output.stream_mode,
+        buffered_latency: Duration::from_millis(config.output.speaker_buffer_ms.into()),
         sample_rate: input.format.sample_rate,
         channels: input.format.channels,
     };
+    if target.stream_mode == StreamMode::Buffered {
+        tracing::info!(
+            speaker_buffer_ms = config.output.speaker_buffer_ms,
+            "AirPlay 2 buffered mode: the speaker holds this much audio"
+        );
+    }
 
     // Capture runs for the whole session; the AirPlay output is only held
     // while there is something to play.
@@ -519,6 +529,11 @@ async fn acquire_with_interrupts(
 
 /// Discovers and connects to the speaker, then starts streaming. On success
 /// the connected client is left in `slot`; on failure it is torn down.
+///
+/// A buffered stream that cannot be set up (PTP ports unavailable, speaker
+/// refusing it, no PTP clock) falls back to a realtime stream for this
+/// session: music with the old margin beats silence. The next session tries
+/// buffered again.
 #[cfg(target_os = "linux")]
 async fn acquire_output(
     target: &OutputTarget,
@@ -526,8 +541,30 @@ async fn acquire_output(
     slot: &mut Option<AirPlayClient>,
 ) -> Result<()> {
     let device = resolve_target(target).await?;
-    let client = slot.insert(connect_device(&device, target.render_delay_ms).await?);
-    if let Err(error) = start_stream(client, target, sink).await {
+    if target.stream_mode == StreamMode::Buffered {
+        match acquire_with(&device, target, StreamMode::Buffered, sink, slot).await {
+            Ok(()) => return Ok(()),
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                hint = buffered_hint(&error),
+                "AirPlay buffered stream unavailable; falling back to realtime for this session"
+            ),
+        }
+    }
+    acquire_with(&device, target, StreamMode::Realtime, sink, slot).await
+}
+
+/// Connects to `device` and starts a stream of the given mode.
+#[cfg(target_os = "linux")]
+async fn acquire_with(
+    device: &Device,
+    target: &OutputTarget,
+    mode: StreamMode,
+    sink: &AudioSink,
+    slot: &mut Option<AirPlayClient>,
+) -> Result<()> {
+    let client = slot.insert(connect_device(device, target, mode).await?);
+    if let Err(error) = start_stream(client, target, mode, sink).await {
         sink.detach();
         if let Some(client) = slot.take() {
             disconnect_quietly(client).await;
@@ -535,6 +572,21 @@ async fn acquire_output(
         return Err(error);
     }
     Ok(())
+}
+
+/// What to do about a buffered stream that could not start, for the log.
+#[cfg(target_os = "linux")]
+fn buffered_hint(error: &anyhow::Error) -> &'static str {
+    let message = format!("{error:#}");
+    if message.contains("PTP ports") {
+        "UDP ports 319 and 320 are needed: grant CAP_NET_BIND_SERVICE (see the README) and make sure no other PTP daemon runs"
+    } else if message.contains("PTP") {
+        "the speaker's PTP clock did not answer; check that UDP 319 and 320 are not filtered"
+    } else if message.contains("buffered stream") {
+        "the speaker refused a buffered stream"
+    } else {
+        "see the error"
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -557,9 +609,16 @@ async fn resolve_target(target: &OutputTarget) -> Result<Device> {
 }
 
 #[cfg(target_os = "linux")]
-async fn connect_device(device: &Device, render_delay_ms: u32) -> Result<AirPlayClient> {
+async fn connect_device(
+    device: &Device,
+    target: &OutputTarget,
+    mode: StreamMode,
+) -> Result<AirPlayClient> {
     let mut client = AirPlayClient::new()?;
-    client.set_render_delay_ms(render_delay_ms);
+    client.set_render_delay_ms(target.render_delay_ms);
+    if mode == StreamMode::Buffered {
+        client.set_buffered(target.buffered_latency);
+    }
     tokio::time::timeout(CONNECT_TIMEOUT, client.connect(device))
         .await
         .context("connecting to the AirPlay output timed out")??;
@@ -570,11 +629,24 @@ async fn connect_device(device: &Device, render_delay_ms: u32) -> Result<AirPlay
 async fn start_stream(
     client: &mut AirPlayClient,
     target: &OutputTarget,
+    mode: StreamMode,
     sink: &AudioSink,
 ) -> Result<()> {
     let (sender, decoder) = LiveAudioDecoder::create_pair(target.sample_rate, target.channels, 64);
-    sink.attach(sender);
-    tokio::time::sleep(PREFILL).await;
+    match mode {
+        StreamMode::Realtime => {
+            sink.attach(sender);
+            tokio::time::sleep(PREFILL).await;
+        }
+        // The speaker buffers: no prefill. The output is paced on the
+        // speaker's clock, which the buffered stream plays on.
+        StreamMode::Buffered => {
+            let clock = client
+                .media_clock()
+                .context("the speaker's clock is not followed")?;
+            sink.attach_with_clock(sender, Some(clock));
+        }
+    }
     tokio::time::timeout(
         REQUEST_TIMEOUT,
         client.start_live_streaming_with_decoder(decoder),
@@ -689,6 +761,9 @@ fn validate_config(config: AppConfig) -> Result<AppConfig> {
         bail!("no output configured");
     }
     if let Err(message) = config.validate_detection() {
+        bail!(message);
+    }
+    if let Err(message) = config.validate_output() {
         bail!(message);
     }
     Ok(config)

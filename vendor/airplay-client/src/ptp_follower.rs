@@ -20,7 +20,7 @@
 //! the fastest Sync bounds the offset from below and the fastest Delay_Req
 //! from above, whatever the spikes in between ([`OffsetEstimator`]). The
 //! published clock only slews toward that estimate, at most 500 ppm, so it is
-//! continuous ([`ClockModel`]).
+//! continuous and runs within 500 ppm of the local clock ([`ClockModel`]).
 //!
 //! Times on this machine are `airplay_audio::timeline::mono_now_ns` (the
 //! monotonic clock), the same clock the rest of the sender uses.
@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -716,12 +716,30 @@ struct State {
     lost: Option<String>,
 }
 
+/// The offset clock readings use: it moves from `offset_ns` (at local time
+/// `local_ns`) toward the model's `target_ns` at [`SLEW_PPM`], so the clock is
+/// continuous and its rate stays within 500 ppm of the local clock's.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClockLine {
+    local_ns: u64,
+    offset_ns: i128,
+    target_ns: i128,
+}
+
+impl ClockLine {
+    fn offset_at(&self, local_ns: u64) -> i128 {
+        let elapsed = i128::from(local_ns.saturating_sub(self.local_ns));
+        let reach = elapsed * SLEW_PPM / 1_000_000;
+        self.offset_ns + (self.target_ns - self.offset_ns).clamp(-reach, reach)
+    }
+}
+
 struct Shared {
     config: FollowerConfig,
     identity: wire::PortIdentity,
     state: Mutex<State>,
-    /// Published offset (valid once `locked`).
-    offset_ns: AtomicI64,
+    /// What clock readings are made of (valid once `locked`).
+    line: Mutex<ClockLine>,
     locked: AtomicBool,
     /// Last clock reading handed out: readings never go backwards.
     last_reading_ns: AtomicU64,
@@ -738,10 +756,16 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn line(&self) -> MutexGuard<'_, ClockLine> {
+        self.line
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn now_ns(&self) -> u64 {
-        let local = i128::from(mono_now_ns());
-        let offset = i128::from(self.offset_ns.load(Ordering::Acquire));
-        let now = (local + offset).clamp(0, i128::from(u64::MAX)) as u64;
+        let line = *self.line();
+        let local = mono_now_ns();
+        let now = (i128::from(local) + line.offset_at(local)).clamp(0, i128::from(u64::MAX)) as u64;
         let previous = self.last_reading_ns.fetch_max(now, Ordering::AcqRel);
         previous.max(now)
     }
@@ -927,9 +951,21 @@ impl Shared {
                 self.lose(state, reason);
             }
         }
-        if let Some(offset) = state.model.offset_ns() {
-            let offset = offset.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-            self.offset_ns.store(offset, Ordering::Release);
+        if let Some(target) = state.model.offset_ns() {
+            let local = mono_now_ns();
+            let mut line = self.line();
+            // The first estimate is taken whole; later ones are slewed to.
+            let offset = if self.locked.load(Ordering::Acquire) {
+                line.offset_at(local)
+            } else {
+                target
+            };
+            *line = ClockLine {
+                local_ns: local,
+                offset_ns: offset,
+                target_ns: target,
+            };
+            drop(line);
             if state.timeline_id.is_some() {
                 self.locked.store(true, Ordering::Release);
             }
@@ -985,7 +1021,7 @@ impl PtpFollower {
             config,
             identity,
             state: Mutex::new(state),
-            offset_ns: AtomicI64::new(0),
+            line: Mutex::new(ClockLine::default()),
             locked: AtomicBool::new(false),
             last_reading_ns: AtomicU64::new(0),
             running: AtomicBool::new(true),

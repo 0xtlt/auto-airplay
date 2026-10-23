@@ -137,18 +137,34 @@ fn never_goes_backwards_and_never_jumps() {
     let follower = gm.start_follower();
     wait_locked(&follower);
     let clock = follower.clock();
-    let mut previous = (mono_now_ns(), clock.now_ns());
+    // A reading between two local readings, retried if preempted between them.
+    let read = || loop {
+        let before = mono_now_ns();
+        let media = clock.now_ns();
+        let after = mono_now_ns();
+        if after - before < 20_000 {
+            return (before, media, after);
+        }
+    };
+    let mut previous = read();
     for _ in 0..2_000 {
         thread::sleep(Duration::from_micros(500));
-        let now = (mono_now_ns(), clock.now_ns());
+        let now = read();
         assert!(now.1 >= previous.1, "the clock went backwards");
-        let local = now.0 - previous.0;
+        // The clock runs within 500 ppm of the local one: between two
+        // readings it moves as much as the local clock could have, give or
+        // take 500 ppm.
         let media = now.1 - previous.1;
-        // The clock moves at each Sync by at most 500 ppm of the time since
-        // the previous one (63 µs at 8 Hz): allow that, the slew over the
-        // interval, and the jitter of reading two clocks (35 µs).
-        let allowed = local + local / 1_000 + 100_000;
-        assert!(media <= allowed, "jumped {media} ns in {local} ns");
+        let longest = now.2 - previous.0;
+        let shortest = now.0 - previous.2;
+        assert!(
+            media <= longest + longest / 2_000 + 1,
+            "jumped: {media} ns in at most {longest} ns"
+        );
+        assert!(
+            media + shortest / 2_000 + 1 >= shortest,
+            "stalled: {media} ns in at least {shortest} ns"
+        );
         previous = now;
     }
 }

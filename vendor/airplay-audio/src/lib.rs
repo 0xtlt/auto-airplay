@@ -19,6 +19,9 @@ mod live_decoder;
 mod rtp;
 mod buffer;
 mod streamer;
+/// Public only so the integration tests of the host crate can drive it.
+#[doc(hidden)]
+pub mod timeline;
 mod traits;
 
 pub use decoder::{AudioDecoder, DecodedFrame};

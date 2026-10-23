@@ -81,9 +81,10 @@ pub struct LiveAudioDecoder {
 impl LiveAudioDecoder {
     /// Create a new live decoder with the given channel receiver.
     ///
-    /// NOTE: The default receive timeout is 5ms to prevent blocking the streamer
-    /// loop when the capture catches up. This allows the streamer to continue
-    /// running and sending buffered frames even when no new data is available.
+    /// Local patch: the default receive timeout is zero. Decoding takes what
+    /// has arrived and never waits for more: the streamer decodes from its
+    /// send loop, and upstream's 2 ms wait, taken whenever the capture had
+    /// caught up, delayed every packet behind it.
     pub fn new(rx: Receiver<LivePcmFrame>, sample_rate: u32, channels: u8) -> Self {
         Self {
             rx,
@@ -92,7 +93,7 @@ impl LiveAudioDecoder {
             position_samples: 0,
             eof: false,
             residual_samples: Vec::new(),
-            recv_timeout: Duration::from_millis(2), // Very short timeout to prevent blocking!
+            recv_timeout: Duration::ZERO, // Local patch: never block (was 2 ms)
             resampler: None,
         }
     }
@@ -152,7 +153,15 @@ impl LiveAudioDecoder {
             return Ok(None);
         }
 
-        match self.rx.recv_timeout(self.recv_timeout) {
+        let received = if self.recv_timeout.is_zero() {
+            self.rx.try_recv().map_err(|error| match error {
+                crossbeam_channel::TryRecvError::Empty => crossbeam_channel::RecvTimeoutError::Timeout,
+                crossbeam_channel::TryRecvError::Disconnected => crossbeam_channel::RecvTimeoutError::Disconnected,
+            })
+        } else {
+            self.rx.recv_timeout(self.recv_timeout)
+        };
+        match received {
             Ok(frame) => {
                 let num_frames = frame.samples.len() / frame.channels as usize;
                 let decoded = DecodedFrame {

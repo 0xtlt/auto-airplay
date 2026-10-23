@@ -132,6 +132,12 @@ bt_input stats: losses_per_min=2 concealed_per_min=2 concealed_ms=340 buffer_fil
 
 `audio.latency_ms` was never used and is deprecated. It is still accepted but ignored, the daemon warns about it at startup, and any command that rewrites the configuration drops it. Use `audio.jitter_buffer_ms` instead.
 
+## AirPlay timing
+
+Each second, the sender tells the speaker in a sync packet when a given RTP timestamp must play, and the speaker plays the stream at the rate consecutive sync packets imply. `auto-airplay` derives both the time each packet is sent and the time each sync packet announces from the position in the stream, never from the moment the packet was prepared: decoding, encoding and scheduling delays change neither, so the speaker sees a steady clock and never has to speed up or slow down. Audio is announced to play `output.render_delay_ms` minus the 10 packets (about 80 ms) queued ahead of the sending thread after it is sent: about 170 ms with the default 250.
+
+Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
+
 ## Speaker volume
 
 `auto-airplay` never changes the speaker volume: not on the first connection, not when it re-acquires the speaker after silence, not after an automatic reconnect, a process recycle, or a restart caused by a configuration change. Set the volume on the speaker, the iPhone, or the Home app and it is kept. `auto-airplay output test` also plays at the speaker's current volume.
@@ -249,4 +255,4 @@ Pushing a version tag such as `v0.1.0` builds checksum-protected ARM64 and ARMv7
 
 ## License and acknowledgements
 
-GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`. The `airplay-audio` crate is vendored the same way in [`vendor/airplay-audio`](vendor/airplay-audio/VENDORED.md).
+GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`. The `airplay-audio` crate is vendored the same way in [`vendor/airplay-audio`](vendor/airplay-audio/VENDORED.md), with patches to its sending loop: sync packets announce times taken from the stream position (see "AirPlay timing"), decoding never waits for input, and stopping a stream no longer hangs.

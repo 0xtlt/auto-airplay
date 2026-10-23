@@ -4,8 +4,9 @@ use airplay_core::{StreamConfig, error::Result};
 use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
 use crate::eq::{EqConfig, EqParams, Equalizer};
-use airplay_timing::{Clock, ClockOffset, unix_to_ntp};
-use std::sync::{Arc, atomic::{AtomicU64, AtomicU8, Ordering}};
+use crate::timeline::{mono_now_ns, wall_minus_mono_ns, Timeline, SENDER_QUEUE};
+use airplay_timing::{ClockOffset, unix_to_ntp};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering}};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
@@ -92,48 +93,49 @@ enum SenderMessage {
         /// Pre-serialized sync packet bytes, if sync is needed this frame.
         /// Shared across all targets (sync content is identical for all devices).
         sync_data: Option<Vec<u8>>,
+        /// Local patch: when to send it, on `timeline::mono_now_ns`. The
+        /// producer takes it from the stream's timeline, so the sender thread
+        /// keeps no schedule of its own.
+        deadline_ns: u64,
     },
-    /// Pause: sender thread should stop advancing deadlines and wait for Resume.
+    /// Pause: sender thread drops what it receives until Resume.
     Pause,
-    /// Resume: reset deadline to now and resume sending.
+    /// Resume sending.
     Resume,
     /// Stop: sender thread should exit.
     Stop,
 }
 
-/// Sleep until an absolute deadline using the best available method.
+/// Sleep until an absolute deadline on `timeline::mono_now_ns`.
 ///
 /// On Linux with SCHED_FIFO, `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`
 /// provides ~10-50μs precision regardless of CONFIG_HZ. On other platforms,
 /// falls back to spin_sleep.
 #[cfg(target_os = "linux")]
 fn precise_sleep_until(deadline_ns: u64) {
-    use std::mem;
-
     let ts = libc::timespec {
         tv_sec: (deadline_ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (deadline_ns % 1_000_000_000) as libc::c_long,
     };
 
+    // SAFETY: `clock_nanosleep` only reads the `timespec` it is given.
     unsafe {
-        // TIMER_ABSTIME = 1, CLOCK_MONOTONIC = 1
-        libc::clock_nanosleep(
+        // TIMER_ABSTIME = 1. Interrupted by a signal: sleep again.
+        while libc::clock_nanosleep(
             libc::CLOCK_MONOTONIC,
             1, // TIMER_ABSTIME
             &ts as *const libc::timespec,
             std::ptr::null_mut(),
-        );
+        ) == libc::EINTR
+        {}
     }
 }
 
-/// Get current CLOCK_MONOTONIC time in nanoseconds.
-#[cfg(target_os = "linux")]
-fn monotonic_now_ns() -> u64 {
-    use std::mem;
-    unsafe {
-        let mut ts: libc::timespec = mem::zeroed();
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts as *mut _);
-        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+#[cfg(not(target_os = "linux"))]
+fn precise_sleep_until(deadline_ns: u64) {
+    let now = mono_now_ns();
+    if deadline_ns > now {
+        spin_sleep::SpinSleeper::default().sleep(std::time::Duration::from_nanos(deadline_ns - now));
     }
 }
 
@@ -149,57 +151,52 @@ struct SendTarget {
     control_dest: Option<SocketAddr>,
 }
 
+/// Local patch: packets the sender thread sent after their deadline.
+#[derive(Debug, Default)]
+struct SendLateness {
+    /// Packets sent more than one packet duration late.
+    late: AtomicU64,
+    /// Largest lateness since the producer last reported it, in µs.
+    max_late_us: AtomicU64,
+}
+
 /// Dedicated OS thread for precise packet timing.
 ///
 /// On Linux, uses `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` with
 /// SCHED_FIFO for ~10-50μs precision. On other platforms, falls back to
 /// `spin_sleep` hybrid kernel-sleep + spin-wait.
 ///
-/// When `burst_size > 1`, packets are buffered and sent in bursts to reduce
-/// WiFi/Bluetooth interference on shared-radio devices (e.g., Pi Zero 2 W).
-/// For example, burst_size=4 sends 4 packets rapidly, then waits 4*frame_duration.
+/// Local patch: each packet carries its deadline, taken from the stream's
+/// timeline; the thread sleeps until it and sends. A late packet is sent at
+/// once and the deadlines after it stay where they are: upstream reset its own
+/// schedule instead, which shifted the stream for good and, through the
+/// producer, every sync anchor after it. The thread also exits once `running`
+/// is cleared, whatever is still queued.
 fn sender_thread_main(
     rx: Receiver<SenderMessage>,
     targets: Vec<SendTarget>,
     frame_duration: std::time::Duration,
-    burst_size: usize,
+    running: Arc<AtomicBool>,
+    lateness: Arc<SendLateness>,
 ) {
     set_realtime_priority();
     disable_wifi_power_save();
 
-    let burst_size = burst_size.max(1); // Minimum 1
-    let frame_duration_ns = frame_duration.as_nanos() as u64;
-    let burst_duration_ns = frame_duration_ns * burst_size as u64;
-    #[cfg(target_os = "linux")]
-    let mut next_deadline_ns = monotonic_now_ns();
-    #[cfg(not(target_os = "linux"))]
-    let sleeper = spin_sleep::SpinSleeper::default();
-    #[cfg(not(target_os = "linux"))]
-    let mut next_deadline = std::time::Instant::now();
-
-    let mut last_send = std::time::Instant::now();
-    let mut started = false;
+    let frame_ns = frame_duration.as_nanos() as u64;
+    let poll = std::time::Duration::from_millis(50);
     let mut packet_count: u64 = 0;
-    let mut max_jitter_ms: f64 = 0.0;
-    let mut jitter_sum_ms: f64 = 0.0;
-    let mut jitter_exceed_count: u64 = 0;
+    let mut late_sum_ns: u64 = 0;
+    let mut late_max_ns: u64 = 0;
 
-    // Burst buffer for WiFi/BT coexistence
-    // Each entry: (wire_packets per target, optional shared sync data)
-    let mut burst_buffer: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> = Vec::with_capacity(burst_size);
-
-    let target_count = targets.len();
     tracing::info!(
-        "Sender thread started: {} target(s), frame_duration={:.3}ms, burst_size={}, timing={}",
-        target_count,
+        "Sender thread started: {} target(s), frame_duration={:.3}ms, timing={}",
+        targets.len(),
         frame_duration.as_secs_f64() * 1000.0,
-        burst_size,
         if cfg!(target_os = "linux") { "clock_nanosleep(TIMER_ABSTIME)" } else { "spin_sleep" }
     );
 
-    loop {
-        // Receive next message (blocking with timeout for clean shutdown detection)
-        let msg = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+    while running.load(Ordering::Acquire) {
+        let msg = match rx.recv_timeout(poll) {
             Ok(msg) => msg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -215,153 +212,64 @@ fn sender_thread_main(
             }
             SenderMessage::Pause => {
                 tracing::debug!("Sender thread: paused");
-                loop {
-                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                while running.load(Ordering::Acquire) {
+                    match rx.recv_timeout(poll) {
                         Ok(SenderMessage::Resume) => {
                             tracing::debug!("Sender thread: resumed");
-                            #[cfg(target_os = "linux")]
-                            { next_deadline_ns = monotonic_now_ns(); }
-                            #[cfg(not(target_os = "linux"))]
-                            { next_deadline = std::time::Instant::now(); }
                             break;
                         }
-                        Ok(SenderMessage::Stop) => {
-                            tracing::info!("Sender thread: received Stop while paused, exiting");
+                        Ok(SenderMessage::Stop) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            tracing::info!("Sender thread: stopped while paused, exiting");
                             return;
                         }
                         _ => continue,
                     }
                 }
-                continue;
             }
-            SenderMessage::Resume => {
-                #[cfg(target_os = "linux")]
-                { next_deadline_ns = monotonic_now_ns(); }
-                #[cfg(not(target_os = "linux"))]
-                { next_deadline = std::time::Instant::now(); }
-                continue;
-            }
-            SenderMessage::Packet { wire_packets, sync_data } => {
-                // Buffer packet for burst sending
-                burst_buffer.push((wire_packets, sync_data));
+            SenderMessage::Resume => {}
+            SenderMessage::Packet { wire_packets, sync_data, deadline_ns } => {
+                precise_sleep_until(deadline_ns);
+                let late_ns = mono_now_ns().saturating_sub(deadline_ns);
 
-                // Only send when we have a full burst (or first packet to initialize timing)
-                if burst_buffer.len() < burst_size && started {
-                    continue;
-                }
-
-                if !started {
-                    #[cfg(target_os = "linux")]
-                    { next_deadline_ns = monotonic_now_ns(); }
-                    #[cfg(not(target_os = "linux"))]
-                    { next_deadline = std::time::Instant::now(); }
-                    last_send = std::time::Instant::now();
-                    started = true;
-                } else {
-                    // Wait until the precise deadline for this burst
-                    #[cfg(target_os = "linux")]
-                    {
-                        precise_sleep_until(next_deadline_ns);
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        let now = std::time::Instant::now();
-                        if next_deadline > now {
-                            sleeper.sleep(next_deadline - now);
+                // Send sync packet to ALL targets' control dests
+                if let Some(ref sync) = sync_data {
+                    for target in &targets {
+                        let sock = target.control_socket.as_ref()
+                            .unwrap_or(&target.data_socket);
+                        let dest = target.control_dest
+                            .unwrap_or(target.data_dest);
+                        if let Err(e) = sock.send_to(sync, dest) {
+                            tracing::error!("Failed to send sync packet to {}: {}", dest, e);
                         }
                     }
                 }
 
-                // Measure actual interval and jitter (for burst timing)
-                let send_time = std::time::Instant::now();
-                let actual_interval = send_time.duration_since(last_send);
-                let interval_ms = actual_interval.as_secs_f64() * 1000.0;
-                let target_ms = frame_duration.as_secs_f64() * 1000.0 * burst_buffer.len() as f64;
-                let jitter_ms = interval_ms - target_ms;
-
-                // Track jitter stats (per burst)
-                packet_count += burst_buffer.len() as u64;
-                if packet_count > burst_size as u64 {
-                    let abs_jitter = jitter_ms.abs();
-                    if abs_jitter > max_jitter_ms {
-                        max_jitter_ms = abs_jitter;
-                    }
-                    jitter_sum_ms += abs_jitter;
-                    if abs_jitter > 1.0 * burst_size as f64 {
-                        jitter_exceed_count += 1;
-                    }
-
-                    // Log burst with significant jitter
-                    if abs_jitter > 2.0 * burst_size as f64 {
-                        tracing::warn!(
-                            "JITTER burst#{}: interval={:.3}ms target={:.3}ms jitter={:+.3}ms",
-                            packet_count / burst_size as u64, interval_ms, target_ms, jitter_ms
-                        );
-                    }
-
-                    // Log stats every 500 packets (~4s)
-                    if packet_count % 500 < burst_size as u64 {
-                        let bursts = packet_count / burst_size as u64;
-                        let avg_jitter = if bursts > 1 { jitter_sum_ms / (bursts - 1) as f64 } else { 0.0 };
-                        tracing::info!(
-                            "TIMING STATS after {} pkts ({} bursts): avg_jitter={:.3}ms max_jitter={:.3}ms exceeds={}",
-                            packet_count, bursts, avg_jitter, max_jitter_ms, jitter_exceed_count
-                        );
-                    }
-                }
-
-                last_send = send_time;
-
-                // Send all buffered packets
-                for (wire_packets, sync_data) in burst_buffer.drain(..) {
-                    // Send sync packet to ALL targets' control dests
-                    if let Some(ref sync) = sync_data {
-                        for target in &targets {
-                            let sock = target.control_socket.as_ref()
-                                .unwrap_or(&target.data_socket);
-                            let dest = target.control_dest
-                                .unwrap_or(target.data_dest);
-                            if let Err(e) = sock.send_to(sync, dest) {
-                                tracing::error!("Failed to send sync packet to {}: {}", dest, e);
-                            }
-                        }
-                    }
-
-                    // Send per-target audio packets
-                    for (i, target) in targets.iter().enumerate() {
-                        if let Some(wire_data) = wire_packets.get(i) {
-                            if let Err(e) = target.data_socket.send_to(wire_data, target.data_dest) {
-                                tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
-                            }
+                // Send per-target audio packets
+                for (i, target) in targets.iter().enumerate() {
+                    if let Some(wire_data) = wire_packets.get(i) {
+                        if let Err(e) = target.data_socket.send_to(wire_data, target.data_dest) {
+                            tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
                         }
                     }
                 }
 
-                // Advance deadline by burst duration
-                #[cfg(target_os = "linux")]
-                {
-                    next_deadline_ns += burst_duration_ns;
-                    // Catch up if we've fallen behind by more than one burst
-                    let now_ns = monotonic_now_ns();
-                    if now_ns > next_deadline_ns + burst_duration_ns {
-                        tracing::warn!(
-                            "Sender thread fell behind by {:.2}ms, resetting deadline",
-                            (now_ns - next_deadline_ns) as f64 / 1_000_000.0
-                        );
-                        next_deadline_ns = now_ns;
-                    }
+                // Lateness stats. Nothing is logged from this thread above
+                // debug level: the producer reports late packets.
+                packet_count += 1;
+                late_sum_ns += late_ns;
+                late_max_ns = late_max_ns.max(late_ns);
+                if late_ns > frame_ns {
+                    lateness.late.fetch_add(1, Ordering::Relaxed);
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    next_deadline += frame_duration * burst_size as u32;
-                    let now = std::time::Instant::now();
-                    if now > next_deadline + frame_duration * burst_size as u32 {
-                        tracing::warn!(
-                            "Sender thread fell behind by {:.2}ms, resetting deadline",
-                            (now - next_deadline).as_secs_f64() * 1000.0
-                        );
-                        next_deadline = now;
-                    }
+                lateness.max_late_us.fetch_max(late_ns / 1_000, Ordering::Relaxed);
+                if packet_count % 500 == 0 {
+                    tracing::debug!(
+                        "TIMING STATS after {} pkts: avg_late={:.3}ms max_late={:.3}ms late_pkts={}",
+                        packet_count,
+                        late_sum_ns as f64 / packet_count as f64 / 1e6,
+                        late_max_ns as f64 / 1e6,
+                        lateness.late.load(Ordering::Relaxed)
+                    );
                 }
             }
         }
@@ -377,7 +285,6 @@ struct StreamerInner {
     rtp_senders: Vec<RtpSender>,
     current_timestamp: u64,
     last_sync_rtp: u32,
-    clock: Clock,
     clock_offset: Option<ClockOffset>,
     timing_rx: Option<watch::Receiver<ClockOffset>>,
     decoder: Option<AudioDecoder>,
@@ -412,6 +319,10 @@ pub struct AudioStreamer {
     sender_thread: Option<std::thread::JoinHandle<()>>,
     /// Channel to send packets to the sender thread.
     sender_tx: Option<Sender<SenderMessage>>,
+    /// Local patch: the sender thread runs while this is set.
+    sender_running: Arc<AtomicBool>,
+    /// Local patch: packets the sender thread sent late.
+    lateness: Arc<SendLateness>,
 }
 
 impl Clone for AudioStreamer {
@@ -425,6 +336,8 @@ impl Clone for AudioStreamer {
             underruns: Arc::clone(&self.underruns),
             sender_thread: None, // Can't clone JoinHandle
             sender_tx: self.sender_tx.clone(),
+            sender_running: Arc::clone(&self.sender_running),
+            lateness: Arc::clone(&self.lateness),
         }
     }
 }
@@ -441,7 +354,6 @@ impl AudioStreamer {
                 rtp_senders: Vec::new(),
                 current_timestamp: 0,
                 last_sync_rtp: 0,
-                clock: Clock::new(audio_format.sample_rate.as_hz()),
                 clock_offset: None,
                 timing_rx: None,
                 decoder: None,
@@ -460,6 +372,8 @@ impl AudioStreamer {
             underruns: Arc::new(AtomicU64::new(0)),
             sender_thread: None,
             sender_tx: None,
+            sender_running: Arc::new(AtomicBool::new(false)),
+            lateness: Arc::new(SendLateness::default()),
         }
     }
 
@@ -543,6 +457,12 @@ impl AudioStreamer {
         self.underruns.load(Ordering::Relaxed)
     }
 
+    /// Local patch: packets the sender thread sent more than one packet
+    /// duration after their deadline.
+    pub fn late_packets(&self) -> u64 {
+        self.lateness.late.load(Ordering::Relaxed)
+    }
+
     /// Get current state.
     pub fn state(&self) -> StreamerState {
         match self.state_cache.load(Ordering::Relaxed) {
@@ -579,7 +499,7 @@ impl AudioStreamer {
 
         if self.task.is_none() {
             // Set up the dedicated sender thread with cloned sockets
-            let (tx, rx) = bounded::<SenderMessage>(8);
+            let (tx, rx) = bounded::<SenderMessage>(SENDER_QUEUE);
             let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
 
             {
@@ -602,13 +522,9 @@ impl AudioStreamer {
                 }
 
                 if !targets.is_empty() {
-                    // Burst size for WiFi/BT coexistence: send N packets rapidly, then wait.
-                    // Creates gaps for Bluetooth to transmit cleanly.
-                    // - burst_size=1: no bursting (original behavior)
-                    // - burst_size=2: 16ms gaps
-                    // - burst_size=4: 32ms gaps (may cause burst packet loss)
-                    let burst_size = 1;
-
+                    self.sender_running.store(true, Ordering::Release);
+                    let running = Arc::clone(&self.sender_running);
+                    let lateness = Arc::clone(&self.lateness);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -616,7 +532,8 @@ impl AudioStreamer {
                                 rx,
                                 targets,
                                 frame_duration,
-                                burst_size,
+                                running,
+                                lateness,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -633,8 +550,9 @@ impl AudioStreamer {
             let packets_sent = self.packets_sent.clone();
             let underruns = self.underruns.clone();
             let sender_tx = self.sender_tx.clone();
+            let lateness = self.lateness.clone();
             self.task = Some(tokio::spawn(async move {
-                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, sender_tx).await {
+                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, sender_tx, lateness).await {
                     Ok(()) => tracing::debug!("Streaming task completed normally"),
                     Err(e) => {
                         tracing::error!("Streaming task error: {}", e);
@@ -720,7 +638,7 @@ impl AudioStreamer {
 
         if self.task.is_none() {
             // Set up the dedicated sender thread with cloned sockets
-            let (tx, rx) = bounded::<SenderMessage>(8);
+            let (tx, rx) = bounded::<SenderMessage>(SENDER_QUEUE);
             let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
 
             {
@@ -743,8 +661,9 @@ impl AudioStreamer {
                 }
 
                 if !targets.is_empty() {
-                    let burst_size = 1;
-
+                    self.sender_running.store(true, Ordering::Release);
+                    let running = Arc::clone(&self.sender_running);
+                    let lateness = Arc::clone(&self.lateness);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -752,7 +671,8 @@ impl AudioStreamer {
                                 rx,
                                 targets,
                                 frame_duration,
-                                burst_size,
+                                running,
+                                lateness,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -769,8 +689,9 @@ impl AudioStreamer {
             let packets_sent = self.packets_sent.clone();
             let underruns = self.underruns.clone();
             let sender_tx = self.sender_tx.clone();
+            let lateness = self.lateness.clone();
             self.task = Some(tokio::spawn(async move {
-                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, sender_tx).await {
+                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, sender_tx, lateness).await {
                     Ok(()) => tracing::debug!("Live streaming task completed normally"),
                     Err(e) => {
                         tracing::error!("Live streaming task error: {}", e);
@@ -829,25 +750,29 @@ impl AudioStreamer {
         // and stops producing into the bounded channel.
         self.state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
 
-        // Signal sender thread to stop
+        // Local patch: the sender thread exits on this flag. Upstream relied on
+        // the Stop message, lost whenever the queue is full, or on the channel
+        // disconnecting, which the producer task and every clone of this
+        // streamer (the control channel holds one) prevent: the join below
+        // never returned, and with it neither did `stop()`.
+        self.sender_running.store(false, Ordering::Release);
         if let Some(ref tx) = self.sender_tx {
             let _ = tx.try_send(SenderMessage::Stop);
         }
-        // Drop sender_tx to disconnect the channel — guarantees the sender
-        // thread's rx.recv() returns Err and exits, even if the Stop message
-        // couldn't be delivered (channel was full).
         self.sender_tx = None;
 
-        // Now safe to join — sender thread will exit from channel disconnect.
+        // Cancel the run_streamer task if still running (it also checks the
+        // state before each packet).
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+
+        // The sender thread exits after the packet it holds, if any, and one
+        // poll interval at most.
         if let Some(handle) = self.sender_thread.take() {
             let _ = tokio::task::spawn_blocking(move || {
                 let _ = handle.join();
             }).await;
-        }
-
-        // Cancel the run_streamer task if still running
-        if let Some(task) = self.task.take() {
-            task.abort();
         }
 
         let mut inner = self.inner.lock().await;
@@ -953,6 +878,7 @@ async fn run_streamer(
     packets_sent_counter: Arc<AtomicU64>,
     underrun_counter: Arc<AtomicU64>,
     sender_tx: Option<Sender<SenderMessage>>,
+    lateness: Arc<SendLateness>,
 ) -> Result<()> {
     // Compute frame duration once (constant for the session)
     let frame_duration_ns = {
@@ -960,7 +886,6 @@ async fn run_streamer(
         guard.config.audio_format.frames_per_packet as u64 * 1_000_000_000u64
             / guard.config.audio_format.sample_rate.as_hz() as u64
     };
-    let frame_duration = Duration::from_nanos(frame_duration_ns);
 
     let has_sender_thread = sender_tx.is_some();
 
@@ -970,10 +895,29 @@ async fn run_streamer(
         set_realtime_priority();
     }
 
-    // Use absolute deadline scheduling so processing time doesn't cause drift
-    let mut next_deadline = Instant::now();
+    // Local patch: the stream's timeline sets when each packet is sent and
+    // the time its sync packet announces (see `timeline`).
+    let mut timeline = {
+        let guard = inner.lock().await;
+        let format = &guard.config.audio_format;
+        Timeline::new(
+            format.sample_rate.as_hz(),
+            format.frames_per_packet,
+            Duration::from_nanos(guard.render_delay_ns),
+        )
+    };
+    // Without the sender thread: when the next packet is due.
+    let mut fallback_next_ns: Option<u64> = None;
+    // Late packets reported so far, and when the next report may be logged.
+    let mut late_reported = 0_u64;
+    let mut next_late_report = Instant::now();
 
     loop {
+        // Local patch: `stop()` sets the cached state first; upstream only
+        // read the locked one, which `stop()` sets last.
+        if state_cache.load(Ordering::Relaxed) == StreamerState::Stopped as u8 {
+            break;
+        }
         {
             let state = inner.lock().await.state;
             if state == StreamerState::Stopped || state == StreamerState::Error {
@@ -981,8 +925,8 @@ async fn run_streamer(
             }
             if state == StreamerState::Paused {
                 sleep(Duration::from_millis(10)).await;
-                // Reset deadline after pause so we don't burst-send
-                next_deadline = Instant::now();
+                // Start a new timeline after the pause so we don't burst-send
+                timeline.restart();
                 continue;
             }
         }
@@ -995,16 +939,21 @@ async fn run_streamer(
                     guard.clock_offset = Some(latest);
                 }
             }
-            // Keep buffer above 40% but don't decode too aggressively
-            // to avoid blocking the send loop with decode operations.
+            // Keep buffer above 40% but don't decode too aggressively.
             // With 50% initial fill, we have plenty of headroom.
+            //
+            // Local patch: decoding no longer blocks the send loop. The live
+            // decoder never waits for input, and how long decoding takes
+            // changes neither when a packet is sent (its deadline) nor what
+            // its sync packet announces: both come from the timeline. The
+            // sender thread has its own queue of SENDER_QUEUE packets.
             if guard.buffer.fill_percentage() < 40.0 {
                 let decode_start = Instant::now();
                 decode_some_inner(&mut guard)?;
                 let decode_elapsed = decode_start.elapsed();
                 if decode_elapsed.as_millis() > 10 {
-                    tracing::warn!(
-                        "Decode took {:.2}ms (blocking send loop!)",
+                    tracing::debug!(
+                        "Decode took {:.2}ms (the sender thread keeps its schedule)",
                         decode_elapsed.as_secs_f64() * 1000.0
                     );
                 }
@@ -1030,11 +979,10 @@ async fn run_streamer(
                         state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
                         break;
                     } else {
-                        // Still buffering, wait and retry
+                        // Still buffering, wait and retry. (A stall longer than
+                        // the timeline tolerates restarts it at the next packet.)
                         drop(guard);
                         sleep(Duration::from_millis(10)).await;
-                        // Reset deadline after buffering stall
-                        next_deadline = Instant::now();
                         continue;
                     }
                 }
@@ -1093,31 +1041,44 @@ async fn run_streamer(
                 let sample_rate = guard.config.audio_format.sample_rate.as_hz();
                 let last_sync_rtp = guard.last_sync_rtp;
 
-                // Get current time and apply clock offset from PTP/NTP sync
-                let local_wall = guard.clock.now_wall_ns();
-                let adjusted = if let Some(offset) = guard.clock_offset {
-                    let result = guard.clock.apply_offset(local_wall, &offset);
-                    if diag < 3 {
-                        tracing::info!(
-                            "CLOCK OFFSET: offset_ns={}, local_wall={}, adjusted={}, diff={}",
-                            offset.offset_ns,
-                            local_wall,
-                            result,
-                            result as i128 - local_wall as i128
-                        );
+                // Local patch: the packet's place on the timeline. Upstream
+                // read the wall clock here, after decoding and encoding, and
+                // announced that time plus the render delay in the sync packet.
+                let restarts = timeline.restarts();
+                let slot = timeline.slot(packet.timestamp, mono_now_ns());
+                if timeline.restarts() > restarts {
+                    tracing::warn!(
+                        restarts = timeline.restarts(),
+                        "AirPlay timeline restarted: a packet was prepared too late to be played on time"
+                    );
+                }
+                if slot.restarted {
+                    fallback_next_ns = None;
+                }
+
+                // Apply clock offset from PTP/NTP sync
+                let offset_ns = match guard.clock_offset {
+                    Some(offset) => {
+                        if diag < 3 {
+                            tracing::info!("CLOCK OFFSET: offset_ns={}", offset.offset_ns);
+                        }
+                        offset.offset_ns
                     }
-                    result
-                } else {
-                    if diag < 3 {
-                        tracing::warn!("CLOCK OFFSET: None - using local time directly (may cause timing issues!)");
+                    None => {
+                        if diag < 3 {
+                            tracing::warn!("CLOCK OFFSET: None - using local time directly (may cause timing issues!)");
+                        }
+                        0
                     }
-                    local_wall
                 };
 
-                // Apply render delay: shift NTP timestamp into the future so the
-                // receiver buffers audio longer before rendering, giving more
-                // time for retransmit recovery of lost packets.
-                let render_adjusted = adjusted + guard.render_delay_ns;
+                // The anchor: when the packet's first frame plays, on the wall
+                // clock the timing server reports. It is the deadline plus the
+                // margin upstream had on average (the render delay minus the
+                // packets queued ahead of the sender thread), so the latency
+                // is unchanged; only the noise is gone.
+                let render_adjusted =
+                    (slot.anchor_ns + wall_minus_mono_ns() + i128::from(offset_ns)).max(0) as u64;
                 let ntp = unix_to_ntp(render_adjusted);
 
                 // Set marker bit on first audio packet (required by some receivers)
@@ -1129,8 +1090,9 @@ async fn run_streamer(
 
                 let rtp_ts = packet.timestamp as u32;
 
-                // Determine if sync is needed BEFORE borrowing rtp_sender
-                let need_sync = first_packet || last_sync_rtp == 0
+                // Determine if sync is needed BEFORE borrowing rtp_sender.
+                // A restarted timeline is announced at once.
+                let need_sync = first_packet || slot.restarted || last_sync_rtp == 0
                     || rtp_ts.wrapping_sub(last_sync_rtp) >= sample_rate;
 
                 // Extract PTP sync mode state before borrowing rtp_sender
@@ -1180,22 +1142,41 @@ async fn run_streamer(
                         // Drop the mutex guard first so other async tasks can proceed
                         drop(guard);
                         let tx_clone = tx.clone();
-                        let msg = SenderMessage::Packet { wire_packets, sync_data };
+                        let msg = SenderMessage::Packet {
+                            wire_packets,
+                            sync_data,
+                            deadline_ns: slot.deadline_ns,
+                        };
                         let send_result = tokio::task::spawn_blocking(move || {
                             tx_clone.send(msg)
                         }).await;
                         match send_result {
                             Ok(Ok(())) => {},
+                            _ if state_cache.load(Ordering::Relaxed) == StreamerState::Stopped as u8 => break,
                             _ => {
                                 tracing::error!("Sender thread disconnected");
                                 state_cache.store(StreamerState::Error as u8, Ordering::Relaxed);
                                 break;
                             }
                         }
+
+                        // Local patch: report packets the sender thread had to
+                        // send late (at most every 10 s).
+                        let late = lateness.late.load(Ordering::Relaxed);
+                        if late > late_reported && Instant::now() >= next_late_report {
+                            tracing::warn!(
+                                late_packets = late - late_reported,
+                                max_late_ms = lateness.max_late_us.swap(0, Ordering::Relaxed) / 1_000,
+                                "AirPlay packets sent after their deadline: the sending task fell behind"
+                            );
+                            late_reported = late;
+                            next_late_report = Instant::now() + Duration::from_secs(10);
+                        }
                         continue;
                     } else {
                         // Fallback: direct send (no sender thread)
                         // Send sync from first sender, audio from all senders
+                        fallback_next_ns = Some(slot.deadline_ns + frame_duration_ns);
                         if need_sync {
                             if use_ptp_sync {
                                 let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
@@ -1252,12 +1233,11 @@ async fn run_streamer(
             //
             // Yield to let other Tokio tasks run (NTP, control, etc.)
             tokio::task::yield_now().await;
-        } else {
-            // Without sender thread: use deadline-based timing (original behavior)
-            next_deadline += frame_duration;
-            let now = Instant::now();
-            if next_deadline > now {
-                tokio::time::sleep(next_deadline - now).await;
+        } else if let Some(next_ns) = fallback_next_ns {
+            // Without sender thread: wait for the next packet's deadline.
+            let now_ns = mono_now_ns();
+            if next_ns > now_ns {
+                tokio::time::sleep(Duration::from_nanos(next_ns - now_ns)).await;
             }
         }
     }

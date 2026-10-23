@@ -416,13 +416,17 @@ fn receive_data(
 struct Feeder {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// When each chunk was handed over, on the feeder's clock.
+    handoffs: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Feeder {
     fn start(sender: LiveFrameSender, clock: MediaClock) -> Self {
         let running = Arc::new(AtomicBool::new(true));
+        let handoffs = Arc::new(Mutex::new(Vec::new()));
         let thread = {
             let running = Arc::clone(&running);
+            let handoffs = Arc::clone(&handoffs);
             thread::spawn(move || {
                 let start = clock.now_ns();
                 let mut frame = 0u64;
@@ -440,11 +444,14 @@ impl Feeder {
                             as i16;
                         samples.extend_from_slice(&[value, value]);
                     }
-                    let _ = sender.try_send(LivePcmFrame {
+                    let handed = clock.now_ns();
+                    let accepted = sender.try_send(LivePcmFrame {
                         samples,
                         channels: 2,
                         sample_rate: SOURCE_RATE,
                     });
+                    assert!(accepted, "the live queue overflowed");
+                    handoffs.lock().unwrap().push(handed);
                     frame += CHUNK_FRAMES as u64;
                 }
             })
@@ -452,7 +459,12 @@ impl Feeder {
         Self {
             running,
             thread: Some(thread),
+            handoffs,
         }
+    }
+
+    fn handoffs(&self) -> Vec<u64> {
+        self.handoffs.lock().unwrap().clone()
     }
 
     fn stop(&mut self) {
@@ -813,4 +825,162 @@ fn anchors_encode_network_time_and_timeline() {
     );
     assert_eq!(anchor["rtpTime"].as_unsigned_integer(), Some(0xFFFF_FFF0));
     assert_eq!(anchor["rate"].as_unsigned_integer(), Some(1));
+}
+
+// ----- latency, against realtime mode -----
+
+/// What realtime mode (the default) gives a chunk from handoff to the
+/// AirPlay client to its announced play time, in ms: the vendored realtime
+/// sender as the daemon drives it (500 ms prefill, render delay 250 ms, NTP
+/// timing), fed the same paced tone, against a loopback receiver that reads
+/// the sync packets.
+async fn realtime_handoff_to_play(run: Duration) -> Vec<f64> {
+    use airplay_audio::timeline::wall_minus_mono_ns;
+    use airplay_audio::{AudioStreamer, RtpSender};
+    use airplay_client::ClockOffset;
+
+    let data = std::net::UdpSocket::bind((LOCALHOST, 0)).unwrap();
+    let control = std::net::UdpSocket::bind((LOCALHOST, 0)).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    data.set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let (data_addr, control_addr) = (data.local_addr().unwrap(), control.local_addr().unwrap());
+    let running = Arc::new(AtomicBool::new(true));
+    let anchors = Arc::new(Mutex::new(Vec::<(u32, i128)>::new()));
+    let listeners = [(data, false), (control, true)].map(|(socket, is_control)| {
+        let (running, anchors) = (Arc::clone(&running), Arc::clone(&anchors));
+        thread::spawn(move || {
+            let mut buffer = [0u8; 2048];
+            while running.load(Ordering::Acquire) {
+                let Ok((length, _)) = socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                // NTP sync: [8..16] NTP time, [16..20] the RTP timestamp
+                // that plays then.
+                if is_control && length >= 20 && buffer[1] & 0x7F == 84 {
+                    let word =
+                        |at: usize| u32::from_be_bytes(buffer[at..at + 4].try_into().unwrap());
+                    let unix_ns = (i128::from(word(8)) - 2_208_988_800) * 1_000_000_000
+                        + ((i128::from(word(12)) * 1_000_000_000) >> 32);
+                    anchors.lock().unwrap().push((word(16), unix_ns));
+                }
+            }
+        })
+    });
+
+    let (sender, decoder) = LiveAudioDecoder::create_pair(SOURCE_RATE, 2, 64);
+    let mut feeder = Feeder::start(sender, MediaClock::from_fn(mono_now_ns));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut rtp = RtpSender::new(data_addr, 0);
+    rtp.set_control_dest(control_addr);
+    rtp.bind(0).unwrap();
+    rtp.set_control_socket(std::net::UdpSocket::bind("0.0.0.0:0").unwrap());
+    let mut streamer = AudioStreamer::new(StreamConfig::default());
+    streamer.set_rtp_sender(rtp).await;
+    streamer.set_render_delay_ms(250).await;
+    streamer.set_timing_offset(ClockOffset::default()).await;
+    streamer.start_live(decoder).await.unwrap();
+    tokio::time::sleep(run).await;
+    feeder.stop();
+    streamer.stop().await.unwrap();
+    running.store(false, Ordering::Release);
+    for listener in listeners {
+        listener.join().unwrap();
+    }
+
+    let (rtp, plays_unix) = *anchors.lock().unwrap().last().expect("sync packets");
+    let wall_minus_mono = wall_minus_mono_ns();
+    let handoffs = feeder.handoffs();
+    let skip = handoffs.len() / 3;
+    handoffs[skip..handoffs.len() - 20]
+        .iter()
+        .enumerate()
+        .map(|(index, &handed)| {
+            let frame = ((skip + index) * CHUNK_FRAMES) as f64 * RTP_RATE / f64::from(SOURCE_RATE);
+            let plays = plays_unix + ((frame - f64::from(rtp)) / RTP_RATE * 1e9) as i128;
+            (plays - (i128::from(handed) + wall_minus_mono)) as f64 / 1e6
+        })
+        .collect()
+}
+
+/// The same for buffered mode with `buffer` held by the speaker: the fake
+/// speaker's anchor gives the play times, on the grandmaster's clock (the
+/// feeder's too). AAC delays the audio by 2048 frames in the stream.
+async fn buffered_handoff_to_play(buffer: Duration, run: Duration) -> Vec<f64> {
+    let speaker = FakeSpeaker::start(Options::default());
+    let mut connection =
+        Connection::connect_unpaired(speaker.device(), StreamConfig::airplay2_buffered())
+            .await
+            .unwrap();
+    connection.set_ptp_config(speaker.ptp_config());
+    connection.set_buffered_latency(buffer);
+    connection.setup().await.unwrap();
+    let (sender, decoder) = LiveAudioDecoder::create_pair(SOURCE_RATE, 2, 64);
+    let mut feeder = Feeder::start(sender, connection.media_clock().unwrap());
+    connection.start_streaming_live(decoder).await.unwrap();
+    tokio::time::sleep(run).await;
+    feeder.stop();
+    let _ = connection.disconnect().await;
+
+    let anchor = speaker
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "SETRATEANCHORTIME")
+        .unwrap()
+        .dictionary();
+    let plays_at = network_time_ns(&anchor);
+    let handoffs = feeder.handoffs();
+    let skip = handoffs.len() / 3;
+    handoffs[skip..handoffs.len() - 20]
+        .iter()
+        .enumerate()
+        .map(|(index, &handed)| {
+            let frame = ((skip + index) * CHUNK_FRAMES) as f64 * RTP_RATE / f64::from(SOURCE_RATE)
+                + f64::from(airplay_audio::buffered::AAC_ENCODER_DELAY_FRAMES);
+            let plays = plays_at + (frame / RTP_RATE * 1e9) as i128;
+            (plays - i128::from(handed)) as f64 / 1e6
+        })
+        .collect()
+}
+
+fn summary(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    (
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+    )
+}
+
+/// Prints how much later than realtime mode buffered mode plays the same
+/// audio. The jitter buffer before the handoff (400 ms by default) and the
+/// pacer's lead (up to 50 ms) come on top of both, and the speaker's own
+/// output latency too.
+///
+/// ```text
+/// cargo test --test buffered_session -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timed comparison with realtime mode; run with --ignored --nocapture"]
+async fn compare_latency_with_realtime() {
+    let run = Duration::from_secs(8);
+    let realtime = summary(&realtime_handoff_to_play(run).await);
+    let buffered = summary(&buffered_handoff_to_play(Duration::from_millis(2_000), run).await);
+    eprintln!("handoff to the AirPlay client -> announced play time (min / median / max):");
+    eprintln!(
+        "  realtime (render_delay_ms 250): {:.0} / {:.0} / {:.0} ms",
+        realtime.0, realtime.1, realtime.2
+    );
+    eprintln!(
+        "  buffered (speaker_buffer_ms 2000): {:.0} / {:.0} / {:.0} ms",
+        buffered.0, buffered.1, buffered.2
+    );
+    eprintln!(
+        "  added by buffered mode: {:.0} ms (medians)",
+        buffered.1 - realtime.1
+    );
+    assert!(buffered.1 > realtime.1);
 }

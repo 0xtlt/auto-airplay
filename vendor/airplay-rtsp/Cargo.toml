@@ -1,0 +1,22 @@
+[package]
+name = "airplay-rtsp"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "RTSP protocol implementation for AirPlay 2"
+publish = false
+
+[dependencies]
+airplay-core = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+airplay-crypto = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+airplay-pairing = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+tokio = { version = "1.37", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+plist = "1.6"
+uuid = { version = "1.8", features = ["v4", "serde"] }
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+rand = "0.8"
+base64 = "0.22"

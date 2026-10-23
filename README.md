@@ -138,7 +138,7 @@ Each second, the sender tells the speaker in a sync packet when a given RTP time
 
 Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
 
-`cargo test --test sender_timing -- --nocapture` measures this against the pinned upstream sender and prints the comparison.
+`cargo test --test sender_timing -- --ignored --nocapture` times this against the pinned upstream sender and prints the comparison. It needs a machine that keeps real time, so `cargo test` alone only checks what holds however the test is scheduled: anchors stay on the timeline or restart it, never move a little.
 
 ## Speaker volume
 

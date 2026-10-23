@@ -105,3 +105,60 @@ fn without_a_margin_lateness_is_still_tolerated_a_little() {
             .restarted
     );
 }
+
+/// The producer runs 9 packets ahead of the sender thread, as in the
+/// streamer; the whole process is suspended for 300 ms at t = 6 s.
+#[test]
+fn a_suspension_restarts_the_timeline_once_and_only_moves_the_anchors_once() {
+    let mut timeline = timeline();
+    let ahead = frames_ns(9 * PACKET);
+    let suspended_at = 6_000 * MS;
+    let suspension = 300 * MS;
+    // Monotonic time at which the packet starting at `position` is prepared.
+    let prepared = |position: u64, shift: u64| {
+        let due = (frames_ns(position) + shift).saturating_sub(ahead);
+        if due >= suspended_at {
+            due.max(suspended_at + suspension)
+        } else {
+            due
+        }
+    };
+
+    let mut shift = 0;
+    let mut anchor_steps = Vec::new();
+    let mut previous: Option<(u64, i128)> = None;
+    for packet in 0..2_000 {
+        let position = packet * PACKET;
+        let now = prepared(position, shift);
+        let slot = timeline.slot(position, now);
+        assert!(slot.deadline_ns + timeline.max_late_ns() >= now);
+        assert_eq!(
+            slot.anchor_ns - i128::from(slot.deadline_ns),
+            timeline.margin()
+        );
+        if slot.restarted && packet > 0 {
+            // From here on the producer runs ahead of the new timeline.
+            shift = slot.deadline_ns - frames_ns(position);
+        }
+        // Anchor minus the RTP timeline: constant (to the nanosecond that
+        // `frames_ns` rounds away), but for the restart.
+        let residual = slot.anchor_ns - i128::from(frames_ns(position));
+        if let Some((_, before)) = previous
+            && (residual - before).abs() > 1_000
+        {
+            anchor_steps.push(residual - before);
+        }
+        previous = Some((position, residual));
+    }
+
+    assert_eq!(timeline.restarts(), 1);
+    assert_eq!(anchor_steps.len(), 1, "{anchor_steps:?}");
+    // The first packet prepared after the suspension was due 72 to 80 ms
+    // after it began: 220 to 228 ms late, so the anchors move that much, once.
+    let step = anchor_steps[0];
+    assert!(step > i128::from(timeline.max_late_ns()), "{step}");
+    assert!(
+        (219 * MS as i128..=229 * MS as i128).contains(&step),
+        "{step}"
+    );
+}

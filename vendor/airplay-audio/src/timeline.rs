@@ -157,4 +157,10 @@ impl Timeline {
     pub fn margin(&self) -> i128 {
         self.margin_ns
     }
+
+    /// How late a packet may be prepared before the timeline restarts: a
+    /// restart moves the anchors by more than this.
+    pub fn max_late_ns(&self) -> u64 {
+        self.max_late_ns
+    }
 }

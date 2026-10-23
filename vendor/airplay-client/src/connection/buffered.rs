@@ -322,7 +322,7 @@ impl Connection {
             .into_std()?;
         connection.set_nonblocking(false)?;
 
-        let mut streamer = BufferedStreamer::start(
+        let streamer = BufferedStreamer::start(
             connection,
             decoder,
             *self.session.stream_key(),
@@ -345,7 +345,7 @@ impl Connection {
             .await
             .and_then(|response| expect_ok("SETRATEANCHORTIME", response.status_code));
         if let Err(error) = anchored {
-            streamer.stop();
+            let _ = tokio::task::spawn_blocking(move || drop(streamer)).await;
             return Err(error);
         }
 
@@ -363,9 +363,10 @@ impl Connection {
 
     /// Stops the buffered stream and removes it from the session.
     pub(super) async fn stop_buffered(&mut self) {
-        if let Some(mut streamer) = self.buffered.take() {
+        if let Some(streamer) = self.buffered.take() {
             let stats = streamer.stats();
-            streamer.stop();
+            // Stopping joins its threads: off the async workers.
+            let _ = tokio::task::spawn_blocking(move || drop(streamer)).await;
             tracing::info!(
                 packets = stats.packets,
                 sent = stats.sent,

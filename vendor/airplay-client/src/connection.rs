@@ -1038,12 +1038,13 @@ impl Connection {
         if let Some(ref mut streamer) = self.streamer {
             streamer.stop().await?;
         }
-        // Local addition: a buffered stream and its PTP follower.
-        if let Some(mut streamer) = self.buffered.take() {
-            streamer.stop();
+        // Local addition: a buffered stream and its PTP follower (stopping
+        // them joins threads: off the async workers).
+        if let Some(streamer) = self.buffered.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(streamer)).await;
         }
-        if let Some(mut follower) = self.ptp_follower.take() {
-            follower.stop();
+        if let Some(follower) = self.ptp_follower.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(follower)).await;
         }
 
         if let Some(task) = self.timing_task.take() {

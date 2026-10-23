@@ -43,6 +43,13 @@ zbus = { version = "5.11", default-features = false, features = ["tokio"] }
 airplay-audio-upstream = { package = "airplay-audio", git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-resampler = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-crypto = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+# The PTP messages upstream sends, for tests/ptp_follower.rs to compare the
+# follower's with; the vendored RTSP crate and the AAC decoder for the fake
+# receiver of tests/buffered_session.rs.
+airplay-timing = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+airplay-rtsp = { path = "vendor/airplay-rtsp" }
+fdk-aac = "0.6"
+plist = "1.6"
 assert_cmd = "2.0"
 predicates = "3.1"
 tokio = { version = "1.47", features = ["io-util"] }

@@ -43,6 +43,10 @@ mod events;
 /// Public only so the integration tests of the host crate can drive it.
 #[doc(hidden)]
 pub mod receiver_events;
+mod media_clock;
+/// Public only so the integration tests of the host crate can drive it.
+#[doc(hidden)]
+pub mod ptp_follower;
 mod raop_connection;
 mod stats;
 
@@ -54,6 +58,7 @@ pub use playback::{PlaybackState, PlaybackInfo};
 pub use builder::ClientBuilder;
 pub use events::{ClientEvent, EventHandler, NoOpHandler, CallbackHandler};
 pub use stats::{StreamStats, StatsSnapshot, DeviceStatsSnapshot};
+pub use media_clock::MediaClock;
 
 // Re-export commonly used types
 pub use airplay_core::{Device, DeviceId, AudioFormat, StreamConfig, Error, Result};

@@ -44,3 +44,18 @@ never change the speaker volume, so the crate is vendored and patched.
    the shared secret (`events_secret`, filled in all connect paths) and the task
    handle (`events_task`, aborted in `disconnect()` and `Drop`); without a secret
    the old behaviour (stream held open, unread) remains.
+3. **PTP follower and media clock for buffered streams.** New modules, no
+   upstream code changed. `src/ptp_follower.rs` (public but `#[doc(hidden)]`,
+   only so the host crate's `tests/ptp_follower.rs` can drive it against a
+   fake grandmaster) follows the receiver's PTP clock the way a Mac does with
+   a HomePod: it introduces itself with the messages upstream's
+   `run_bmca_yield_flow` sends (byte for byte, priority1 250 against the
+   HomePod's 248), yields, then pairs each Sync with its Follow_Up and sends a
+   Delay_Req for each. Its estimate takes the fastest Sync and the fastest
+   Delay_Req of the last 4 s (delays only ever add up, so those bound the
+   offset from both sides, whatever the Wi-Fi spikes); the published clock
+   only slews toward it (500 ppm at most), so it never jumps. Its timestamps
+   are on the monotonic clock (`airplay_audio::timeline::mono_now_ns`), not
+   the wall clock upstream used. It reports a grandmaster that falls silent
+   (15 s), changes, or jumps (over 50 ms for 3 s). `src/media_clock.rs`
+   (`MediaClock`, exported) hands that clock to the host's output pacer.

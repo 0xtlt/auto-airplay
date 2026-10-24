@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 airplay-client = { path = "vendor/airplay-client" }
 airplay-core = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
-airplay-audio = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
+airplay-audio = { path = "vendor/airplay-audio" }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
@@ -38,10 +38,15 @@ libc = "0.2"
 zbus = { version = "5.11", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+# The pinned upstream crate, for tests/sender_timing.rs to measure it next to
+# the vendored (patched) one.
+airplay-audio-upstream = { package = "airplay-audio", git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-resampler = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 airplay-crypto = { git = "https://github.com/lmcgartland/airplay2-rs.git", rev = "a7f019fe6246ebd9701201a8a5c31e9a15243956" }
 assert_cmd = "2.0"
 predicates = "3.1"
+# Decodes the ALAC packets back for tests/output_chain.rs.
+symphonia = { version = "0.5.5", default-features = false, features = ["alac"] }
 tokio = { version = "1.47", features = ["io-util"] }
 
 # The tests push minutes of audio through the jitter buffer and the real AirPlay

@@ -132,6 +132,24 @@ bt_input stats: losses_per_min=2 concealed_per_min=2 concealed_ms=340 buffer_fil
 
 `audio.latency_ms` was never used and is deprecated. It is still accepted but ignored, the daemon warns about it at startup, and any command that rewrites the configuration drops it. Use `audio.jitter_buffer_ms` instead.
 
+## AirPlay timing
+
+Each second, the sender tells the speaker in a sync packet when a given RTP timestamp must play, and the speaker plays the stream at the rate consecutive sync packets imply. `auto-airplay` derives both the time each packet is sent and the time each sync packet announces from the position in the stream, never from the moment the packet was prepared: decoding, encoding and scheduling delays change neither, so the speaker sees a steady clock and never has to speed up or slow down.
+
+The sync packet also announces the latency, the audio the speaker must hold: it goes out with an audio packet, carries the time it is sent, the packet's RTP timestamp, and that timestamp minus the latency (bytes 4-7), as iTunes and other AirPlay senders do. The latency is `output.render_delay_ms` (default 250 ms, 11025 frames at 44.1 kHz), kept between the minimum and maximum the stream declares when it is set up (250 ms and 2 s). Each packet therefore plays that long after it is sent, plus the speaker's own fixed delay. Bytes 2-3 of every sync packet are 7, the value iTunes, OwnTone, pyatv and AirConnect send (the AirPlay library sent a counter). This only aligns the sender with those known to work with HomePods; what a HomePod does with the field is not known.
+
+Two warnings point at a sender that cannot keep up: `AirPlay packets sent after their deadline` (packets went out more than one packet late; logged at most every 10 s; the timeline is kept, so they play on time if they arrive within the margin) and `AirPlay timeline restarted` (a packet was prepared too late to play on time; the stream jumps once, as after a gap).
+
+Once a minute while streaming, the daemon also logs what the sender did, even when everything is zero:
+
+```text
+airplay_output stats: packets=7517 late_packets=0 send_jitter_max_ms=0.4 rtx_requests=2 rtx_unparsed=0 rtx_requested=3 rtx_served=3 rtx_missed=0 rtx_late=0 rtx_age_max_ms=38
+```
+
+`packets` counts the audio packets sent (7517 make a minute), `late_packets` those sent more than one packet (8 ms) after their deadline, and `send_jitter_max_ms` is the latest one went out. The speaker asks for a packet again when it did not arrive: `rtx_requests` counts its requests, `rtx_requested` the packets they asked for, `rtx_served` those sent again, `rtx_missed` those that could not be (older than the 4 s history), `rtx_late` those asked for once the time the sync packets announced for them had passed (their deadline plus the latency, however late they really went out), so the resend arrives too late, and `rtx_age_max_ms` is the longest between a packet really going out and the request for it. Only the last 512 packets sent (about 4 s) are judged late or dated. `rtx_unparsed` counts requests the daemon could not read (none expected). Find it with `journalctl -u "auto-airplay@$USER.service" | grep airplay_output`. Requests every minute mean packets get lost between the Pi and the speaker, usually on Wi-Fi; `rtx_late` above zero means some resends come too late to help.
+
+`cargo test --test sender_timing -- --ignored --nocapture` times this against the pinned upstream sender and prints the comparison. It needs a machine that keeps real time, so `cargo test` alone only checks what holds however the test is scheduled: anchors stay on the timeline or restart it, never move a little.
+
 ## Speaker volume
 
 `auto-airplay` never changes the speaker volume: not on the first connection, not when it re-acquires the speaker after silence, not after an automatic reconnect, a process recycle, or a restart caused by a configuration change. Set the volume on the speaker, the iPhone, or the Home app and it is kept. `auto-airplay output test` also plays at the speaker's current volume.
@@ -230,7 +248,7 @@ Do not commit a real configuration file. Common secret and configuration filenam
 ## Development
 
 ```bash
-cargo fmt --all -- --check # vendor/airplay-client is excluded via its rustfmt.toml
+cargo fmt --all -- --check # the crates in vendor/ are excluded via their rustfmt.toml
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
@@ -249,4 +267,4 @@ Pushing a version tag such as `v0.1.0` builds checksum-protected ARM64 and ARMv7
 
 ## License and acknowledgements
 
-GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`.
+GPL-2.0-only. The AirPlay implementation currently uses the GPL-2.0 Rust project [`airplay2-rs`](https://github.com/lmcgartland/airplay2-rs), pinned to a reviewed commit for reproducible builds. The `airplay-client` crate of that project is vendored in [`vendor/airplay-client`](vendor/airplay-client/VENDORED.md) with a small patch: upstream sent a 100 % volume every time a stream started, which `auto-airplay` must not do. Its origin and patches are listed in `VENDORED.md`. The `airplay-audio` crate is vendored the same way in [`vendor/airplay-audio`](vendor/airplay-audio/VENDORED.md), with patches to its sending loop: sync packets announce times taken from the stream position (see "AirPlay timing"), decoding never waits for input, and stopping a stream no longer hangs.

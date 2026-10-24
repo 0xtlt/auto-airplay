@@ -49,6 +49,29 @@ dependencies = [
 [[package]]
 name = "airplay-audio"
 version = "0.1.0"
+dependencies = [
+ "airplay-core",
+ "airplay-crypto",
+ "airplay-resampler",
+ "airplay-timing",
+ "alac-encoder",
+ "async-trait",
+ "biquad",
+ "crossbeam-channel",
+ "fdk-aac",
+ "futures",
+ "libc",
+ "rand",
+ "socket2 0.5.10",
+ "spin_sleep",
+ "symphonia",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "airplay-audio"
+version = "0.1.0"
 source = "git+https://github.com/lmcgartland/airplay2-rs.git?rev=a7f019fe6246ebd9701201a8a5c31e9a15243956#a7f019fe6246ebd9701201a8a5c31e9a15243956"
 dependencies = [
  "airplay-core",
@@ -74,7 +97,7 @@ dependencies = [
 name = "airplay-client"
 version = "0.1.0"
 dependencies = [
- "airplay-audio",
+ "airplay-audio 0.1.0",
  "airplay-core",
  "airplay-crypto",
  "airplay-discovery",
@@ -371,7 +394,8 @@ dependencies = [
 name = "auto-airplay"
 version = "0.4.0"
 dependencies = [
- "airplay-audio",
+ "airplay-audio 0.1.0",
+ "airplay-audio 0.1.0 (git+https://github.com/lmcgartland/airplay2-rs.git?rev=a7f019fe6246ebd9701201a8a5c31e9a15243956)",
  "airplay-client",
  "airplay-core",
  "airplay-crypto",
@@ -391,6 +415,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "symphonia",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

@@ -2,10 +2,12 @@
 //! the packets really leave, and how both relate to the input clock.
 //!
 //! A sync packet pairs an RTP timestamp with the time it must play (its
-//! anchor). The receiver plays the stream at the rate consecutive anchors
-//! imply: two anchors one second apart that disagree by 2 ms make it play
-//! 0.2 % fast or slow, heard as speed and pitch moving. Bluetooth clock drift
-//! is tens of ppm by comparison, and the jitter buffer absorbs it.
+//! anchor): the frame in bytes 4-7 plays at the NTP time, so the one in bytes
+//! 16-19 plays the latency (their difference) later. The receiver plays the
+//! stream at the rate consecutive anchors imply: two anchors one second apart
+//! that disagree by 2 ms make it play 0.2 % fast or slow, heard as speed and
+//! pitch moving. Bluetooth clock drift is tens of ppm by comparison, and the
+//! jitter buffer absorbs it.
 //!
 //! Each run drives the real sender (`AudioStreamer::start_live`, the path the
 //! daemon uses) against a receiver on the loopback interface. The input path
@@ -17,8 +19,9 @@
 //! however the machine schedules the test (preempted, throttled, suspended):
 //! every change of anchor between two sync packets is either none or a
 //! restart of the timeline after a packet too late to play (a step of more
-//! than half the margin), never a small step; the receiver is never given more
-//! margin than upstream gave; `stop` returns; decoding never waits for input.
+//! than half the margin), never a small step; every sync packet announces the
+//! render delay as its latency, and no packet arrives earlier than that before
+//! it plays; `stop` returns; decoding never waits for input.
 //!
 //! `compare_with_upstream` is ignored by default: it times the pinned upstream
 //! sender and the vendored one side by side and prints the figures:
@@ -32,7 +35,8 @@
 //!   follows;
 //! * packet sends against the RTP timeline: lasting shifts, and lateness;
 //! * the margin between a packet's arrival and its anchor (the latency the
-//!   receiver is given).
+//!   receiver is given), and the latency the sync packets announce (upstream:
+//!   none).
 //!
 //! Environment: `AUTO_AIRPLAY_TIMING_SECONDS` sets the length of each timed
 //! run (default 8), `AUTO_AIRPLAY_TIMING_CSV` a directory for the raw
@@ -46,13 +50,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use airplay_audio::timeline::Timeline;
+use airplay_audio::timeline::{Timeline, announced_latency};
 use airplay_client::{AudioFormat, ClockOffset, StreamConfig};
 use auto_airplay::plc::{JitterBuffer, PLAYOUT_CHUNK_FRAMES};
 
 /// The RTP clock of the stream (ALAC, 44.1 kHz, 352 frames per packet).
 const RTP_RATE: f64 = 44_100.0;
-const PACKET_FRAMES: u32 = 352;
 /// The daemon's settings, unchanged.
 const RENDER_DELAY_MS: u32 = 250;
 const JITTER_BUFFER_MS: u32 = 400;
@@ -82,11 +85,14 @@ fn timed_run() -> Duration {
 
 /// The vendored sender's timeline with the daemon's settings.
 fn timeline() -> Timeline {
-    Timeline::new(
-        RTP_RATE as u32,
-        PACKET_FRAMES,
+    let config = StreamConfig::default();
+    let latency = announced_latency(
         Duration::from_millis(u64::from(RENDER_DELAY_MS)),
-    )
+        RTP_RATE as u32,
+        config.latency_min,
+        config.latency_max,
+    );
+    Timeline::new(RTP_RATE as u32, latency)
 }
 
 fn logs() {
@@ -114,6 +120,8 @@ struct SyncPacket {
     arrival: Arrival,
     /// When the sync says `arrival.rtp` plays, Unix ns.
     anchor: i128,
+    /// The latency it announces, in frames (NTP sync only).
+    latency: u32,
     payload_type: u8,
 }
 
@@ -220,16 +228,23 @@ fn listen(socket: &UdpSocket, base: Instant, log: &Mutex<Log>, running: &AtomicB
                 wall,
                 rtp: word(4),
             }),
-            // NTP sync: [8..16] NTP time, [16..20] RTP timestamp.
-            84 if len >= 20 => log.syncs.push(SyncPacket {
-                arrival: Arrival {
-                    mono,
-                    wall,
-                    rtp: word(16),
-                },
-                anchor: fixed_point_ns(i128::from(word(8)) - NTP_UNIX_OFFSET_S, word(12)),
-                payload_type: 84,
-            }),
+            // NTP sync: [4..8] RTP timestamp minus the latency, which plays
+            // at [8..16] the NTP time; [16..20] RTP timestamp, which plays
+            // the latency later.
+            84 if len >= 20 => {
+                let latency = word(16).wrapping_sub(word(4));
+                log.syncs.push(SyncPacket {
+                    arrival: Arrival {
+                        mono,
+                        wall,
+                        rtp: word(16),
+                    },
+                    anchor: fixed_point_ns(i128::from(word(8)) - NTP_UNIX_OFFSET_S, word(12))
+                        + (f64::from(latency) * 1e9 / RTP_RATE).round() as i128,
+                    latency,
+                    payload_type: 84,
+                });
+            }
             // PTP sync: [4..8] RTP timestamp, [8..16] time.
             87 if len >= 28 => log.syncs.push(SyncPacket {
                 arrival: Arrival {
@@ -238,6 +253,7 @@ fn listen(socket: &UdpSocket, base: Instant, log: &Mutex<Log>, running: &AtomicB
                     rtp: word(4),
                 },
                 anchor: fixed_point_ns(i128::from(word(8)), word(12)),
+                latency: 0,
                 payload_type: 87,
             }),
             _ => {}
@@ -709,16 +725,26 @@ fn assert_on_the_timeline(mut run: Run) {
         steps.len() - restarts
     );
 
-    // The receiver is never given more margin (latency) than upstream gave
-    // in its steady state: no packet leaves before its deadline.
+    // Live streaming never uses PTP sync packets, and every sync announces
+    // the render delay as its latency: bytes 4-7 are the RTP timestamp of
+    // bytes 16-19 minus 11025 frames (250 ms, SETUP's latencyMin).
+    assert!(syncs.iter().all(|sync| sync.payload_type == 84));
+    for sync in &syncs {
+        assert_eq!(
+            sync.latency,
+            timeline.latency_frames(),
+            "announced latency ({})",
+            anchors.summary()
+        );
+    }
+    // No packet arrives earlier than the announced latency before it plays:
+    // none leaves before its deadline.
     for margin in anchors.margins(&syncs) {
         assert!(
             margin <= margin_ms + 0.1,
             "margin {margin:.3} ms over {margin_ms:.3} ms"
         );
     }
-    // Live streaming never uses PTP sync packets.
-    assert!(syncs.iter().all(|sync| sync.payload_type == 84));
     assert!(run.stopped.is_some(), "stop() did not return");
 }
 
@@ -767,6 +793,9 @@ struct Report {
     late_count: Option<u64>,
     /// The receiver's margin, i.e. the latency it is given.
     margin_ms: (f64, f64),
+    /// The latency the sync packets announce (bytes 16-19 minus bytes 4-7),
+    /// frames: lowest and highest.
+    announced: (u32, u32),
     stop_ms: Option<f64>,
 }
 
@@ -848,6 +877,9 @@ impl Report {
             send_late_ms,
             late_count: run.late_count,
             margin_ms: range(anchors.margins(&syncs)),
+            announced: syncs.iter().fold((u32::MAX, 0), |(low, high), sync| {
+                (low.min(sync.latency), high.max(sync.latency))
+            }),
             stop_ms: run.stopped.map(|elapsed| elapsed.as_secs_f64() * 1e3),
         }
     }
@@ -855,8 +887,8 @@ impl Report {
     fn header() -> String {
         format!(
             "Input: simulated Bluetooth clock {INPUT_DRIFT_PPM:+.0} ppm against real time. Clocks are against real time (monotonic).\n\
-             sender    scenario        syncs restarts | startup  | anchors vs RTP: max step  rate swing | sends: clock   late  (counted) | margin (latency) | stop\n\
-             ---------------------------------------+----------+-------------------------------+--------------------------------+------------------+--------"
+             sender    scenario        syncs restarts | startup  | anchors vs RTP: max step  rate swing | sends: clock   late  (counted) | margin (latency) | announced | stop\n\
+             ---------------------------------------+----------+-------------------------------+--------------------------------+------------------+-----------+--------"
         )
     }
 }
@@ -865,7 +897,7 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:<9} {:<15} {:>5} {:>8} | {:>+5.1} ms | {:>14.3} ms {:>6.0} ppm | {:>+6.0} ppm {:>6.2} ms {:>7} | {:>6.1}..{:<5.1} ms | {}",
+            "{:<9} {:<15} {:>5} {:>8} | {:>+5.1} ms | {:>14.3} ms {:>6.0} ppm | {:>+6.0} ppm {:>6.2} ms {:>7} | {:>6.1}..{:<5.1} ms | {:>9} | {}",
             self.sender,
             self.scenario,
             self.syncs,
@@ -879,6 +911,11 @@ impl fmt::Display for Report {
                 .map_or_else(|| "-".to_owned(), |count| format!("({count})")),
             self.margin_ms.0,
             self.margin_ms.1,
+            if self.announced.0 == self.announced.1 {
+                format!("{} fr", self.announced.0)
+            } else {
+                format!("{}..{}", self.announced.0, self.announced.1)
+            },
             self.stop_ms
                 .map_or_else(|| "hung".to_owned(), |ms| format!("{ms:.0} ms")),
         )
@@ -955,9 +992,13 @@ fn compare_with_upstream() {
             fixed.startup_ms.abs() < NO_STEP_MS || fixed.startup_ms > restart_ms,
             "{fixed}"
         );
-        // No more latency than upstream gave.
+        // Upstream announces no latency (bytes 4-7 equal bytes 16-19); the
+        // vendored sender announces the render delay, and its packets play
+        // that long after their deadline, never earlier.
+        assert_eq!(upstream.announced, (0, 0), "{upstream}");
+        let latency = timeline().latency_frames();
+        assert_eq!(fixed.announced, (latency, latency), "{fixed}");
         assert!(fixed.margin_ms.1 <= margin_ms + 0.1, "{fixed}");
-        assert!(upstream.margin_ms.1 > fixed.margin_ms.1, "{upstream}");
         assert!(fixed.stop_ms.is_some(), "{fixed}");
         if fixed.restarts == 0 {
             assert!(fixed.send_clock_ppm.abs() < 500.0, "{fixed}");

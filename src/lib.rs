@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod output;
+pub mod output_stats;
 pub mod platform;
 pub mod playout;
 pub mod plc;

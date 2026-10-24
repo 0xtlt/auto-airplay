@@ -23,6 +23,8 @@ use crate::config::ConfigStore;
 #[cfg(target_os = "linux")]
 use crate::config::{AppConfig, OutputProtocol};
 #[cfg(target_os = "linux")]
+use crate::output_stats::OutputReport;
+#[cfg(target_os = "linux")]
 use crate::preemption::{
     ExitKind, PREEMPTIONS_ENV, PreemptionGate, backoff_delay, count_after, decode_preemptions,
     encode_preemptions, is_preemption_kind,
@@ -216,6 +218,10 @@ async fn run_session(
     let mut feedback = tokio::time::interval(FEEDBACK_INTERVAL);
     feedback.set_missed_tick_behavior(MissedTickBehavior::Skip);
     feedback.tick().await;
+    // The output's counters, once a minute while streaming (restarted with
+    // each stream, so each line covers a full minute of it).
+    let mut output_stats = tokio::time::interval(crate::plc::STATS_INTERVAL);
+    output_stats.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut client: Option<AirPlayClient> = None;
     // Timestamps for the failure diagnostics.
@@ -275,6 +281,7 @@ async fn run_session(
                                     client = Some(*acquired);
                                     stream_started = Some(Instant::now());
                                     last_feedback_ok_return = None;
+                                    output_stats.reset();
                                     sink.arm();
                                     monitor.mark_active(Instant::now());
                                     tracing::info!("streaming started");
@@ -316,6 +323,11 @@ async fn run_session(
                         Ok(Err(error)) => failure = Some(error.into()),
                         Err(_) => failure = Some(anyhow!("AirPlay feedback timed out")),
                     }
+                }
+            }
+            _ = output_stats.tick(), if client.is_some() => {
+                if let Some(stats) = client.as_ref().and_then(AirPlayClient::take_output_stats) {
+                    tracing::info!(target: "auto_airplay", "{}", OutputReport(stats));
                 }
             }
             next = &mut changed => {

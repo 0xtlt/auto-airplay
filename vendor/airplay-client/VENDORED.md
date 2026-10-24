@@ -44,3 +44,11 @@ never change the speaker volume, so the crate is vendored and patched.
    the shared secret (`events_secret`, filled in all connect paths) and the task
    handle (`events_task`, aborted in `disconnect()` and `Drop`); without a secret
    the old behaviour (stream held open, unread) remains.
+3. **Output counters.** `AirPlayClient::take_output_stats` and
+   `Connection::take_output_stats` hand over the streamer's
+   `take_output_stats` (see `vendor/airplay-audio`, patch 6; `OutputStats` is
+   re-exported). The control channel loops (`Connection::start_streaming`,
+   `Connection::start_streaming_live`, the group listener) count retransmit
+   requests (payload type 85) they cannot parse with
+   `AudioStreamer::note_unparsed_retransmit_request`; upstream dropped them
+   without a log in the live path.

@@ -9,10 +9,12 @@
 //!
 //! Here the timeline is a pure function of the stream position. The first
 //! packet sets an origin; packet `n` frames later is due at
-//! `origin + n / rate`, and its sync packet announces that time plus a fixed
-//! margin. Decoding, encoding and scheduling delays change when a packet is
-//! prepared, never when it is due or when it plays. Only a packet that is
-//! hopelessly late (more than half the margin) moves the timeline, once.
+//! `origin + n / rate`, and plays the announced latency later: its sync
+//! packet, sent with it, carries the deadline and the latency (see
+//! [`announced_latency`]). Decoding, encoding and scheduling delays change
+//! when a packet is prepared, never when it is due or when it plays. Only a
+//! packet that is hopelessly late (more than half the latency) moves the
+//! timeline, once.
 
 #[cfg(not(target_os = "linux"))]
 use std::sync::OnceLock;
@@ -23,13 +25,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Packets the producer may queue ahead of the sender thread.
 pub const SENDER_QUEUE: usize = 8;
 
-/// How far ahead of its send deadline upstream stamped a packet: the queue,
-/// plus the packet the sender thread holds, plus the one being prepared. The
-/// sync anchor keeps that offset so that the latency stays what it was.
-const STAMP_LEAD_PACKETS: u64 = SENDER_QUEUE as u64 + 2;
-
 /// Lateness at which the timeline is moved, at least.
 const MIN_MAX_LATE: Duration = Duration::from_millis(20);
+
+/// The latency the sync packets announce, in frames of the stream's RTP
+/// clock: the render delay, kept within the bounds the stream declared at
+/// SETUP (`latencyMin`, `latencyMax`), where a receiver would clamp it anyway.
+///
+/// A sync packet carries it as the difference of its two RTP timestamps
+/// (bytes 16-19 minus bytes 4-7): the receiver plays a packet that long after
+/// the time the sync packet sent with it carries, plus its own latency.
+pub fn announced_latency(render_delay: Duration, rate: u32, min_frames: u32, max_frames: u32) -> u32 {
+    let frames = (render_delay.as_nanos() * u128::from(rate) + 500_000_000) / 1_000_000_000;
+    u32::try_from(frames)
+        .unwrap_or(u32::MAX)
+        .max(min_frames)
+        .min(max_frames.max(min_frames))
+}
 
 /// The monotonic clock the sender thread sleeps on, in ns.
 pub fn mono_now_ns() -> u64 {
@@ -76,10 +88,11 @@ pub fn wall_minus_mono_ns() -> i128 {
 /// Where a packet sits on the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
-    /// When the packet is due to be sent, on [`mono_now_ns`].
+    /// When the packet is due to be sent, on [`mono_now_ns`]. A sync packet
+    /// sent with it carries this time (converted to the wall clock).
     pub deadline_ns: u64,
-    /// When its first frame plays, on [`mono_now_ns`]: what its sync packet
-    /// announces (converted to the wall clock).
+    /// When its first frame plays (before the receiver's own latency), on
+    /// [`mono_now_ns`]: the deadline plus the announced latency.
     pub anchor_ns: i128,
     /// The timeline (re)started at this packet: send a sync packet with it.
     pub restarted: bool,
@@ -90,7 +103,9 @@ pub struct Slot {
 #[derive(Debug, Clone)]
 pub struct Timeline {
     rate: u64,
-    /// Sync anchor minus send deadline.
+    /// The announced latency, in frames.
+    latency_frames: u32,
+    /// The same in ns: anchor minus send deadline.
     margin_ns: i128,
     max_late_ns: u64,
     /// Monotonic ns and stream position of the origin.
@@ -99,18 +114,16 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// `render_delay` is the setting of the same name, `frames_per_packet` the
-    /// packet size, both as upstream used them.
-    pub fn new(rate: u32, frames_per_packet: u32, render_delay: Duration) -> Self {
+    /// `latency_frames` is what the sync packets announce (see
+    /// [`announced_latency`]): a packet plays that long after its deadline.
+    pub fn new(rate: u32, latency_frames: u32) -> Self {
         let rate = u64::from(rate.max(1));
-        let stamp_lead_ns =
-            STAMP_LEAD_PACKETS * u64::from(frames_per_packet) * 1_000_000_000 / rate;
-        let margin_ns = render_delay.as_nanos() as i128 - i128::from(stamp_lead_ns);
-        let half_margin = u64::try_from(margin_ns / 2).unwrap_or(0);
+        let latency_ns = u64::from(latency_frames) * 1_000_000_000 / rate;
         Self {
             rate,
-            margin_ns,
-            max_late_ns: half_margin.max(MIN_MAX_LATE.as_nanos() as u64),
+            latency_frames,
+            margin_ns: i128::from(latency_ns),
+            max_late_ns: (latency_ns / 2).max(MIN_MAX_LATE.as_nanos() as u64),
             origin: None,
             restarts: 0,
         }
@@ -118,7 +131,7 @@ impl Timeline {
 
     /// The slot of the packet starting at stream position `position`, prepared
     /// at `now_ns`. The first packet, the first after [`Self::restart`], and
-    /// one prepared more than half the margin after its deadline start the
+    /// one prepared more than half the latency after its deadline start the
     /// timeline at `now_ns`.
     pub fn slot(&mut self, position: u64, now_ns: u64) -> Slot {
         if let Some((origin_ns, origin_position)) = self.origin {
@@ -153,7 +166,13 @@ impl Timeline {
         self.restarts
     }
 
-    /// Sync anchor minus send deadline.
+    /// The announced latency, in frames: what bytes 4-7 of a sync packet
+    /// subtract from the RTP timestamp in bytes 16-19.
+    pub fn latency_frames(&self) -> u32 {
+        self.latency_frames
+    }
+
+    /// Anchor minus send deadline: the announced latency, in ns.
     pub fn margin(&self) -> i128 {
         self.margin_ns
     }

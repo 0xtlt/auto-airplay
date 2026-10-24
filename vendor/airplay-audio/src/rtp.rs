@@ -374,6 +374,18 @@ pub fn build_retransmit_response(original_packet: &[u8]) -> Vec<u8> {
 /// Maximum number of recent packets to retain for retransmission.
 const PACKET_HISTORY_SIZE: usize = 512;
 
+/// Local patch: bytes 2-3 of every NTP sync packet (PT=84).
+///
+/// iTunes and Apple Music, OwnTone, pyatv and libraop (AirConnect: "seems
+/// that seq=7 shall be forced") all send 7 in every sync packet; upstream
+/// sent a counter of sync packets. 7 only aligns this sender with those known
+/// to work with HomePods: what a HomePod does with the field is not known.
+/// shairport-sync reads 7 as "add 11025 frames of latency", but adds them
+/// anyway for senders that announce AirPlay 371 or later, as this one does
+/// (`AirPlay/745.83`), so the value changes nothing there; OwnTone found that
+/// AirPlay 2 receivers do not take the latency from it.
+const NTP_SYNC_BYTES_2_3: u16 = 7;
+
 /// RTP sender over UDP.
 pub struct RtpSender {
     socket: Option<UdpSocket>,
@@ -568,24 +580,18 @@ impl RtpSender {
         self.serialize_audio(payload_type, timestamp, payload, marker)
     }
 
-    /// Send sync packet to control port.
+    /// Send sync packet to control port (format: [`Self::prepare_sync`]).
     ///
-    /// Owntone's sync packet format (20 bytes):
-    /// - Byte 0: Type (0x90 = start sync, 0x80 = regular sync)
-    /// - Byte 1: 0xd4 (payload type 84 with marker bit)
-    /// - Bytes 2-3: 0x00, 0x07 (fixed values)
-    /// - Bytes 4-7: Current playback position in samples (BE)
-    /// - Bytes 8-15: NTP timestamp (8 bytes BE - seconds + fraction)
-    /// - Bytes 16-19: RTP timestamp (BE)
-    pub fn send_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<()> {
+    /// Local patch: sends what `prepare_sync` builds, as `send_ptp_sync` does
+    /// with `prepare_ptp_sync`; upstream built the same packet twice.
+    pub fn send_sync(&mut self, rtp_timestamp: u32, latency: u32, ntp_timestamp: u64) -> Result<()> {
+        let packet = match self.prepare_sync(rtp_timestamp, latency, ntp_timestamp)? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
         // Get the destination - control port if set, otherwise data port
         let dest = self.control_dest.unwrap_or(self.dest);
-
-        // Skip sync packets if destination port is 0 (AirPlay 2 buffered doesn't use sync packets)
-        if dest.port() == 0 {
-            tracing::debug!("Skipping sync packet (no control port for AirPlay 2 buffered)");
-            return Ok(());
-        }
 
         // Use control socket if available (sends from our declared control port),
         // otherwise fall back to data socket.
@@ -595,47 +601,33 @@ impl RtpSender {
                 airplay_core::error::StreamingError::Encoding("Socket not bound".into())
             ))?;
 
-        // Build owntone-style sync packet (20 bytes)
-        let mut packet = [0u8; 20];
-
-        // Byte 0: 0x90 for first sync (extension bit set), 0x80 for subsequent
-        packet[0] = if !self.first_sync_sent {
-            self.first_sync_sent = true;
-            0x90
-        } else {
-            0x80
-        };
-        // Byte 1: 0xd4 = marker bit (0x80) | payload type 84 (0x54)
-        packet[1] = 0xd4;
-        // Bytes 2-3: Sync sequence counter (increment after use)
-        packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
-        self.sync_sequence = self.sync_sequence.wrapping_add(1);
-        // Bytes 4-7: Current playback position (use rtp_timestamp)
-        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
-        // Bytes 8-15: NTP timestamp (8 bytes BE)
-        packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
-        // Bytes 16-19: RTP timestamp (BE)
-        packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
-
         socket.send_to(&packet, dest)?;
-        // Diagnostic: log first sync packet in detail
-        if self.sync_sequence <= 2 {
-            let ntp_secs = (ntp_timestamp >> 32) as u32;
-            let ntp_frac = ntp_timestamp as u32;
-            tracing::info!(
-                "DIAG sync #{}: dest={}, rtp_ts={}, ntp_secs={}, ntp_frac={}, first_byte=0x{:02x}, pkt={:02x?}",
-                self.sync_sequence - 1, dest, rtp_timestamp, ntp_secs, ntp_frac,
-                packet[0], &packet[..20]
-            );
-        }
-        tracing::debug!("Sync packet sent to {}: rtp_ts={}, ntp_ts={}", dest, rtp_timestamp, ntp_timestamp);
+        tracing::debug!(
+            "Sync packet sent to {}: rtp_ts={}, latency={}, ntp_ts={}",
+            dest, rtp_timestamp, latency, ntp_timestamp
+        );
 
         Ok(())
     }
 
     /// Prepare a sync packet without sending. Returns the 20-byte packet data,
     /// or None if the control port is 0 (buffered mode skips sync).
-    pub fn prepare_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<Option<Vec<u8>>> {
+    ///
+    /// Sync packet (PT=84, 20 bytes), as iTunes, OwnTone and pyatv send it:
+    /// - Byte 0: 0x90 for the first sync after RECORD or FLUSH (extension bit),
+    ///   0x80 after
+    /// - Byte 1: 0xd4 (marker bit | payload type 84)
+    /// - Bytes 2-3: 7 (BE), always (local patch, see `NTP_SYNC_BYTES_2_3`)
+    /// - Bytes 4-7: `rtp_timestamp - latency` (BE): the frame that plays at
+    ///   the NTP time
+    /// - Bytes 8-15: NTP time (BE, seconds + fraction): when the sync is sent
+    /// - Bytes 16-19: `rtp_timestamp` (BE): the audio packet sent at that time
+    ///
+    /// Local patch: the receiver reads the difference of the two RTP
+    /// timestamps as the latency, in frames, and keeps that much audio
+    /// buffered on top of its own latency. Upstream wrote `rtp_timestamp` in
+    /// bytes 4-7 as well: a latency of zero.
+    pub fn prepare_sync(&mut self, rtp_timestamp: u32, latency: u32, ntp_timestamp: u64) -> Result<Option<Vec<u8>>> {
         let dest = self.control_dest.unwrap_or(self.dest);
 
         if dest.port() == 0 {
@@ -652,9 +644,12 @@ impl RtpSender {
             0x80
         };
         packet[1] = 0xd4;
-        packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
+        // Local patch: 7, as other AirPlay senders write it. Upstream wrote
+        // the sync counter here. (The counter still gates the logs.)
+        packet[2..4].copy_from_slice(&NTP_SYNC_BYTES_2_3.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
-        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+        // RTP timestamps wrap: so does this one, near the start of a stream.
+        packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(latency).to_be_bytes());
         packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
         packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
 
@@ -662,8 +657,8 @@ impl RtpSender {
             let ntp_secs = (ntp_timestamp >> 32) as u32;
             let ntp_frac = ntp_timestamp as u32;
             tracing::info!(
-                "DIAG sync #{}: dest={}, rtp_ts={}, ntp_secs={}, ntp_frac={}, first_byte=0x{:02x}, pkt={:02x?}",
-                self.sync_sequence - 1, dest, rtp_timestamp, ntp_secs, ntp_frac,
+                "DIAG sync #{}: dest={}, rtp_ts={}, latency={}, ntp_secs={}, ntp_frac={}, first_byte=0x{:02x}, pkt={:02x?}",
+                self.sync_sequence - 1, dest, rtp_timestamp, latency, ntp_secs, ntp_frac,
                 packet[0], &packet[..20]
             );
         }
@@ -1160,7 +1155,7 @@ mod tests {
             sender.set_control_socket(control_socket);
 
             // Send a sync packet
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
 
             // Receive it and check the source port
             let mut buf = [0u8; 64];
@@ -1190,7 +1185,7 @@ mod tests {
             let data_port = sender.bind(0).unwrap();
             // No set_control_socket call
 
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
 
             let mut buf = [0u8; 64];
             let (_len, src_addr) = listener.recv_from(&mut buf).unwrap();
@@ -1210,8 +1205,9 @@ mod tests {
             sender.bind(0).unwrap();
 
             let rtp_ts: u32 = 44100;
+            let latency: u32 = 11025;
             let ntp_ts: u64 = 0xAAAABBBBCCCCDDDD;
-            sender.send_sync(rtp_ts, ntp_ts).unwrap();
+            sender.send_sync(rtp_ts, latency, ntp_ts).unwrap();
 
             let mut buf = [0u8; 64];
             let (len, _) = listener.recv_from(&mut buf).unwrap();
@@ -1222,12 +1218,36 @@ mod tests {
             assert_eq!(buf[0], 0x90);
             // Byte 1: 0xD4 = marker (0x80) | PT 84 (0x54)
             assert_eq!(buf[1], 0xD4);
-            // Bytes 4-7: RTP timestamp (big-endian)
-            assert_eq!(&buf[4..8], &rtp_ts.to_be_bytes());
+            // Bytes 2-3: 7, as every AirPlay sender writes them (local patch)
+            assert_eq!(&buf[2..4], &[0x00, 0x07]);
+            // Bytes 4-7: RTP timestamp minus the latency (big-endian)
+            assert_eq!(&buf[4..8], &33075u32.to_be_bytes());
             // Bytes 8-15: NTP timestamp (big-endian)
             assert_eq!(&buf[8..16], &ntp_ts.to_be_bytes());
-            // Bytes 16-19: RTP timestamp again
+            // Bytes 16-19: RTP timestamp
             assert_eq!(&buf[16..20], &rtp_ts.to_be_bytes());
+        }
+
+        #[test]
+        fn sync_announces_the_latency_in_bytes_4_to_7() {
+            // Local patch: a receiver reads bytes 16-19 minus bytes 4-7 as the
+            // latency (shairport-sync: `rtp_timestamp_less_latency`).
+            let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+            let mut sender = RtpSender::new(addr, 0xABCD);
+            sender.set_control_dest("127.0.0.1:5001".parse().unwrap());
+
+            let packet = sender.prepare_sync(1_000_000, 11025, 0).unwrap().unwrap();
+            let word = |at: usize| u32::from_be_bytes([packet[at], packet[at + 1], packet[at + 2], packet[at + 3]]);
+            assert_eq!(word(4), 988_975);
+            assert_eq!(word(16), 1_000_000);
+            assert_eq!(word(16).wrapping_sub(word(4)), 11025);
+
+            // Near the start of a stream the frame in bytes 4-7 is before the
+            // first one: it wraps, like any RTP timestamp.
+            let packet = sender.prepare_sync(352, 11025, 0).unwrap().unwrap();
+            let word = |at: usize| u32::from_be_bytes([packet[at], packet[at + 1], packet[at + 2], packet[at + 3]]);
+            assert_eq!(word(4), u32::MAX - 11025 + 353);
+            assert_eq!(word(16).wrapping_sub(word(4)), 11025);
         }
 
         #[test]
@@ -1241,15 +1261,29 @@ mod tests {
             sender.bind(0).unwrap();
 
             // First sync
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
             let mut buf = [0u8; 64];
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x90, "first sync should have extension bit");
 
             // Second sync
-            sender.send_sync(352, 1000).unwrap();
+            sender.send_sync(352, 0, 1000).unwrap();
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x80, "subsequent syncs should NOT have extension bit");
+        }
+
+        #[test]
+        fn every_sync_carries_7_in_bytes_2_and_3() {
+            // Local patch: upstream counted sync packets in these bytes; other
+            // AirPlay senders always write 7.
+            let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+            let mut sender = RtpSender::new(addr, 0xABCD);
+            sender.set_control_dest("127.0.0.1:5001".parse().unwrap());
+
+            for n in 0..20u32 {
+                let packet = sender.prepare_sync(n * 44100, 11025, 0).unwrap().unwrap();
+                assert_eq!(&packet[2..4], &[0x00, 0x07], "sync #{n}");
+            }
         }
     }
 
@@ -1315,7 +1349,7 @@ mod tests {
             sender.set_control_socket(control_socket);
 
             // Send sync
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
 
             // Verify it arrived from the control port
             let mut buf = [0u8; 64];

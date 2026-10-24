@@ -1,16 +1,26 @@
 //! The timeline of the vendored AirPlay sender (`airplay_audio::timeline`):
-//! when each packet is due and what its sync packet announces.
+//! when each packet is due, when it plays, and the latency its sync packet
+//! announces.
 
 use std::time::Duration;
 
-use airplay_audio::timeline::Timeline;
+use airplay_audio::timeline::{Timeline, announced_latency};
+use airplay_client::StreamConfig;
 
 const RATE: u32 = 44_100;
 const PACKET: u64 = 352;
 const MS: u64 = 1_000_000;
+/// The daemon's `output.render_delay_ms`.
+const RENDER_DELAY: Duration = Duration::from_millis(250);
+
+/// The latency the daemon's sync packets announce, in frames.
+fn daemon_latency() -> u32 {
+    let config = StreamConfig::default();
+    announced_latency(RENDER_DELAY, RATE, config.latency_min, config.latency_max)
+}
 
 fn timeline() -> Timeline {
-    Timeline::new(RATE, PACKET as u32, Duration::from_millis(250))
+    Timeline::new(RATE, daemon_latency())
 }
 
 /// ns of `frames` at 44.1 kHz, rounded down.
@@ -43,11 +53,34 @@ fn deadlines_and_anchors_are_a_function_of_the_position_only() {
 }
 
 #[test]
-fn the_margin_is_what_upstream_gave_in_its_steady_state() {
-    // Render delay minus the ten packets upstream stamped ahead of sending.
-    let margin = timeline().margin();
-    assert_eq!(margin, 250_000_000 - i128::from(frames_ns(10 * PACKET)));
-    assert!((170_181_000..170_182_000).contains(&margin), "{margin}");
+fn the_render_delay_is_announced_as_the_latency_setup_declares_as_minimum() {
+    // SETUP declares latencyMin 11025 and latencyMax 88200 frames (250 ms and
+    // 2 s at 44.1 kHz): the 250 ms render delay is exactly the minimum.
+    let config = StreamConfig::default();
+    assert_eq!((config.latency_min, config.latency_max), (11_025, 88_200));
+    assert_eq!(daemon_latency(), 11_025);
+    // A packet plays that long after its deadline: 250 ms, where the timeline
+    // used to subtract the 10 packets (80 ms) upstream stamped ahead of
+    // sending.
+    let timeline = timeline();
+    assert_eq!(timeline.latency_frames(), 11_025);
+    assert_eq!(timeline.margin(), 250_000_000);
+}
+
+#[test]
+fn the_announced_latency_stays_within_what_setup_declares() {
+    let latency = |ms| announced_latency(Duration::from_millis(ms), RATE, 11_025, 88_200);
+    // Below the minimum: a receiver would clamp it there anyway.
+    assert_eq!(latency(0), 11_025);
+    assert_eq!(latency(100), 11_025);
+    assert_eq!(latency(500), 22_050);
+    assert_eq!(latency(2_000), 88_200);
+    assert_eq!(latency(5_000), 88_200);
+    // Frames of the stream's clock, rounded to the nearest.
+    assert_eq!(announced_latency(RENDER_DELAY, 48_000, 0, u32::MAX), 12_000);
+    let rounded = |us| announced_latency(Duration::from_micros(us), RATE, 0, u32::MAX);
+    assert_eq!(rounded(250_005), 11_025); // 11025.2 frames
+    assert_eq!(rounded(250_020), 11_026); // 11025.9 frames
 }
 
 #[test]
@@ -64,12 +97,13 @@ fn a_week_of_packets_does_not_drift() {
 fn only_a_hopelessly_late_packet_moves_the_timeline() {
     let mut timeline = timeline();
     timeline.slot(0, 0);
-    // Half the 170 ms margin: still playable, the timeline holds.
-    let late = timeline.slot(100 * PACKET, frames_ns(100 * PACKET) + 85 * MS);
+    // Half the 250 ms latency: still playable, the timeline holds.
+    assert_eq!(timeline.max_late_ns(), 125 * MS);
+    let late = timeline.slot(100 * PACKET, frames_ns(100 * PACKET) + 125 * MS);
     assert!(!late.restarted);
     assert_eq!(timeline.restarts(), 0);
 
-    let now = frames_ns(101 * PACKET) + 90 * MS;
+    let now = frames_ns(101 * PACKET) + 130 * MS;
     let hopeless = timeline.slot(101 * PACKET, now);
     assert!(hopeless.restarted);
     assert_eq!(hopeless.deadline_ns, now);
@@ -93,10 +127,9 @@ fn a_restart_or_a_jump_back_starts_a_new_timeline() {
 }
 
 #[test]
-fn without_a_margin_lateness_is_still_tolerated_a_little() {
-    // A render delay shorter than ten packets: negative margin, as upstream.
-    let mut timeline = Timeline::new(RATE, PACKET as u32, Duration::ZERO);
-    assert!(timeline.margin() < 0);
+fn without_latency_lateness_is_still_tolerated_a_little() {
+    let mut timeline = Timeline::new(RATE, 0);
+    assert_eq!(timeline.margin(), 0);
     timeline.slot(0, 0);
     assert!(!timeline.slot(PACKET, frames_ns(PACKET) + 19 * MS).restarted);
     assert!(

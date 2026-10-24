@@ -1186,6 +1186,10 @@ impl Connection {
                                     );
                                     None
                                 };
+                                // Local patch: counted for the periodic report.
+                                if request.is_none() {
+                                    streamer_clone.note_unparsed_retransmit_request();
+                                }
 
                                 if let Some(request) = request {
                                     stats.rtx_requested.fetch_add(request.count as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1326,6 +1330,10 @@ impl Connection {
                                 } else {
                                     None
                                 };
+                                // Local patch: upstream dropped these without a word.
+                                if request.is_none() {
+                                    streamer_clone.note_unparsed_retransmit_request();
+                                }
 
                                 if let Some(request) = request {
                                     stats.rtx_requested.fetch_add(request.count as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1439,6 +1447,12 @@ impl Connection {
     /// Get the total buffer underruns from this connection's streamer (0 if no streamer).
     pub fn streamer_underruns(&self) -> u64 {
         self.streamer.as_ref().map_or(0, |s| s.underruns())
+    }
+
+    /// Local patch: the streamer's counters since the previous call (see
+    /// `AudioStreamer::take_output_stats`). `None` without a streamer.
+    pub fn take_output_stats(&self) -> Option<airplay_audio::OutputStats> {
+        self.streamer.as_ref().map(AudioStreamer::take_output_stats)
     }
 
     /// Set render delay in milliseconds.

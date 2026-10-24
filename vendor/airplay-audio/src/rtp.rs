@@ -374,6 +374,18 @@ pub fn build_retransmit_response(original_packet: &[u8]) -> Vec<u8> {
 /// Maximum number of recent packets to retain for retransmission.
 const PACKET_HISTORY_SIZE: usize = 512;
 
+/// Local patch: bytes 2-3 of every NTP sync packet (PT=84).
+///
+/// iTunes and Apple Music, OwnTone, pyatv and libraop (AirConnect: "seems
+/// that seq=7 shall be forced") all send 7 in every sync packet; upstream
+/// sent a counter of sync packets. 7 only aligns this sender with those known
+/// to work with HomePods: what a HomePod does with the field is not known.
+/// shairport-sync reads 7 as "add 11025 frames of latency", but adds them
+/// anyway for senders that announce AirPlay 371 or later, as this one does
+/// (`AirPlay/745.83`), so the value changes nothing there; OwnTone found that
+/// AirPlay 2 receivers do not take the latency from it.
+const NTP_SYNC_BYTES_2_3: u16 = 7;
+
 /// RTP sender over UDP.
 pub struct RtpSender {
     socket: Option<UdpSocket>,
@@ -605,7 +617,7 @@ impl RtpSender {
     /// - Byte 0: 0x90 for the first sync after RECORD or FLUSH (extension bit),
     ///   0x80 after
     /// - Byte 1: 0xd4 (marker bit | payload type 84)
-    /// - Bytes 2-3: sync sequence counter (BE)
+    /// - Bytes 2-3: 7 (BE), always (local patch, see `NTP_SYNC_BYTES_2_3`)
     /// - Bytes 4-7: `rtp_timestamp - latency` (BE): the frame that plays at
     ///   the NTP time
     /// - Bytes 8-15: NTP time (BE, seconds + fraction): when the sync is sent
@@ -632,7 +644,9 @@ impl RtpSender {
             0x80
         };
         packet[1] = 0xd4;
-        packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
+        // Local patch: 7, as other AirPlay senders write it. Upstream wrote
+        // the sync counter here. (The counter still gates the logs.)
+        packet[2..4].copy_from_slice(&NTP_SYNC_BYTES_2_3.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
         // RTP timestamps wrap: so does this one, near the start of a stream.
         packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(latency).to_be_bytes());
@@ -1204,6 +1218,8 @@ mod tests {
             assert_eq!(buf[0], 0x90);
             // Byte 1: 0xD4 = marker (0x80) | PT 84 (0x54)
             assert_eq!(buf[1], 0xD4);
+            // Bytes 2-3: 7, as every AirPlay sender writes them (local patch)
+            assert_eq!(&buf[2..4], &[0x00, 0x07]);
             // Bytes 4-7: RTP timestamp minus the latency (big-endian)
             assert_eq!(&buf[4..8], &33075u32.to_be_bytes());
             // Bytes 8-15: NTP timestamp (big-endian)
@@ -1254,6 +1270,20 @@ mod tests {
             sender.send_sync(352, 0, 1000).unwrap();
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x80, "subsequent syncs should NOT have extension bit");
+        }
+
+        #[test]
+        fn every_sync_carries_7_in_bytes_2_and_3() {
+            // Local patch: upstream counted sync packets in these bytes; other
+            // AirPlay senders always write 7.
+            let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+            let mut sender = RtpSender::new(addr, 0xABCD);
+            sender.set_control_dest("127.0.0.1:5001".parse().unwrap());
+
+            for n in 0..20u32 {
+                let packet = sender.prepare_sync(n * 44100, 11025, 0).unwrap().unwrap();
+                assert_eq!(&packet[2..4], &[0x00, 0x07], "sync #{n}");
+            }
         }
     }
 

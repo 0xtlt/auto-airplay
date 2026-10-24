@@ -4,6 +4,7 @@ use airplay_core::{StreamConfig, error::Result};
 use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
 use crate::eq::{EqConfig, EqParams, Equalizer};
+use crate::output::{OutputCounters, OutputStats};
 use crate::timeline::{announced_latency, mono_now_ns, wall_minus_mono_ns, Timeline, SENDER_QUEUE};
 use airplay_timing::{ClockOffset, unix_to_ntp};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering}};
@@ -178,6 +179,7 @@ fn sender_thread_main(
     frame_duration: std::time::Duration,
     running: Arc<AtomicBool>,
     lateness: Arc<SendLateness>,
+    output: Arc<OutputCounters>,
 ) {
     set_realtime_priority();
     disable_wifi_power_save();
@@ -245,10 +247,19 @@ fn sender_thread_main(
                 }
 
                 // Send per-target audio packets
+                // Local patch: when the audio packet really went out (right
+                // after its first successful send), for the periodic report.
+                // A packet no target took is not recorded.
+                let mut sent_ns = None;
                 for (i, target) in targets.iter().enumerate() {
                     if let Some(wire_data) = wire_packets.get(i) {
-                        if let Err(e) = target.data_socket.send_to(wire_data, target.data_dest) {
-                            tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
+                        match target.data_socket.send_to(wire_data, target.data_dest) {
+                            Ok(_) => {
+                                sent_ns.get_or_insert_with(mono_now_ns);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
+                            }
                         }
                     }
                 }
@@ -262,6 +273,14 @@ fn sender_thread_main(
                     lateness.late.fetch_add(1, Ordering::Relaxed);
                 }
                 lateness.max_late_us.fetch_max(late_ns / 1_000, Ordering::Relaxed);
+                // Local patch: the periodic report. Each packet's deadline and
+                // send time judge the requests for it later (atomics only).
+                if let (Some(sent_ns), Some(header)) =
+                    (sent_ns, wire_packets.first().and_then(|wire| wire.get(2..4)))
+                {
+                    let sequence = u16::from_be_bytes([header[0], header[1]]);
+                    output.record_send(sequence, deadline_ns, sent_ns, frame_ns);
+                }
                 if packet_count % 500 == 0 {
                     tracing::debug!(
                         "TIMING STATS after {} pkts: avg_late={:.3}ms max_late={:.3}ms late_pkts={}",
@@ -323,6 +342,8 @@ pub struct AudioStreamer {
     sender_running: Arc<AtomicBool>,
     /// Local patch: packets the sender thread sent late.
     lateness: Arc<SendLateness>,
+    /// Local patch: what [`AudioStreamer::take_output_stats`] reports.
+    output: Arc<OutputCounters>,
 }
 
 impl Clone for AudioStreamer {
@@ -338,6 +359,7 @@ impl Clone for AudioStreamer {
             sender_tx: self.sender_tx.clone(),
             sender_running: Arc::clone(&self.sender_running),
             lateness: Arc::clone(&self.lateness),
+            output: Arc::clone(&self.output),
         }
     }
 }
@@ -374,6 +396,7 @@ impl AudioStreamer {
             sender_tx: None,
             sender_running: Arc::new(AtomicBool::new(false)),
             lateness: Arc::new(SendLateness::default()),
+            output: Arc::new(OutputCounters::default()),
         }
     }
 
@@ -440,13 +463,42 @@ impl AudioStreamer {
     ///
     /// Each RtpSender has its own packet history ring buffer, so retransmit
     /// responses are per-device (encrypted with the correct device key).
+    ///
+    /// Local patch: counted in [`AudioStreamer::take_output_stats`].
     pub async fn handle_retransmit_for_target(&self, index: usize, request: &crate::rtp::RetransmitRequest) -> airplay_core::error::Result<u16> {
+        // When the request came in, before waiting for the lock.
+        let now_ns = mono_now_ns();
         let inner = self.inner.lock().await;
-        if let Some(sender) = inner.rtp_senders.get(index) {
-            sender.handle_retransmit(request)
-        } else {
-            Ok(0)
-        }
+        let Some(sender) = inner.rtp_senders.get(index) else {
+            return Ok(0);
+        };
+        let served = sender.handle_retransmit(request);
+        // The latency the sync packets announce, as the timeline has it.
+        let config = &inner.config;
+        let rate = config.audio_format.sample_rate.as_hz();
+        let latency = announced_latency(
+            Duration::from_nanos(inner.render_delay_ns),
+            rate,
+            config.latency_min,
+            config.latency_max,
+        );
+        let latency_ns = Timeline::new(rate, latency).margin().max(0) as u64;
+        drop(inner);
+        self.output.record_retransmit(request, served.as_ref().ok().copied(), now_ns, latency_ns);
+        served
+    }
+
+    /// Local patch: what the sender did since the previous call (counts) or
+    /// over that time (maxima), for a periodic report. Counts every target
+    /// of a group together.
+    pub fn take_output_stats(&self) -> OutputStats {
+        self.output.take()
+    }
+
+    /// Local patch: the control channel received a retransmit request it
+    /// could not parse (see [`OutputStats::rtx_unparsed`]).
+    pub fn note_unparsed_retransmit_request(&self) {
+        self.output.note_unparsed();
     }
 
     /// Get the total number of audio packets sent.
@@ -527,6 +579,7 @@ impl AudioStreamer {
                     self.sender_running.store(true, Ordering::Release);
                     let running = Arc::clone(&self.sender_running);
                     let lateness = Arc::clone(&self.lateness);
+                    let output = Arc::clone(&self.output);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -536,6 +589,7 @@ impl AudioStreamer {
                                 frame_duration,
                                 running,
                                 lateness,
+                                output,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -666,6 +720,7 @@ impl AudioStreamer {
                     self.sender_running.store(true, Ordering::Release);
                     let running = Arc::clone(&self.sender_running);
                     let lateness = Arc::clone(&self.lateness);
+                    let output = Arc::clone(&self.output);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -675,6 +730,7 @@ impl AudioStreamer {
                                 frame_duration,
                                 running,
                                 lateness,
+                                output,
                             );
                         })
                         .expect("Failed to spawn sender thread");

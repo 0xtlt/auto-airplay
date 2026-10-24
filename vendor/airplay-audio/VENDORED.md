@@ -76,3 +76,29 @@ way to change it from outside, so it is vendored like `vendor/airplay-client`.
    `prepare_sync` and `send_sync` take the latency; `send_sync` sends what
    `prepare_sync` builds, as `send_ptp_sync` does. PTP sync packets keep
    their format and announce when the packet plays.
+5. **Sync packets carry 7 in bytes 2-3.** Upstream wrote a counter of sync
+   packets there; iTunes and Apple Music, OwnTone, pyatv and libraop
+   (AirConnect: "seems that seq=7 shall be forced") all write 7. The change
+   only aligns this sender with those known to work with HomePods: what a
+   HomePod does with the field is not known. shairport-sync reads 7 as "add
+   11025 frames of latency" but adds them anyway for senders that announce
+   AirPlay 371 or later, as this one does (`AirPlay/745.83`); OwnTone found
+   that AirPlay 2 receivers do not take the latency from the field.
+   `prepare_sync` writes 7 (`NTP_SYNC_BYTES_2_3`); the counter still limits
+   the first-syncs log. PTP sync packets (not used for live streaming) are
+   unchanged.
+6. **Output counters.** `AudioStreamer::take_output_stats` returns what the
+   sender did since the previous call (`OutputStats`, exported): packets sent,
+   those sent more than a packet late and the largest lateness; retransmit
+   requests, the packets they asked for, served and missed (not in the
+   history), those asked for once the time the sync packets announced for
+   them had passed, and the longest a requested packet had been out. New
+   module `src/output.rs` (public but `#[doc(hidden)]`, only so the host
+   crate's `tests/output_stats.rs` can drive it on its own clock): for each
+   of the last 512 packets, the sender thread stores its deadline (the
+   timeline's, which the sync packets announce) and when it really went out,
+   in atomics tagged with the sequence number, so it takes no lock. A request
+   is late once the deadline plus the announced latency has passed, however
+   late the packet went out, and across timeline restarts; its age counts
+   from when it really went out. `note_unparsed_retransmit_request` counts the
+   requests the control channel cannot parse (see `vendor/airplay-client`).

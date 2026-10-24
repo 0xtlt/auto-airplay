@@ -4,7 +4,8 @@
 //! frame that plays at the NTP time of bytes 8-15. Receivers read the
 //! difference of the two timestamps as the latency they must buffer
 //! (shairport-sync: `sync_rtp_timestamp - rtp_timestamp_less_latency`);
-//! iTunes sends 88200 frames, OwnTone and pyatv their own buffer.
+//! iTunes sends 88200 frames, OwnTone and pyatv their own buffer. Bytes 2-3
+//! carry 7, as in other senders' sync packets.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -60,6 +61,21 @@ fn bytes_4_to_7_wrap_at_the_start_of_a_stream() {
     assert_eq!(next[0], 0x80);
     assert_eq!(word(&next, 4), 33_075);
     assert_eq!(word(&next, 16).wrapping_sub(word(&next, 4)), LATENCY);
+}
+
+#[test]
+fn bytes_2_and_3_are_7_in_every_sync_packet() {
+    // iTunes, OwnTone, pyatv and libraop send 7 there in every sync packet;
+    // upstream sent a counter of sync packets.
+    let mut sender = sender();
+    for n in 0..300_u32 {
+        let packet = sender
+            .prepare_sync(n * 44_100, LATENCY, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet[2..4], [0x00, 0x07], "sync packet {n}");
+        assert_eq!(word(&packet, 16).wrapping_sub(word(&packet, 4)), LATENCY);
+    }
 }
 
 #[test]

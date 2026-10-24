@@ -62,6 +62,9 @@ pub use airplay_discovery::Discovery;
 // Live streaming types for external sources (e.g., Bluetooth audio)
 pub use airplay_audio::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 
+// Local patch: the sender's counters, for a periodic report.
+pub use airplay_audio::OutputStats;
+
 // Equalizer types
 pub use airplay_audio::{EqConfig, EqParams};
 pub use airplay_audio::eq::MAX_GAIN_DB;

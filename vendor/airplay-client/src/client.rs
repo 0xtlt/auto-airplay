@@ -780,6 +780,10 @@ impl AirPlayClient {
                                     } else {
                                         None
                                     };
+                                    // Local patch: counted for the periodic report.
+                                    if request.is_none() {
+                                        streamer_clone.note_unparsed_retransmit_request();
+                                    }
                                     if let Some(req) = request {
                                         // Update aggregate stats
                                         stats.rtx_requested.fetch_add(req.count as u64, Ordering::Relaxed);
@@ -861,6 +865,17 @@ impl AirPlayClient {
             snap
         } else {
             crate::stats::StatsSnapshot::default()
+        }
+    }
+
+    /// Local patch: what the sender did since the previous call (counts) or
+    /// over that time (maxima): packets sent, how late, retransmits asked
+    /// for and served. `None` while not streaming.
+    pub fn take_output_stats(&self) -> Option<airplay_audio::OutputStats> {
+        match (&self.group_streamer, &self.connection) {
+            (Some(streamer), _) => Some(streamer.take_output_stats()),
+            (None, Some(conn)) => conn.take_output_stats(),
+            (None, None) => None,
         }
     }
 

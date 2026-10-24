@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "auto-airplay"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "airplay-audio 0.1.0",
  "airplay-audio 0.1.0 (git+https://github.com/lmcgartland/airplay2-rs.git?rev=a7f019fe6246ebd9701201a8a5c31e9a15243956)",
